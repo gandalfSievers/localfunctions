@@ -9,6 +9,10 @@ license = "MIT"
 name = "localfunctions"
 path = "src/main.rs"
 
+[lib]
+name = "localfunctions"
+path = "src/lib.rs"
+
 [dependencies]
 # HTTP framework
 axum = "0.7"
@@ -47,6 +51,7 @@ tokio-test = "0.4"
 tempfile = "3"
 serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]
 lto = true

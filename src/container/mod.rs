@@ -196,7 +196,7 @@ impl ContainerRegistry {
         }
 
         self.deregister(container_id).await;
-        info!(container_id = %container_id, "container stopped and removed (timeout)");
+        info!(container_id = %container_id, "container stopped and removed");
     }
 
     /// Stop and remove all containers for a given function.

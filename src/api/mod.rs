@@ -233,7 +233,11 @@ async fn invoke_function_inner(
                 (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
             }
             crate::types::InvocationResult::Timeout => {
-                warn!("function timed out");
+                // This branch is reached when the function runtime itself
+                // reports a timeout via the runtime bridge (as opposed to the
+                // tokio::time::timeout Err(_) branch below which fires when
+                // the invoke handler's own deadline expires).
+                warn!("function reported timeout via runtime bridge");
                 let mut resp_headers = base_headers();
                 resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
                 let error_body = serde_json::json!({
