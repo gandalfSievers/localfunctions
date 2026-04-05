@@ -59,6 +59,7 @@ async fn build_e2e_state(
                 code_path: std::path::PathBuf::from("/tmp/code"),
                 timeout: *timeout,
                 memory_size: 128,
+                ephemeral_storage_mb: 512,
                 environment: HashMap::new(),
                 image: None,
             },

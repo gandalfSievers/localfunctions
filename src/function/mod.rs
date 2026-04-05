@@ -32,6 +32,9 @@ pub enum FunctionConfigError {
     #[error("function '{name}': invalid memory_size {value} — must be a positive integer")]
     InvalidMemorySize { name: String, value: u64 },
 
+    #[error("function '{name}': invalid ephemeral_storage_mb {value} — must be between 512 and 10240")]
+    InvalidEphemeralStorage { name: String, value: u64 },
+
     #[error("function '{name}': code_path '{path}' is invalid — directory traversal is not allowed")]
     DirectoryTraversal { name: String, path: String },
 
@@ -80,6 +83,7 @@ struct RawFunctionEntry {
     code_path: String,
     timeout: Option<u64>,
     memory_size: Option<u64>,
+    ephemeral_storage_mb: Option<u64>,
     #[serde(default)]
     environment: HashMap<String, String>,
     image: Option<String>,
@@ -163,6 +167,7 @@ pub fn parse_functions_config(
 
         let timeout = entry.timeout.unwrap_or(30);
         let memory_size = entry.memory_size.unwrap_or(128);
+        let ephemeral_storage_mb = entry.ephemeral_storage_mb.unwrap_or(512);
 
         // Validate runtime
         if !is_known_runtime(&entry.runtime) {
@@ -185,6 +190,11 @@ pub fn parse_functions_config(
 
         // Validate memory size
         if let Err(e) = validate_memory_size(name, memory_size) {
+            errors.push(e);
+        }
+
+        // Validate ephemeral storage
+        if let Err(e) = validate_ephemeral_storage(name, ephemeral_storage_mb) {
             errors.push(e);
         }
 
@@ -230,6 +240,7 @@ pub fn parse_functions_config(
             code_path,
             timeout,
             memory_size,
+            ephemeral_storage_mb,
             environment: entry.environment.clone(),
             image: entry.image.clone(),
         };
@@ -454,6 +465,16 @@ fn validate_memory_size(name: &str, memory_size: u64) -> Result<(), FunctionConf
         return Err(FunctionConfigError::InvalidMemorySize {
             name: name.to_string(),
             value: memory_size,
+        });
+    }
+    Ok(())
+}
+
+fn validate_ephemeral_storage(name: &str, ephemeral_storage_mb: u64) -> Result<(), FunctionConfigError> {
+    if !(512..=10240).contains(&ephemeral_storage_mb) {
+        return Err(FunctionConfigError::InvalidEphemeralStorage {
+            name: name.to_string(),
+            value: ephemeral_storage_mb,
         });
     }
     Ok(())
@@ -896,6 +917,109 @@ mod tests {
         }"#;
         let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert_validation_error_contains(&err, "invalid memory_size");
+    }
+
+    // -- Ephemeral storage validation -----------------------------------------
+
+    #[test]
+    fn ephemeral_storage_default_512() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].ephemeral_storage_mb, 512);
+    }
+
+    #[test]
+    fn ephemeral_storage_custom_value() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "ephemeral_storage_mb": 1024
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].ephemeral_storage_mb, 1024);
+    }
+
+    #[test]
+    fn ephemeral_storage_max_value() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "ephemeral_storage_mb": 10240
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].ephemeral_storage_mb, 10240);
+    }
+
+    #[test]
+    fn error_ephemeral_storage_below_minimum() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "ephemeral_storage_mb": 256
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "invalid ephemeral_storage_mb");
+    }
+
+    #[test]
+    fn error_ephemeral_storage_above_maximum() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "ephemeral_storage_mb": 10241
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "invalid ephemeral_storage_mb");
+    }
+
+    #[test]
+    fn error_ephemeral_storage_zero() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "ephemeral_storage_mb": 0
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "invalid ephemeral_storage_mb");
     }
 
     // -- Custom runtime requires image ---------------------------------------

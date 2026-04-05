@@ -23,6 +23,9 @@ pub struct FunctionConfig {
     pub timeout: u64,
     #[serde(default = "default_memory_size")]
     pub memory_size: u64,
+    /// Ephemeral /tmp storage size in MB (default 512, range 512-10240).
+    #[serde(default = "default_ephemeral_storage_mb")]
+    pub ephemeral_storage_mb: u64,
     #[serde(default)]
     pub environment: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,6 +40,11 @@ fn default_timeout() -> u64 {
 #[allow(dead_code)]
 fn default_memory_size() -> u64 {
     128
+}
+
+#[allow(dead_code)]
+fn default_ephemeral_storage_mb() -> u64 {
+    512
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +203,7 @@ mod tests {
             code_path: PathBuf::from("/tmp/code"),
             timeout: 30,
             memory_size: 256,
+            ephemeral_storage_mb: 1024,
             environment: HashMap::from([("KEY".into(), "value".into())]),
             image: Some("custom:latest".into()),
         };
@@ -208,6 +217,7 @@ mod tests {
         assert_eq!(deserialized.code_path, PathBuf::from("/tmp/code"));
         assert_eq!(deserialized.timeout, 30);
         assert_eq!(deserialized.memory_size, 256);
+        assert_eq!(deserialized.ephemeral_storage_mb, 1024);
         assert_eq!(deserialized.environment.get("KEY").unwrap(), "value");
         assert_eq!(deserialized.image, Some("custom:latest".into()));
     }
@@ -224,6 +234,7 @@ mod tests {
         let config: FunctionConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.timeout, 30);
         assert_eq!(config.memory_size, 128);
+        assert_eq!(config.ephemeral_storage_mb, 512);
         assert!(config.environment.is_empty());
         assert!(config.image.is_none());
     }
@@ -237,6 +248,7 @@ mod tests {
             code_path: PathBuf::from("/c"),
             timeout: 3,
             memory_size: 128,
+            ephemeral_storage_mb: 512,
             environment: HashMap::new(),
             image: None,
         };

@@ -644,6 +644,13 @@ impl ContainerManager {
             function.name.clone(),
         );
 
+        // Ephemeral /tmp as a size-limited tmpfs (matches AWS Lambda behavior)
+        let tmpfs_size_bytes = (function.ephemeral_storage_mb as i64) * 1024 * 1024;
+        let tmpfs = HashMap::from([(
+            "/tmp".to_string(),
+            format!("size={}", tmpfs_size_bytes),
+        )]);
+
         let host_config = HostConfig {
             binds: Some(binds),
             memory: Some(memory),
@@ -652,6 +659,7 @@ impl ContainerManager {
             cpu_shares: Some(cpu_shares),
             network_mode: Some(self.network_name.clone()),
             extra_hosts: Some(container_extra_hosts()),
+            tmpfs: Some(tmpfs),
             // Explicitly no privileged mode, no port bindings
             privileged: Some(false),
             publish_all_ports: Some(false),
@@ -1327,6 +1335,7 @@ mod tests {
             code_path: std::path::PathBuf::from("/tmp/code"),
             timeout: 30,
             memory_size: 256,
+            ephemeral_storage_mb: 512,
             environment: HashMap::new(),
             image: None,
         }
@@ -2356,6 +2365,7 @@ mod integration_tests {
             code_path: code_dir.path().to_path_buf(),
             timeout: 30,
             memory_size: 128,
+            ephemeral_storage_mb: 512,
             environment: HashMap::from([("MY_VAR".into(), "my_value".into())]),
             image: None,
         };
@@ -2397,6 +2407,11 @@ mod integration_tests {
             host_config.network_mode,
             Some(network_name.clone())
         );
+
+        // Verify tmpfs mount for /tmp with size limit
+        let tmpfs = host_config.tmpfs.as_ref().unwrap();
+        assert!(tmpfs.contains_key("/tmp"));
+        assert_eq!(tmpfs["/tmp"], format!("size={}", 512 * 1024 * 1024));
 
         // Verify volume mount
         let binds = host_config.binds.as_ref().unwrap();

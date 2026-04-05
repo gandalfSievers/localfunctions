@@ -59,6 +59,7 @@ async fn build_state(
             code_path: std::path::PathBuf::from("/tmp/code"),
             timeout: timeout_secs,
             memory_size: 128,
+            ephemeral_storage_mb: 512,
             environment: HashMap::new(),
             image: None,
         },
