@@ -24,8 +24,7 @@ async fn main() -> Result<()> {
 
     let config = config::Config::from_env()?;
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| config.log_level.clone().into());
+    let env_filter = tracing_subscriber::EnvFilter::new(&config.log_level);
 
     match config.log_format {
         config::LogFormat::Json => {

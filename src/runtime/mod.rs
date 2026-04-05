@@ -118,17 +118,17 @@ impl RuntimeBridge {
     pub async fn submit_invocation(
         &self,
         function_name: &str,
+        request_id: Uuid,
         payload: Bytes,
         deadline: tokio::time::Instant,
         trace_id: Option<String>,
         client_context: Option<String>,
-    ) -> Result<(Uuid, oneshot::Receiver<InvocationResult>), ServiceError> {
+    ) -> Result<oneshot::Receiver<InvocationResult>, ServiceError> {
         let sender = self
             .senders
             .get(function_name)
             .ok_or_else(|| ServiceError::ResourceNotFound(function_name.to_string()))?;
 
-        let request_id = Uuid::new_v4();
         let (response_tx, response_rx) = oneshot::channel();
 
         let invocation = Invocation {
@@ -148,7 +148,7 @@ impl RuntimeBridge {
             ))
         })?;
 
-        Ok((request_id, response_rx))
+        Ok(response_rx)
     }
 
     /// Store the response channel for a dispatched invocation so that the

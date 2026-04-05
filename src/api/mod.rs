@@ -6,7 +6,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::function::validate_function_name;
@@ -82,6 +82,21 @@ async fn invoke_function(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let request_id = Uuid::new_v4();
+    let span = info_span!("invocation", %request_id, function = %function_name);
+
+    invoke_function_inner(state, function_name, headers, body, request_id)
+        .instrument(span)
+        .await
+}
+
+async fn invoke_function_inner(
+    state: AppState,
+    function_name: String,
+    headers: HeaderMap,
+    body: Bytes,
+    request_id: Uuid,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     // Validate function name from the URL path.
     if let Err(e) = validate_function_name(&function_name) {
         let err = ServiceError::InvalidRequestContent(e.to_string());
@@ -90,7 +105,6 @@ async fn invoke_function(
 
     // Log payload at DEBUG level only — never at INFO or above.
     debug!(
-        function = %function_name,
         payload_size = body.len(),
         payload = %String::from_utf8_lossy(&body),
         "invoke request"
@@ -136,19 +150,18 @@ async fn invoke_function(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     info!(
-        function = %function_name,
         payload_size = body.len(),
         timeout_secs,
         "invoking function"
     );
 
     // Submit the invocation to the runtime bridge.
-    let (request_id, response_rx) = match state
+    let response_rx = match state
         .runtime_bridge
-        .submit_invocation(&function_name, body, deadline, None, client_context)
+        .submit_invocation(&function_name, request_id, body, deadline, None, client_context)
         .await
     {
-        Ok(result) => result,
+        Ok(rx) => rx,
         Err(e) => {
             // If submit fails (e.g. channel closed), return 502.
             let err = ServiceError::ServiceException(e.to_string());
@@ -166,7 +179,7 @@ async fn invoke_function(
     match result {
         Ok(Ok(invocation_result)) => match invocation_result {
             crate::types::InvocationResult::Success { body } => {
-                info!(function = %function_name, request_id = %request_id, "invocation succeeded");
+                info!("invocation succeeded");
                 (StatusCode::OK, HeaderMap::new(), body.into_bytes())
             }
             crate::types::InvocationResult::Error {
@@ -174,8 +187,6 @@ async fn invoke_function(
                 error_message,
             } => {
                 warn!(
-                    function = %function_name,
-                    request_id = %request_id,
                     error_type = %error_type,
                     error_message = %error_message,
                     "function returned error"
@@ -189,7 +200,7 @@ async fn invoke_function(
                 (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
             }
             crate::types::InvocationResult::Timeout => {
-                warn!(function = %function_name, request_id = %request_id, "function timed out");
+                warn!("function timed out");
                 let mut resp_headers = HeaderMap::new();
                 resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
                 let error_body = serde_json::json!({
@@ -211,12 +222,7 @@ async fn invoke_function(
         }
         Err(_) => {
             // Timeout waiting for response.
-            warn!(
-                function = %function_name,
-                request_id = %request_id,
-                timeout_secs,
-                "invocation timed out"
-            );
+            warn!(timeout_secs, "invocation timed out");
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
             let error_body = serde_json::json!({
