@@ -7,7 +7,7 @@ use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::types::ServiceError;
+use crate::types::{FunctionConfig, ServiceError};
 
 /// Manages the Docker network used for communication between Lambda containers
 /// and the Runtime API.
@@ -237,6 +237,57 @@ fn is_benign_docker_error(e: &bollard::errors::Error) -> bool {
     )
 }
 
+/// Build the complete set of environment variables to inject into a Lambda
+/// function container.
+///
+/// System variables (AWS_LAMBDA_FUNCTION_NAME, _HANDLER, etc.) are set first,
+/// then user-configured variables are merged in. User variables do **not**
+/// override the system variables.
+pub fn lambda_env_vars(
+    function: &FunctionConfig,
+    runtime_port: u16,
+    region: &str,
+) -> Vec<String> {
+    let runtime_api = runtime_api_endpoint(runtime_port);
+
+    // System variables required by the AWS Lambda execution environment
+    let mut vars: HashMap<String, String> = HashMap::new();
+    vars.insert(
+        "AWS_LAMBDA_FUNCTION_NAME".into(),
+        function.name.clone(),
+    );
+    vars.insert("_HANDLER".into(), function.handler.clone());
+    vars.insert(
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE".into(),
+        function.memory_size.to_string(),
+    );
+    vars.insert("AWS_LAMBDA_RUNTIME_API".into(), runtime_api);
+    vars.insert("AWS_REGION".into(), region.to_string());
+    vars.insert("AWS_DEFAULT_REGION".into(), region.to_string());
+    vars.insert(
+        "AWS_LAMBDA_FUNCTION_VERSION".into(),
+        "$LATEST".into(),
+    );
+    vars.insert(
+        "AWS_LAMBDA_LOG_GROUP_NAME".into(),
+        format!("/aws/lambda/{}", function.name),
+    );
+    vars.insert(
+        "AWS_LAMBDA_LOG_STREAM_NAME".into(),
+        "localfunctions/latest".into(),
+    );
+
+    // Merge user-configured environment variables without overriding system vars
+    for (key, value) in &function.environment {
+        vars.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+
+    // Convert to Docker's "KEY=VALUE" format
+    vars.into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect()
+}
+
 /// Build the `AWS_LAMBDA_RUNTIME_API` endpoint value that containers should
 /// use to reach the Runtime API.
 ///
@@ -267,6 +318,113 @@ mod tests {
     fn runtime_api_endpoint_custom_port() {
         let endpoint = runtime_api_endpoint(3000);
         assert_eq!(endpoint, "host.docker.internal:3000");
+    }
+
+    // -- lambda_env_vars ------------------------------------------------
+
+    fn make_test_function() -> FunctionConfig {
+        FunctionConfig {
+            name: "my-func".into(),
+            runtime: "python3.12".into(),
+            handler: "main.handler".into(),
+            code_path: std::path::PathBuf::from("/tmp/code"),
+            timeout: 30,
+            memory_size: 256,
+            environment: HashMap::new(),
+            image: None,
+        }
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_function_name() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_NAME=my-func".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_handler() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"_HANDLER=main.handler".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_memory_size() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=256".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_runtime_api() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=host.docker.internal:9601".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_region() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "eu-west-1");
+        assert!(vars.contains(&"AWS_REGION=eu-west-1".to_string()));
+        assert!(vars.contains(&"AWS_DEFAULT_REGION=eu-west-1".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_version() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_VERSION=$LATEST".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_log_group() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_LOG_GROUP_NAME=/aws/lambda/my-func".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_log_stream() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_LOG_STREAM_NAME=localfunctions/latest".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_includes_user_vars() {
+        let mut func = make_test_function();
+        func.environment.insert("TABLE_NAME".into(), "my-table".into());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(&"TABLE_NAME=my-table".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_user_vars_do_not_override_system_vars() {
+        let mut func = make_test_function();
+        func.environment.insert("AWS_LAMBDA_FUNCTION_NAME".into(), "hacked".into());
+        func.environment.insert("_HANDLER".into(), "evil.handler".into());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        // System values must win
+        assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_NAME=my-func".to_string()));
+        assert!(vars.contains(&"_HANDLER=main.handler".to_string()));
+        assert!(!vars.iter().any(|v| v.contains("hacked")));
+    }
+
+    #[test]
+    fn lambda_env_vars_custom_port() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 3000, "us-east-1");
+        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=host.docker.internal:3000".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_count() {
+        // 9 system vars with no user vars
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert_eq!(vars.len(), 9);
     }
 
     #[test]
