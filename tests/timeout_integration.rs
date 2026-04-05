@@ -64,6 +64,7 @@ async fn build_state(
             ephemeral_storage_mb: 512,
             environment: HashMap::new(),
             image: None,
+            image_uri: None,
         },
     );
 

@@ -1629,6 +1629,7 @@ mod tests {
                 ephemeral_storage_mb: 512,
                 environment: HashMap::new(),
                 image: None,
+                image_uri: None,
             },
         );
         let functions = FunctionsConfig {
@@ -2168,6 +2169,7 @@ mod tests {
                 ephemeral_storage_mb: 512,
                 environment: HashMap::new(),
                 image: None,
+                image_uri: None,
             },
         );
         let functions = FunctionsConfig {

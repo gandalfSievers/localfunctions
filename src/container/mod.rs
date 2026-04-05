@@ -558,9 +558,14 @@ impl ContainerManager {
 
     /// Resolve the Docker image for a function.
     ///
-    /// If the function has a custom `image` field, use that. Otherwise look up
-    /// the runtime in the `runtime_images` map.
+    /// Priority: `image_uri` > `image` > `runtime_images` map lookup.
+    /// `image_uri` is used for fully-packaged container image functions.
+    /// `image` is for custom runtime base images (code still mounted).
     pub fn resolve_image(&self, function: &FunctionConfig) -> Result<String, ServiceError> {
+        if let Some(ref image_uri) = function.image_uri {
+            return Ok(image_uri.clone());
+        }
+
         if let Some(ref image) = function.image {
             return Ok(image.clone());
         }
@@ -647,19 +652,22 @@ impl ContainerManager {
             &self.credential_config,
         );
 
-        // Code path mount: read-only at /var/task
-        let code_path = function
-            .code_path
-            .to_str()
-            .ok_or_else(|| {
-                ServiceError::ServiceException(format!(
-                    "code_path contains invalid UTF-8: {:?}",
-                    function.code_path
-                ))
-            })?
-            .to_string();
-
-        let mut binds = vec![format!("{}:/var/task:ro", code_path)];
+        // Code path mount: read-only at /var/task (skipped for image_uri functions
+        // since the image already contains the function code)
+        let mut binds = Vec::new();
+        if function.image_uri.is_none() {
+            let code_path = function
+                .code_path
+                .to_str()
+                .ok_or_else(|| {
+                    ServiceError::ServiceException(format!(
+                        "code_path contains invalid UTF-8: {:?}",
+                        function.code_path
+                    ))
+                })?
+                .to_string();
+            binds.push(format!("{}:/var/task:ro", code_path));
+        }
 
         // Optionally mount host ~/.aws directory read-only
         if self.credential_config.mount_aws_dir {
@@ -1260,7 +1268,11 @@ pub fn lambda_env_vars(
         "AWS_LAMBDA_FUNCTION_NAME".into(),
         function.name.clone(),
     );
-    vars.insert("_HANDLER".into(), function.handler.clone());
+    // For image_uri functions, only set _HANDLER if the user explicitly provided one.
+    // This allows the container's ENTRYPOINT/CMD to be respected as-is.
+    if function.image_uri.is_none() || !function.handler.is_empty() {
+        vars.insert("_HANDLER".into(), function.handler.clone());
+    }
     vars.insert(
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE".into(),
         function.memory_size.to_string(),
@@ -1416,6 +1428,7 @@ mod tests {
             ephemeral_storage_mb: 512,
             environment: HashMap::new(),
             image: None,
+            image_uri: None,
         }
     }
 
@@ -1517,6 +1530,24 @@ mod tests {
         };
         let vars = lambda_env_vars(&func, 9601, "us-east-1", &no_creds);
         assert_eq!(vars.len(), 9);
+    }
+
+    #[test]
+    fn lambda_env_vars_image_uri_without_handler_skips_handler() {
+        let mut func = make_test_function();
+        func.image_uri = Some("my-lambda:latest".into());
+        func.handler = String::new();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        assert!(!vars.iter().any(|v| v.starts_with("_HANDLER=")));
+    }
+
+    #[test]
+    fn lambda_env_vars_image_uri_with_handler_sets_handler() {
+        let mut func = make_test_function();
+        func.image_uri = Some("my-lambda:latest".into());
+        func.handler = "app.handler".into();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        assert!(vars.contains(&"_HANDLER=app.handler".to_string()));
     }
 
     #[test]
@@ -1687,6 +1718,25 @@ mod tests {
         func.image = Some("my-custom-runtime:v1".into());
         let image = mgr.resolve_image(&func).unwrap();
         assert_eq!(image, "my-custom-runtime:v1");
+    }
+
+    #[test]
+    fn resolve_image_from_image_uri() {
+        let mgr = make_container_manager();
+        let mut func = make_test_function();
+        func.image_uri = Some("my-lambda:latest".into());
+        let image = mgr.resolve_image(&func).unwrap();
+        assert_eq!(image, "my-lambda:latest");
+    }
+
+    #[test]
+    fn resolve_image_image_uri_takes_priority_over_image() {
+        let mgr = make_container_manager();
+        let mut func = make_test_function();
+        func.image = Some("custom-base:v1".into());
+        func.image_uri = Some("my-lambda:latest".into());
+        let image = mgr.resolve_image(&func).unwrap();
+        assert_eq!(image, "my-lambda:latest");
     }
 
     #[test]
@@ -2611,6 +2661,7 @@ mod integration_tests {
             ephemeral_storage_mb: 512,
             environment: HashMap::from([("MY_VAR".into(), "my_value".into())]),
             image: None,
+            image_uri: None,
         };
 
         // Create and start

@@ -30,6 +30,11 @@ pub struct FunctionConfig {
     pub environment: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// OCI container image used as the complete function package.
+    /// When set, the image is used directly without mounting code into a
+    /// runtime base image. The container's ENTRYPOINT/CMD is respected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_uri: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -206,6 +211,7 @@ mod tests {
             ephemeral_storage_mb: 1024,
             environment: HashMap::from([("KEY".into(), "value".into())]),
             image: Some("custom:latest".into()),
+            image_uri: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -220,6 +226,7 @@ mod tests {
         assert_eq!(deserialized.ephemeral_storage_mb, 1024);
         assert_eq!(deserialized.environment.get("KEY").unwrap(), "value");
         assert_eq!(deserialized.image, Some("custom:latest".into()));
+        assert_eq!(deserialized.image_uri, None);
     }
 
     #[test]
@@ -237,6 +244,7 @@ mod tests {
         assert_eq!(config.ephemeral_storage_mb, 512);
         assert!(config.environment.is_empty());
         assert!(config.image.is_none());
+        assert!(config.image_uri.is_none());
     }
 
     #[test]
@@ -251,11 +259,35 @@ mod tests {
             ephemeral_storage_mb: 512,
             environment: HashMap::new(),
             image: None,
+            image_uri: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
-        // image should be absent when None
+        // image and image_uri should be absent when None
         assert!(!json.contains("image"));
+        assert!(!json.contains("image_uri"));
+    }
+
+    #[test]
+    fn function_config_with_image_uri() {
+        let config = FunctionConfig {
+            name: "img-func".into(),
+            runtime: "provided.al2023".into(),
+            handler: String::new(),
+            code_path: PathBuf::new(),
+            timeout: 30,
+            memory_size: 256,
+            ephemeral_storage_mb: 512,
+            environment: HashMap::new(),
+            image: None,
+            image_uri: Some("my-lambda:latest".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("image_uri"));
+        assert!(json.contains("my-lambda:latest"));
+
+        let deserialized: FunctionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.image_uri, Some("my-lambda:latest".into()));
     }
 
     // -- InvocationResult ----------------------------------------------------

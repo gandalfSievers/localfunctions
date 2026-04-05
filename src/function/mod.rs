@@ -61,6 +61,12 @@ pub enum FunctionConfigError {
     #[error("function '{name}': invalid environment variable key '{key}' — must start with a letter and contain only alphanumeric characters and underscores")]
     InvalidEnvironmentKey { name: String, key: String },
 
+    #[error("function '{name}': image_uri functions must not specify code_path")]
+    ImageUriWithCodePath { name: String },
+
+    #[error("function '{name}': must specify either image_uri or both runtime and code_path")]
+    MissingRuntimeOrImageUri { name: String },
+
     #[error("configuration validation failed with {count} error(s):\n{details}")]
     ValidationErrors { count: usize, details: String },
 }
@@ -78,15 +84,16 @@ struct RawFunctionsFile {
 
 #[derive(Debug, Deserialize)]
 struct RawFunctionEntry {
-    runtime: String,
-    handler: String,
-    code_path: String,
+    runtime: Option<String>,
+    handler: Option<String>,
+    code_path: Option<String>,
     timeout: Option<u64>,
     memory_size: Option<u64>,
     ephemeral_storage_mb: Option<u64>,
     #[serde(default)]
     environment: HashMap<String, String>,
     image: Option<String>,
+    image_uri: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,18 +176,47 @@ pub fn parse_functions_config(
         let memory_size = entry.memory_size.unwrap_or(128);
         let ephemeral_storage_mb = entry.ephemeral_storage_mb.unwrap_or(512);
 
-        // Validate runtime
-        if !is_known_runtime(&entry.runtime) {
+        let is_image_uri = entry.image_uri.is_some();
+
+        // Image-URI functions: code_path must not be specified
+        if is_image_uri && entry.code_path.is_some() {
+            errors.push(FunctionConfigError::ImageUriWithCodePath {
+                name: name.clone(),
+            });
+        }
+
+        // Non-image-URI functions: runtime and code_path are required
+        if !is_image_uri && (entry.runtime.is_none() || entry.code_path.is_none()) {
+            errors.push(FunctionConfigError::MissingRuntimeOrImageUri {
+                name: name.clone(),
+            });
+            continue;
+        }
+
+        // Resolve runtime: image_uri functions default to "provided.al2023"
+        let runtime = entry
+            .runtime
+            .clone()
+            .unwrap_or_else(|| "provided.al2023".to_string());
+
+        // Resolve handler: image_uri functions without explicit handler use ""
+        let handler = entry.handler.clone().unwrap_or_default();
+
+        // Validate runtime (skip for image_uri functions without explicit runtime)
+        if entry.runtime.is_some() && !is_known_runtime(&runtime) {
             errors.push(FunctionConfigError::UnknownRuntime {
                 name: name.clone(),
-                value: entry.runtime.clone(),
+                value: runtime.clone(),
                 expected: KNOWN_RUNTIMES.join(", "),
             });
         }
 
-        // Validate handler format
-        if let Err(e) = validate_handler(name, &entry.handler, &entry.runtime) {
-            errors.push(e);
+        // Validate handler format: required for non-image-uri functions,
+        // optional for image-uri functions (only validated if explicitly set)
+        if !is_image_uri || entry.handler.is_some() {
+            if let Err(e) = validate_handler(name, &handler, &runtime) {
+                errors.push(e);
+            }
         }
 
         // Validate timeout
@@ -198,27 +234,32 @@ pub fn parse_functions_config(
             errors.push(e);
         }
 
-        // Validate code_path (traversal check)
-        let code_path = match canonicalize_code_path(name, &entry.code_path, base_dir) {
-            Ok(p) => {
-                // Validate code_path existence
-                if !p.exists() {
-                    errors.push(FunctionConfigError::CodePathNotFound {
-                        name: name.clone(),
-                        path: entry.code_path.clone(),
-                    });
+        // Validate code_path (only for non-image-uri functions)
+        let code_path = if let Some(ref raw_code_path) = entry.code_path {
+            match canonicalize_code_path(name, raw_code_path, base_dir) {
+                Ok(p) => {
+                    // Validate code_path existence
+                    if !p.exists() {
+                        errors.push(FunctionConfigError::CodePathNotFound {
+                            name: name.clone(),
+                            path: raw_code_path.clone(),
+                        });
+                    }
+                    p
                 }
-                p
+                Err(e) => {
+                    errors.push(e);
+                    // Use a placeholder so we can continue validation
+                    base_dir.join(raw_code_path)
+                }
             }
-            Err(e) => {
-                errors.push(e);
-                // Use a placeholder so we can continue validation
-                base_dir.join(&entry.code_path)
-            }
+        } else {
+            // image_uri functions have no code_path
+            PathBuf::new()
         };
 
-        // Validate custom runtime requires image
-        if entry.runtime == "custom" && entry.image.is_none() {
+        // Validate custom runtime requires image (only for non-image-uri)
+        if !is_image_uri && runtime == "custom" && entry.image.is_none() {
             errors.push(FunctionConfigError::MissingImageForCustomRuntime {
                 name: name.clone(),
             });
@@ -235,14 +276,15 @@ pub fn parse_functions_config(
         // (we still continue to validate other functions)
         let config = FunctionConfig {
             name: name.clone(),
-            runtime: entry.runtime.clone(),
-            handler: entry.handler.clone(),
+            runtime,
+            handler,
             code_path,
             timeout,
             memory_size,
             ephemeral_storage_mb,
             environment: entry.environment.clone(),
             image: entry.image.clone(),
+            image_uri: entry.image_uri.clone(),
         };
 
         functions.insert(name.clone(), config);
@@ -661,7 +703,8 @@ mod tests {
             }
         }"#;
         let err = parse_functions_config(json, dir.path()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::ParseJson(_)));
+        // Without image_uri, runtime and code_path are required together
+        assert!(matches!(err, FunctionConfigError::ValidationErrors { .. }));
         assert!(err.to_string().contains("runtime"));
     }
 
@@ -676,9 +719,11 @@ mod tests {
                 }
             }
         }"#;
+        // Handler is optional — when omitted, it defaults to empty string.
+        // For non-image-uri functions with a standard runtime, handler
+        // validation catches empty handlers.
         let err = parse_functions_config(json, dir.path()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::ParseJson(_)));
-        assert!(err.to_string().contains("handler"));
+        assert!(matches!(err, FunctionConfigError::ValidationErrors { .. }));
     }
 
     #[test]
@@ -693,8 +738,8 @@ mod tests {
             }
         }"#;
         let err = parse_functions_config(json, dir.path()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::ParseJson(_)));
-        assert!(err.to_string().contains("code_path"));
+        // Without image_uri, code_path is required
+        assert!(matches!(err, FunctionConfigError::ValidationErrors { .. }));
     }
 
     #[test]
@@ -1038,6 +1083,114 @@ mod tests {
         }"#;
         let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert_validation_error_contains(&err, "requires an 'image' field");
+    }
+
+    // -- image_uri functions ---------------------------------------------------
+
+    #[test]
+    fn image_uri_function_minimal_config() {
+        let dir = setup_dirs(&[]);
+        let json = r#"{
+            "functions": {
+                "my-image-func": {
+                    "image_uri": "my-lambda:latest"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["my-image-func"];
+        assert_eq!(f.image_uri, Some("my-lambda:latest".into()));
+        assert_eq!(f.runtime, "provided.al2023");
+        assert!(f.handler.is_empty());
+        assert_eq!(f.timeout, 30);
+        assert_eq!(f.memory_size, 128);
+    }
+
+    #[test]
+    fn image_uri_function_with_handler_override() {
+        let dir = setup_dirs(&[]);
+        let json = r#"{
+            "functions": {
+                "my-image-func": {
+                    "image_uri": "my-lambda:latest",
+                    "handler": "app.handler"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["my-image-func"];
+        assert_eq!(f.image_uri, Some("my-lambda:latest".into()));
+        assert_eq!(f.handler, "app.handler");
+    }
+
+    #[test]
+    fn image_uri_function_with_all_optional_fields() {
+        let dir = setup_dirs(&[]);
+        let json = r#"{
+            "functions": {
+                "my-image-func": {
+                    "image_uri": "my-lambda:latest",
+                    "timeout": 60,
+                    "memory_size": 512,
+                    "ephemeral_storage_mb": 1024,
+                    "environment": { "MY_VAR": "hello" }
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["my-image-func"];
+        assert_eq!(f.image_uri, Some("my-lambda:latest".into()));
+        assert_eq!(f.timeout, 60);
+        assert_eq!(f.memory_size, 512);
+        assert_eq!(f.ephemeral_storage_mb, 1024);
+        assert_eq!(f.environment.get("MY_VAR"), Some(&"hello".to_string()));
+    }
+
+    #[test]
+    fn error_image_uri_with_code_path() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "image_uri": "my-lambda:latest",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "must not specify code_path");
+    }
+
+    #[test]
+    fn error_missing_runtime_and_image_uri() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "must specify either image_uri");
+    }
+
+    #[test]
+    fn image_uri_function_with_explicit_runtime() {
+        let dir = setup_dirs(&[]);
+        let json = r#"{
+            "functions": {
+                "my-image-func": {
+                    "image_uri": "my-lambda:latest",
+                    "runtime": "python3.12"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["my-image-func"];
+        assert_eq!(f.runtime, "python3.12");
+        assert_eq!(f.image_uri, Some("my-lambda:latest".into()));
     }
 
     // -- Unknown runtime -----------------------------------------------------

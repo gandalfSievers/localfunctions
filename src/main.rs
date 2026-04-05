@@ -213,7 +213,9 @@ async fn verify_runtime_images(
         std::collections::HashMap::new();
 
     for (name, func) in &functions_config.functions {
-        let image = if let Some(ref img) = func.image {
+        let image = if let Some(ref img) = func.image_uri {
+            img.clone()
+        } else if let Some(ref img) = func.image {
             img.clone()
         } else if let Some(img) = functions_config.runtime_images.get(&func.runtime) {
             img.clone()
