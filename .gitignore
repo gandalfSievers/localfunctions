@@ -20,5 +20,10 @@
 .idea/
 .vscode/
 
+# SDK test artifacts
+tests/sdk/node_modules/
+tests/sdk/__pycache__/
+tests/sdk/package-lock.json
+
 # Project orchestration
 .pralph/

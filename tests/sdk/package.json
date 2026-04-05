@@ -1,0 +1,11 @@
+{
+  "name": "localfunctions-sdk-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test_aws_sdk.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.500.0"
+  }
+}
