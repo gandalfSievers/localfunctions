@@ -268,8 +268,18 @@ async fn invoke_function_inner(
         }
     };
 
-    // For Event invocations, return 202 Accepted immediately and execute in the background.
+    // For Event invocations, enforce the async payload size limit (default 256 KB).
     if is_event_invocation {
+        let max_async = state.config.max_async_body_size;
+        if body.len() > max_async {
+            let err = ServiceError::RequestEntityTooLarge(format!(
+                "Request payload size ({} bytes) exceeded maximum allowed payload size ({} bytes) for async invocations.",
+                body.len(),
+                max_async
+            ));
+            return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
+        }
+
         let span = info_span!("async_invocation", %request_id, function = %function_name);
         tokio::spawn(
             invoke_async_background(state, function_name, headers, body, request_id)
@@ -1075,6 +1085,7 @@ mod tests {
             container_acquire_timeout: 10,
             forward_aws_credentials: true,
             mount_aws_credentials: false,
+            max_async_body_size: 256 * 1024,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -1170,6 +1181,7 @@ mod tests {
             container_acquire_timeout: 10,
             forward_aws_credentials: true,
             mount_aws_credentials: false,
+            max_async_body_size: 256 * 1024,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -2026,6 +2038,7 @@ mod tests {
             container_acquire_timeout: 10,
             forward_aws_credentials: true,
             mount_aws_credentials: false,
+            max_async_body_size: 256 * 1024,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -2309,6 +2322,102 @@ mod tests {
         // Should return 202 even though the function doesn't exist — the error
         // is handled asynchronously.
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn invoke_event_type_rejects_oversized_payload() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        // 256 KB + 1 byte exceeds the async limit
+        let oversized = vec![b'x'; 256 * 1024 + 1];
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "Event")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "RequestEntityTooLargeException");
+        assert!(json["Message"].as_str().unwrap().contains("262144"));
+    }
+
+    #[tokio::test]
+    async fn invoke_event_type_accepts_payload_at_limit() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        tokio::spawn(async move {
+            if let Some(inv) = runtime_bridge.next_invocation("my-func").await {
+                runtime_bridge
+                    .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                    .await;
+                let _ = runtime_bridge
+                    .complete_invocation(inv.request_id, "ok".into())
+                    .await;
+            }
+        });
+
+        let app = invoke_routes().with_state(state);
+
+        // Exactly 256 KB should be accepted
+        let at_limit = vec![b'x'; 256 * 1024];
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "Event")
+                    .body(Body::from(at_limit))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn invoke_sync_allows_payload_over_async_limit() {
+        // Synchronous invocations should not be restricted by the async limit.
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1).await;
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .await;
+            bridge
+                .complete_invocation(inv.request_id, "ok".into())
+                .await;
+        });
+
+        let app = invoke_routes().with_state(state);
+
+        // 256 KB + 1 exceeds async limit but is fine for sync (< 6 MB)
+        let payload = vec![b'x'; 256 * 1024 + 1];
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "RequestResponse")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2625,6 +2734,7 @@ mod tests {
             container_acquire_timeout: 0, // no wait — reject immediately
             forward_aws_credentials: true,
             mount_aws_credentials: false,
+            max_async_body_size: 256 * 1024,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 

@@ -18,6 +18,8 @@ pub struct Config {
     pub docker_network: String,
     /// Maximum request body size in bytes for the Invoke API (default 6 MB).
     pub max_body_size: usize,
+    /// Maximum request body size in bytes for async (Event) invocations (default 256 KB).
+    pub max_async_body_size: usize,
     /// Log output format: "json" for structured JSON, "text" for human-readable.
     pub log_format: LogFormat,
     /// Whether to automatically pull missing Docker images on startup.
@@ -82,6 +84,7 @@ impl Config {
         let max_containers = parse_env("LOCAL_LAMBDA_MAX_CONTAINERS", "20")?;
         let docker_network = parse_env::<String>("LOCAL_LAMBDA_DOCKER_NETWORK", "localfunctions")?;
         let max_body_size = parse_env("LOCAL_LAMBDA_MAX_BODY_SIZE", "6291456")?; // 6 MB
+        let max_async_body_size = parse_env("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE", "262144")?; // 256 KB
         let pull_images = parse_env_with_alias::<bool>(
             "LOCAL_LAMBDA_PULL_IMAGES",
             "LOCALFUNCTIONS_PULL_IMAGES",
@@ -105,6 +108,7 @@ impl Config {
             max_containers,
             docker_network,
             max_body_size,
+            max_async_body_size,
             log_format,
             pull_images,
             init_timeout,
@@ -170,6 +174,7 @@ mod tests {
             "LOCAL_LAMBDA_MAX_CONTAINERS",
             "LOCAL_LAMBDA_DOCKER_NETWORK",
             "LOCAL_LAMBDA_MAX_BODY_SIZE",
+            "LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE",
             "LOCAL_LAMBDA_PULL_IMAGES",
             "LOCALFUNCTIONS_PULL_IMAGES",
             "LOCAL_LAMBDA_INIT_TIMEOUT",
@@ -193,6 +198,7 @@ mod tests {
         assert_eq!(config.max_containers, 20);
         assert_eq!(config.docker_network, "localfunctions");
         assert_eq!(config.max_body_size, 6 * 1024 * 1024);
+        assert_eq!(config.max_async_body_size, 256 * 1024);
         assert_eq!(config.log_format, LogFormat::Json);
         assert!(!config.pull_images);
         assert_eq!(config.init_timeout, 10);
@@ -474,5 +480,31 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert!(config.mount_aws_credentials);
         std::env::remove_var("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_async_body_size_default() {
+        std::env::remove_var("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.max_async_body_size, 256 * 1024);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_async_body_size_custom() {
+        std::env::set_var("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE", "131072");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.max_async_body_size, 131072);
+        std::env::remove_var("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_async_body_size_invalid() {
+        std::env::set_var("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE", "not_a_number");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE");
     }
 }

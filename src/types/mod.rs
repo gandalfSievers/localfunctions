@@ -144,6 +144,9 @@ pub enum ServiceError {
 
     #[error("Invalid request content: {0}")]
     InvalidRequestContent(String),
+
+    #[error("Request entity too large: {0}")]
+    RequestEntityTooLarge(String),
 }
 
 /// AWS-compatible error response body.
@@ -172,6 +175,7 @@ impl ServiceError {
             ServiceError::InvalidRuntime(_) => "InvalidRuntimeException",
             ServiceError::TooManyRequests(_) => "TooManyRequestsException",
             ServiceError::InvalidRequestContent(_) => "InvalidRequestContentException",
+            ServiceError::RequestEntityTooLarge(_) => "RequestEntityTooLargeException",
         }
     }
 
@@ -183,6 +187,7 @@ impl ServiceError {
             ServiceError::InvalidRuntime(_) => http::StatusCode::BAD_REQUEST,
             ServiceError::TooManyRequests(_) => http::StatusCode::TOO_MANY_REQUESTS,
             ServiceError::InvalidRequestContent(_) => http::StatusCode::BAD_REQUEST,
+            ServiceError::RequestEntityTooLarge(_) => http::StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 
@@ -397,6 +402,15 @@ mod tests {
         assert_eq!(resp.Type, "InvalidRequestContentException");
         assert_eq!(resp.Message, "Invalid request content: bad json");
         assert_eq!(err.status_code(), http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn service_error_to_aws_response_request_entity_too_large() {
+        let err = ServiceError::RequestEntityTooLarge("payload too big".into());
+        let resp = err.to_aws_response();
+        assert_eq!(resp.Type, "RequestEntityTooLargeException");
+        assert_eq!(resp.Message, "Request entity too large: payload too big");
+        assert_eq!(err.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
