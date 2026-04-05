@@ -162,6 +162,43 @@ impl ContainerRegistry {
         self.containers.read().await.len()
     }
 
+    /// Stop and remove a single container by ID.
+    ///
+    /// Issues a Docker stop with the given grace period, then force-removes the
+    /// container and deregisters it from tracking.
+    pub async fn stop_and_remove(&self, container_id: &str, timeout: Duration) {
+        let timeout_secs = timeout.as_secs().try_into().unwrap_or(i64::MAX);
+
+        if let Err(e) = self
+            .docker
+            .stop_container(container_id, Some(StopContainerOptions { t: timeout_secs }))
+            .await
+        {
+            if !is_benign_docker_error(&e) {
+                error!(container_id = %container_id, %e, "failed to stop container");
+            }
+        }
+
+        if let Err(e) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !is_benign_docker_error(&e) {
+                error!(container_id = %container_id, %e, "failed to remove container");
+            }
+        }
+
+        self.deregister(container_id).await;
+        info!(container_id = %container_id, "container stopped and removed (timeout)");
+    }
+
     /// Stop and remove all containers for a given function.
     ///
     /// Returns the container IDs that were cleaned up.

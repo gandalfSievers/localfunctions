@@ -12,6 +12,7 @@ use crate::types::{Invocation, InvocationResult, ServiceError};
 /// A dispatched invocation waiting for a response from the container runtime.
 struct PendingInvocation {
     function_name: String,
+    container_id: Option<String>,
     response_tx: oneshot::Sender<InvocationResult>,
 }
 
@@ -158,12 +159,13 @@ impl RuntimeBridge {
         &self,
         request_id: Uuid,
         function_name: String,
+        container_id: Option<String>,
         response_tx: oneshot::Sender<InvocationResult>,
     ) {
         self.pending_invocations
             .lock()
             .await
-            .insert(request_id, PendingInvocation { function_name, response_tx });
+            .insert(request_id, PendingInvocation { function_name, container_id, response_tx });
     }
 
     /// Complete a pending invocation with a success result.
@@ -212,6 +214,20 @@ impl RuntimeBridge {
                 }
             }
             None => false,
+        }
+    }
+
+    /// Time out a pending invocation. Removes it from tracking and returns the
+    /// container_id that was handling it (if known), so the caller can kill the
+    /// container.
+    pub async fn timeout_invocation(&self, request_id: Uuid) -> Option<String> {
+        let pending = self.pending_invocations.lock().await.remove(&request_id);
+        match pending {
+            Some(p) => {
+                let _ = p.response_tx.send(InvocationResult::Timeout);
+                p.container_id
+            }
+            None => None,
         }
     }
 
@@ -409,7 +425,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4();
-        bridge.store_pending(request_id, "test-func".into(), tx).await;
+        bridge.store_pending(request_id, "test-func".into(), None, tx).await;
 
         assert!(bridge.complete_invocation(request_id, "done".into()).await);
         assert_eq!(
@@ -435,7 +451,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4();
-        bridge.store_pending(request_id, "test-func".into(), tx).await;
+        bridge.store_pending(request_id, "test-func".into(), None, tx).await;
 
         assert!(bridge
             .fail_invocation(request_id, "RuntimeError".into(), "boom".into())
@@ -499,13 +515,13 @@ mod tests {
         let (tx2, rx2) = oneshot::channel();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        bridge.store_pending(id1, "test-func".into(), tx1).await;
-        bridge.store_pending(id2, "test-func".into(), tx2).await;
+        bridge.store_pending(id1, "test-func".into(), None, tx1).await;
+        bridge.store_pending(id2, "test-func".into(), None, tx2).await;
 
         // Also store one for a different function — should NOT be failed.
         let (tx3, mut rx3) = oneshot::channel();
         let id3 = Uuid::new_v4();
-        bridge.store_pending(id3, "other-func".into(), tx3).await;
+        bridge.store_pending(id3, "other-func".into(), None, tx3).await;
 
         let count = bridge.fail_init("test-func").await;
         assert_eq!(count, 2);
@@ -551,5 +567,69 @@ mod tests {
         let result = handle.await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().request_id, request_id);
+    }
+
+    #[tokio::test]
+    async fn timeout_invocation_returns_container_id() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx, rx) = oneshot::channel();
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_pending(request_id, "test-func".into(), Some("container-abc".into()), tx)
+            .await;
+
+        let container_id = bridge.timeout_invocation(request_id).await;
+        assert_eq!(container_id, Some("container-abc".to_string()));
+
+        // Receiver should get Timeout result
+        assert_eq!(rx.await.unwrap(), InvocationResult::Timeout);
+    }
+
+    #[tokio::test]
+    async fn timeout_invocation_returns_none_for_unknown_request() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let result = bridge.timeout_invocation(Uuid::new_v4()).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_invocation_without_container_id() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx, rx) = oneshot::channel();
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_pending(request_id, "test-func".into(), None, tx)
+            .await;
+
+        let container_id = bridge.timeout_invocation(request_id).await;
+        assert!(container_id.is_none());
+
+        // Receiver should still get Timeout result
+        assert_eq!(rx.await.unwrap(), InvocationResult::Timeout);
+    }
+
+    #[tokio::test]
+    async fn store_pending_with_container_id_tracks_correctly() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx, rx) = oneshot::channel();
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_pending(request_id, "test-func".into(), Some("ctr-123".into()), tx)
+            .await;
+
+        // Complete normally — should still work
+        assert!(bridge.complete_invocation(request_id, "ok".into()).await);
+        assert_eq!(
+            rx.await.unwrap(),
+            InvocationResult::Success { body: "ok".into() }
+        );
     }
 }

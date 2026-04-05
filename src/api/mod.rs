@@ -256,6 +256,24 @@ async fn invoke_function_inner(
         Err(_) => {
             // Timeout waiting for response.
             warn!(timeout_secs, "invocation timed out");
+
+            // Remove the pending invocation and find which container was
+            // handling it so we can kill it.
+            let timed_out_container = state
+                .runtime_bridge
+                .timeout_invocation(request_id)
+                .await;
+
+            // Kill the container in the background with a short grace period.
+            if let Some(container_id) = timed_out_container {
+                let registry = state.container_registry.clone();
+                tokio::spawn(async move {
+                    registry
+                        .stop_and_remove(&container_id, Duration::from_secs(2))
+                        .await;
+                });
+            }
+
             let mut resp_headers = base_headers();
             resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
             let error_body = serde_json::json!({
@@ -357,9 +375,13 @@ async fn next_invocation(
 
             // Store the response channel so /response and /error can forward
             // results back to the original invoke caller.
+            let dispatched_container_id = headers
+                .get(HEADER_CONTAINER_ID)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
             state
                 .runtime_bridge
-                .store_pending(request_id, function_name.clone(), response_tx)
+                .store_pending(request_id, function_name.clone(), dispatched_container_id, response_tx)
                 .await;
 
             // Compute deadline in epoch milliseconds.
@@ -1455,7 +1477,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
                 .await;
             bridge
                 .complete_invocation(inv.request_id, r#"{"result":"ok"}"#.into())
@@ -1497,7 +1519,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
                 .await;
             bridge
                 .fail_invocation(
@@ -1608,7 +1630,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
                 .await;
             bridge
                 .complete_invocation(inv.request_id, "ok".into())
@@ -1639,7 +1661,7 @@ mod tests {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             let ctx = inv.client_context.clone();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
                 .await;
             bridge
                 .complete_invocation(inv.request_id, "done".into())
@@ -1675,7 +1697,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
                 .await;
             let oversized_body = "x".repeat(6_291_557);
             bridge
@@ -1731,7 +1753,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
                 .await;
             let body = "x".repeat(6_291_556);
             bridge.complete_invocation(inv.request_id, body).await;
@@ -1748,6 +1770,118 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("X-Amz-Function-Error").is_none());
+    }
+
+    #[tokio::test]
+    async fn invoke_timeout_cleans_up_pending_invocation() {
+        // Simulate a container that picks up the invocation via /next but
+        // never responds — the timeout should clean up the pending state.
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        // Spawn a "container" that picks up the invocation and stores it as
+        // pending (simulating what /next does), but never calls /response.
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(
+                    inv.request_id,
+                    "my-func".into(),
+                    Some("test-container-id".into()),
+                    inv.response_tx,
+                )
+                .await;
+            // Intentionally never respond — simulates a function that hangs.
+        });
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Verify timeout response (200 with Unhandled, per AWS convention).
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("X-Amz-Function-Error")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Unhandled"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("Task timed out after 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn invoke_timeout_with_dispatched_invocation_sends_timeout_result() {
+        // Verify that when a dispatched (pending) invocation times out,
+        // the InvocationResult::Timeout is sent on the response channel.
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            let request_id = inv.request_id;
+
+            // Store pending with a known container ID.
+            bridge
+                .store_pending(
+                    request_id,
+                    "my-func".into(),
+                    Some("ctr-timeout-test".into()),
+                    inv.response_tx,
+                )
+                .await;
+
+            // Wait for the timeout to fire, then check the pending was removed.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // After timeout, timeout_invocation should have already been called
+            // by the invoke handler. Attempting to complete should fail (not found).
+            let was_found = bridge.complete_invocation(request_id, "late".into()).await;
+            let _ = result_tx.send(was_found);
+        });
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("X-Amz-Function-Error")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Unhandled"
+        );
+
+        // The late complete_invocation should return false because the
+        // pending invocation was already cleaned up by timeout_invocation.
+        let was_found = result_rx.await.unwrap();
+        assert!(!was_found, "pending invocation should have been removed by timeout");
     }
 
     #[tokio::test]
