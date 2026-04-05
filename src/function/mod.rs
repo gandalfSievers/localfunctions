@@ -3,8 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
-use crate::types::FunctionConfig;
+use crate::types::{FunctionConfig, Invocation, ServiceError};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -131,6 +132,98 @@ pub fn parse_functions_config(
         functions,
         runtime_images: raw.runtime_images,
     })
+}
+
+// ---------------------------------------------------------------------------
+// FunctionManager
+// ---------------------------------------------------------------------------
+
+/// Central manager that holds loaded function definitions, provides lookup and
+/// listing, and maintains per-function invocation channels for routing payloads
+/// to containers.
+#[allow(dead_code)]
+pub struct FunctionManager {
+    functions: HashMap<String, FunctionConfig>,
+    runtime_images: HashMap<String, String>,
+    /// Per-function sender for routing invocations to container workers.
+    invocation_txs: HashMap<String, mpsc::Sender<Invocation>>,
+    region: String,
+    account_id: String,
+}
+
+#[allow(dead_code)]
+impl FunctionManager {
+    /// Create a new `FunctionManager` from a parsed `FunctionsConfig`.
+    ///
+    /// For each function an mpsc channel is created (with `buffer_size` capacity)
+    /// whose receiver should be consumed by the container/worker layer.
+    pub fn new(
+        config: FunctionsConfig,
+        region: String,
+        account_id: String,
+        buffer_size: usize,
+    ) -> (Self, HashMap<String, mpsc::Receiver<Invocation>>) {
+        let mut invocation_txs = HashMap::new();
+        let mut invocation_rxs = HashMap::new();
+
+        for name in config.functions.keys() {
+            let (tx, rx) = mpsc::channel(buffer_size);
+            invocation_txs.insert(name.clone(), tx);
+            invocation_rxs.insert(name.clone(), rx);
+        }
+
+        let manager = Self {
+            functions: config.functions,
+            runtime_images: config.runtime_images,
+            invocation_txs,
+            region,
+            account_id,
+        };
+
+        (manager, invocation_rxs)
+    }
+
+    /// Look up a function by name, returning its configuration.
+    ///
+    /// Returns `ServiceError::ResourceNotFound` if no function with the given
+    /// name is configured.
+    pub fn get_function(&self, name: &str) -> Result<&FunctionConfig, ServiceError> {
+        self.functions
+            .get(name)
+            .ok_or_else(|| ServiceError::ResourceNotFound(name.to_string()))
+    }
+
+    /// Return all configured functions as a slice-like iterator.
+    pub fn list_functions(&self) -> Vec<&FunctionConfig> {
+        self.functions.values().collect()
+    }
+
+    /// Get the invocation sender for a function so callers can route payloads.
+    ///
+    /// Returns `ServiceError::ResourceNotFound` if the function does not exist.
+    pub fn invocation_tx(&self, name: &str) -> Result<&mpsc::Sender<Invocation>, ServiceError> {
+        self.invocation_txs
+            .get(name)
+            .ok_or_else(|| ServiceError::ResourceNotFound(name.to_string()))
+    }
+
+    /// Generate an AWS-format ARN for the given function.
+    ///
+    /// Format: `arn:aws:lambda:{region}:{account_id}:function:{function_name}`
+    pub fn arn(&self, function_name: &str) -> Result<String, ServiceError> {
+        if !self.functions.contains_key(function_name) {
+            return Err(ServiceError::ResourceNotFound(function_name.to_string()));
+        }
+        Ok(format!(
+            "arn:aws:lambda:{}:{}:function:{}",
+            self.region, self.account_id, function_name
+        ))
+    }
+
+    /// Return the number of configured functions.
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +745,121 @@ mod tests {
         let config = load_functions_config(&file, dir.path()).unwrap();
         assert_eq!(config.functions.len(), 1);
         assert!(config.functions["f1"].code_path.starts_with(dir.path()));
+    }
+
+    // -- runtime_images map --------------------------------------------------
+
+    // -- FunctionManager -----------------------------------------------------
+
+    fn test_functions_config() -> FunctionsConfig {
+        let json = r#"{
+            "functions": {
+                "my-python-func": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./functions/py",
+                    "timeout": 30,
+                    "memory_size": 256
+                },
+                "my-node-func": {
+                    "runtime": "nodejs20.x",
+                    "handler": "index.handler",
+                    "code_path": "./functions/node"
+                }
+            },
+            "runtime_images": {
+                "python3.12": "public.ecr.aws/lambda/python:3.12"
+            }
+        }"#;
+        parse_functions_config(json, &base()).unwrap()
+    }
+
+    #[test]
+    fn function_manager_loads_all_functions() {
+        let config = test_functions_config();
+        let (mgr, _rxs) = FunctionManager::new(config, "us-east-1".into(), "123456789012".into(), 10);
+        assert_eq!(mgr.function_count(), 2);
+    }
+
+    #[test]
+    fn function_manager_get_existing_function() {
+        let config = test_functions_config();
+        let (mgr, _rxs) = FunctionManager::new(config, "us-east-1".into(), "123456789012".into(), 10);
+
+        let f = mgr.get_function("my-python-func").unwrap();
+        assert_eq!(f.name, "my-python-func");
+        assert_eq!(f.runtime, "python3.12");
+        assert_eq!(f.handler, "main.handler");
+    }
+
+    #[test]
+    fn function_manager_get_missing_function_returns_error() {
+        let config = test_functions_config();
+        let (mgr, _rxs) = FunctionManager::new(config, "us-east-1".into(), "123456789012".into(), 10);
+
+        let err = mgr.get_function("nonexistent").unwrap_err();
+        assert!(matches!(err, ServiceError::ResourceNotFound(_)));
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn function_manager_list_returns_all_functions() {
+        let config = test_functions_config();
+        let (mgr, _rxs) = FunctionManager::new(config, "us-east-1".into(), "123456789012".into(), 10);
+
+        let list = mgr.list_functions();
+        assert_eq!(list.len(), 2);
+
+        let names: Vec<&str> = list.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"my-python-func"));
+        assert!(names.contains(&"my-node-func"));
+    }
+
+    #[test]
+    fn function_manager_arn_generation() {
+        let config = test_functions_config();
+        let (mgr, _rxs) = FunctionManager::new(config, "us-west-2".into(), "123456789012".into(), 10);
+
+        let arn = mgr.arn("my-python-func").unwrap();
+        assert_eq!(arn, "arn:aws:lambda:us-west-2:123456789012:function:my-python-func");
+    }
+
+    #[test]
+    fn function_manager_arn_missing_function_returns_error() {
+        let config = test_functions_config();
+        let (mgr, _rxs) = FunctionManager::new(config, "us-east-1".into(), "123456789012".into(), 10);
+
+        let err = mgr.arn("nonexistent").unwrap_err();
+        assert!(matches!(err, ServiceError::ResourceNotFound(_)));
+    }
+
+    #[test]
+    fn function_manager_invocation_channels_created() {
+        let config = test_functions_config();
+        let (mgr, rxs) = FunctionManager::new(config, "us-east-1".into(), "123456789012".into(), 10);
+
+        // Each function should have a tx and rx
+        assert!(mgr.invocation_tx("my-python-func").is_ok());
+        assert!(mgr.invocation_tx("my-node-func").is_ok());
+        assert!(mgr.invocation_tx("nonexistent").is_err());
+
+        assert!(rxs.contains_key("my-python-func"));
+        assert!(rxs.contains_key("my-node-func"));
+        assert_eq!(rxs.len(), 2);
+    }
+
+    #[test]
+    fn function_manager_empty_config() {
+        let config = FunctionsConfig {
+            functions: HashMap::new(),
+            runtime_images: HashMap::new(),
+        };
+        let (mgr, rxs) = FunctionManager::new(config, "us-east-1".into(), "000000000000".into(), 10);
+
+        assert_eq!(mgr.function_count(), 0);
+        assert!(mgr.list_functions().is_empty());
+        assert!(rxs.is_empty());
+        assert!(mgr.get_function("any").is_err());
     }
 
     // -- runtime_images map --------------------------------------------------
