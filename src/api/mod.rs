@@ -97,10 +97,18 @@ async fn invoke_function_inner(
     body: Bytes,
     request_id: Uuid,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
+    // Build base headers included in every invoke response.
+    let base_headers = || -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("X-Amz-Request-Id", request_id.to_string().parse().unwrap());
+        h.insert("X-Amz-Executed-Version", "$LATEST".parse().unwrap());
+        h
+    };
+
     // Validate function name from the URL path.
     if let Err(e) = validate_function_name(&function_name) {
         let err = ServiceError::InvalidRequestContent(e.to_string());
-        return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+        return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
     }
 
     // Log payload at DEBUG level only — never at INFO or above.
@@ -115,7 +123,7 @@ async fn invoke_function_inner(
         let err = ServiceError::ServiceException(
             "Service is shutting down, not accepting new invocations".into(),
         );
-        return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+        return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
     }
 
     // Check X-Amz-Invocation-Type — only RequestResponse is supported.
@@ -125,7 +133,7 @@ async fn invoke_function_inner(
                 "Unsupported invocation type '{}'. Only 'RequestResponse' is supported.",
                 invocation_type
             ));
-            return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+            return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
         }
     }
 
@@ -134,7 +142,7 @@ async fn invoke_function_inner(
         Some(config) => config,
         None => {
             let err = ServiceError::ResourceNotFound(function_name);
-            return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+            return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
         }
     };
 
@@ -167,7 +175,7 @@ async fn invoke_function_inner(
             let err = ServiceError::ServiceException(e.to_string());
             return (
                 StatusCode::BAD_GATEWAY,
-                HeaderMap::new(),
+                base_headers(),
                 err.to_aws_response().to_json_bytes(),
             );
         }
@@ -180,7 +188,7 @@ async fn invoke_function_inner(
         Ok(Ok(invocation_result)) => match invocation_result {
             crate::types::InvocationResult::Success { body } => {
                 info!("invocation succeeded");
-                (StatusCode::OK, HeaderMap::new(), body.into_bytes())
+                (StatusCode::OK, base_headers(), body.into_bytes())
             }
             crate::types::InvocationResult::Error {
                 error_type,
@@ -191,8 +199,8 @@ async fn invoke_function_inner(
                     error_message = %error_message,
                     "function returned error"
                 );
-                let mut resp_headers = HeaderMap::new();
-                resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
+                let mut resp_headers = base_headers();
+                resp_headers.insert("X-Amz-Function-Error", "Handled".parse().unwrap());
                 let error_body = serde_json::json!({
                     "errorType": error_type,
                     "errorMessage": error_message,
@@ -201,12 +209,12 @@ async fn invoke_function_inner(
             }
             crate::types::InvocationResult::Timeout => {
                 warn!("function timed out");
-                let mut resp_headers = HeaderMap::new();
+                let mut resp_headers = base_headers();
                 resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
                 let error_body = serde_json::json!({
                     "errorMessage": format!("Task timed out after {} seconds", timeout_secs),
                 });
-                (StatusCode::REQUEST_TIMEOUT, resp_headers, serde_json::to_vec(&error_body).unwrap())
+                (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
             }
         },
         Ok(Err(_)) => {
@@ -216,19 +224,19 @@ async fn invoke_function_inner(
             );
             (
                 StatusCode::BAD_GATEWAY,
-                HeaderMap::new(),
+                base_headers(),
                 err.to_aws_response().to_json_bytes(),
             )
         }
         Err(_) => {
             // Timeout waiting for response.
             warn!(timeout_secs, "invocation timed out");
-            let mut resp_headers = HeaderMap::new();
+            let mut resp_headers = base_headers();
             resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
             let error_body = serde_json::json!({
                 "errorMessage": format!("Task timed out after {} seconds", timeout_secs),
             });
-            (StatusCode::REQUEST_TIMEOUT, resp_headers, serde_json::to_vec(&error_body).unwrap())
+            (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
         }
     }
 }
@@ -691,6 +699,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Invocation errors include request-id but NOT function-error header
+        assert!(resp.headers().get("X-Amz-Request-Id").is_some());
+        assert_eq!(
+            resp.headers().get("X-Amz-Executed-Version").unwrap().to_str().unwrap(),
+            "$LATEST"
+        );
+        assert!(resp.headers().get("X-Amz-Function-Error").is_none());
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1431,6 +1446,13 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("X-Amz-Function-Error").is_none());
+        // Verify AWS-compatible headers
+        let req_id = resp.headers().get("X-Amz-Request-Id").unwrap().to_str().unwrap();
+        uuid::Uuid::parse_str(req_id).expect("X-Amz-Request-Id should be a valid UUID");
+        assert_eq!(
+            resp.headers().get("X-Amz-Executed-Version").unwrap().to_str().unwrap(),
+            "$LATEST"
+        );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1438,7 +1460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_function_error_returns_200_with_error_header() {
+    async fn invoke_function_error_returns_200_with_handled_error_header() {
         let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
         let runtime_bridge = state.runtime_bridge.clone();
 
@@ -1471,7 +1493,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("X-Amz-Function-Error").unwrap().to_str().unwrap(),
-            "Unhandled"
+            "Handled"
+        );
+        // Verify AWS-compatible headers
+        let req_id = resp.headers().get("X-Amz-Request-Id").unwrap().to_str().unwrap();
+        uuid::Uuid::parse_str(req_id).expect("X-Amz-Request-Id should be a valid UUID");
+        assert_eq!(
+            resp.headers().get("X-Amz-Executed-Version").unwrap().to_str().unwrap(),
+            "$LATEST"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1482,7 +1511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_timeout_returns_408() {
+    async fn invoke_timeout_returns_200_with_unhandled_error_header() {
         // Use a very short timeout (1 second) and never respond.
         let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
 
@@ -1497,10 +1526,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("X-Amz-Function-Error").unwrap().to_str().unwrap(),
             "Unhandled"
+        );
+        // Verify AWS-compatible headers
+        let req_id = resp.headers().get("X-Amz-Request-Id").unwrap().to_str().unwrap();
+        uuid::Uuid::parse_str(req_id).expect("X-Amz-Request-Id should be a valid UUID");
+        assert_eq!(
+            resp.headers().get("X-Amz-Executed-Version").unwrap().to_str().unwrap(),
+            "$LATEST"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
