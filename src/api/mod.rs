@@ -1,5 +1,6 @@
 mod eventstream;
 pub(crate) mod function_url;
+mod sample_events;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -165,6 +166,9 @@ pub fn invoke_routes() -> Router<AppState> {
             "/2021-11-15/functions/:function_name/response-streaming-invocations",
             post(invoke_function_streaming),
         )
+        // Sample event payload generation endpoints.
+        .route("/admin/sample-events", get(sample_events::list_sample_events))
+        .route("/admin/sample-events/:source", get(sample_events::get_sample_event))
         // Function URL endpoints — placed last so static routes take priority.
         .route(
             "/:function_name",
