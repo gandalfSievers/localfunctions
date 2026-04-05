@@ -38,6 +38,12 @@ pub struct Config {
     /// Whether to mount the host ~/.aws directory read-only into function
     /// containers (at /root/.aws). Default: false.
     pub mount_aws_credentials: bool,
+    /// Whether to watch function code_path directories for changes and
+    /// automatically recycle containers when code is modified. Default: true.
+    pub hot_reload: bool,
+    /// Debounce window in milliseconds for file change events. Rapid changes
+    /// within this window are coalesced into a single reload. Default: 500ms.
+    pub hot_reload_debounce_ms: u64,
 }
 
 /// Controls the format of log output.
@@ -94,6 +100,8 @@ impl Config {
         let container_acquire_timeout = parse_env("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT", "10")?;
         let forward_aws_credentials = parse_env("LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS", "true")?;
         let mount_aws_credentials = parse_env("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS", "false")?;
+        let hot_reload = parse_env("LOCAL_LAMBDA_HOT_RELOAD", "true")?;
+        let hot_reload_debounce_ms = parse_env("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS", "500")?;
 
         Ok(Config {
             host,
@@ -115,6 +123,8 @@ impl Config {
             container_acquire_timeout,
             forward_aws_credentials,
             mount_aws_credentials,
+            hot_reload,
+            hot_reload_debounce_ms,
         })
     }
 }
@@ -181,6 +191,8 @@ mod tests {
             "LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT",
             "LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS",
             "LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS",
+            "LOCAL_LAMBDA_HOT_RELOAD",
+            "LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS",
         ] {
             std::env::remove_var(key);
         }
@@ -205,6 +217,8 @@ mod tests {
         assert_eq!(config.container_acquire_timeout, 10);
         assert!(config.forward_aws_credentials);
         assert!(!config.mount_aws_credentials);
+        assert!(config.hot_reload);
+        assert_eq!(config.hot_reload_debounce_ms, 500);
     }
 
     #[test]
@@ -506,5 +520,57 @@ mod tests {
         let result = Config::from_env();
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_MAX_ASYNC_BODY_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_hot_reload_default_true() {
+        std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD");
+        let config = Config::from_env().unwrap();
+        assert!(config.hot_reload);
+    }
+
+    #[test]
+    #[serial]
+    fn test_hot_reload_disabled() {
+        std::env::set_var("LOCAL_LAMBDA_HOT_RELOAD", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.hot_reload);
+        std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_hot_reload_invalid() {
+        std::env::set_var("LOCAL_LAMBDA_HOT_RELOAD", "yes");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_hot_reload_debounce_ms_default() {
+        std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.hot_reload_debounce_ms, 500);
+    }
+
+    #[test]
+    #[serial]
+    fn test_hot_reload_debounce_ms_custom() {
+        std::env::set_var("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS", "1000");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.hot_reload_debounce_ms, 1000);
+        std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_hot_reload_debounce_ms_invalid() {
+        std::env::set_var("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS", "abc");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS");
     }
 }

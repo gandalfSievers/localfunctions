@@ -7,6 +7,7 @@ mod metrics;
 mod runtime;
 mod server;
 mod types;
+mod watcher;
 
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -99,6 +100,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let reaper_shutdown_rx = shutdown_rx.clone();
     let event_monitor_shutdown_rx = shutdown_rx.clone();
+    let watcher_shutdown_rx = shutdown_rx.clone();
     let extension_registry = Arc::new(extensions::ExtensionRegistry::new(shutdown_rx.clone()));
     let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_senders, invocation_receivers, shutdown_rx));
 
@@ -172,6 +174,24 @@ async fn main() -> Result<()> {
             )
             .await;
         });
+    }
+
+    // Spawn file watcher for hot reload (if enabled).
+    if state.config.hot_reload {
+        let watcher_functions = state.functions.clone();
+        let watcher_registry = container_registry.clone();
+        let debounce_ms = state.config.hot_reload_debounce_ms;
+        tokio::spawn(async move {
+            watcher::watch_code_paths(
+                watcher_functions,
+                watcher_registry,
+                debounce_ms,
+                watcher_shutdown_rx,
+            )
+            .await;
+        });
+    } else {
+        info!("hot reload disabled");
     }
 
     // Start both API servers (blocks until shutdown signal)

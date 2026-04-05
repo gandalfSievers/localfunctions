@@ -48,6 +48,8 @@ async fn build_state(
         forward_aws_credentials: true,
         mount_aws_credentials: false,
         max_async_body_size: 256 * 1024,
+        hot_reload: false,
+        hot_reload_debounce_ms: 500,
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
