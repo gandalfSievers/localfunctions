@@ -4,8 +4,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use serde::Serialize;
-use tracing::{debug, warn};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::function::validate_function_name;
 use crate::server::AppState;
@@ -180,10 +181,23 @@ async fn next_invocation(
     // Long-poll until an invocation is available or shutdown.
     match state.runtime_bridge.next_invocation(&function_name).await {
         Some(invocation) => {
+            // Destructure to separate response_tx from the rest.
+            let request_id = invocation.request_id;
+            let payload = invocation.payload;
+            let deadline = invocation.deadline;
+            let trace_id = invocation.trace_id;
+            let response_tx = invocation.response_tx;
+
+            // Store the response channel so /response and /error can forward
+            // results back to the original invoke caller.
+            state
+                .runtime_bridge
+                .store_pending(request_id, response_tx)
+                .await;
+
             // Compute deadline in epoch milliseconds.
             let deadline_ms = {
-                let remaining = invocation
-                    .deadline
+                let remaining = deadline
                     .saturating_duration_since(tokio::time::Instant::now());
                 let epoch_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -202,7 +216,7 @@ async fn next_invocation(
             let mut response_headers = HeaderMap::new();
             response_headers.insert(
                 "Lambda-Runtime-Aws-Request-Id",
-                invocation.request_id.to_string().parse().unwrap(),
+                request_id.to_string().parse().unwrap(),
             );
             response_headers.insert(
                 "Lambda-Runtime-Deadline-Ms",
@@ -213,7 +227,7 @@ async fn next_invocation(
                 arn.parse().unwrap(),
             );
 
-            if let Some(ref trace_id) = invocation.trace_id {
+            if let Some(ref trace_id) = trace_id {
                 response_headers.insert(
                     "Lambda-Runtime-Trace-Id",
                     trace_id.parse().unwrap(),
@@ -222,11 +236,11 @@ async fn next_invocation(
 
             debug!(
                 function = %function_name,
-                request_id = %invocation.request_id,
+                request_id = %request_id,
                 "dispatching invocation to container"
             );
 
-            (StatusCode::OK, response_headers, invocation.payload.to_vec())
+            (StatusCode::OK, response_headers, payload.to_vec())
         }
         None => {
             // Channel closed or shutdown — return a 500 to let the runtime
@@ -241,27 +255,194 @@ async fn next_invocation(
     }
 }
 
+/// Error body sent by Lambda runtimes when reporting invocation or init errors.
+#[derive(Debug, Deserialize)]
+#[allow(non_snake_case, dead_code)]
+struct RuntimeErrorRequest {
+    #[serde(default)]
+    errorMessage: String,
+    #[serde(default)]
+    errorType: String,
+    #[serde(default)]
+    stackTrace: Vec<String>,
+}
+
 /// POST /2018-06-01/runtime/invocation/:request_id/response
+///
+/// Called by the Lambda runtime after successfully processing an invocation.
+/// Forwards the response body back to the original invoke caller.
 async fn invocation_response(
-    State(_state): State<AppState>,
-    Path(_request_id): Path<String>,
-    _body: Bytes,
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    body: Bytes,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    let uuid = match Uuid::parse_str(&request_id) {
+        Ok(id) => id,
+        Err(_) => {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Invalid request_id: {}",
+                request_id
+            ));
+            return (err.status_code(), Json(serde_json::to_value(err.to_aws_response()).unwrap()));
+        }
+    };
+
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+
+    debug!(
+        request_id = %uuid,
+        payload_size = body.len(),
+        "invocation response received"
+    );
+
+    if state.runtime_bridge.complete_invocation(uuid, body_str).await {
+        (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "OK"})))
+    } else {
+        let err = ServiceError::InvalidRequestContent(format!(
+            "Unknown request_id: {}",
+            request_id
+        ));
+        (err.status_code(), Json(serde_json::to_value(err.to_aws_response()).unwrap()))
+    }
 }
 
 /// POST /2018-06-01/runtime/invocation/:request_id/error
+///
+/// Called by the Lambda runtime when the function handler returns an error.
+/// Formats the error in AWS error format and forwards it to the invoke caller.
 async fn invocation_error(
-    State(_state): State<AppState>,
-    Path(_request_id): Path<String>,
-    _body: Bytes,
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    let uuid = match Uuid::parse_str(&request_id) {
+        Ok(id) => id,
+        Err(_) => {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Invalid request_id: {}",
+                request_id
+            ));
+            return (err.status_code(), Json(serde_json::to_value(err.to_aws_response()).unwrap()));
+        }
+    };
+
+    // The error type can come from the header or the body.
+    let header_error_type = headers
+        .get("Lambda-Runtime-Function-Error-Type")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let (error_type, error_message) = match serde_json::from_slice::<RuntimeErrorRequest>(&body) {
+        Ok(err_body) => {
+            let etype = if err_body.errorType.is_empty() {
+                header_error_type.unwrap_or_else(|| "Runtime.UnknownError".into())
+            } else {
+                err_body.errorType
+            };
+            let emsg = if err_body.errorMessage.is_empty() {
+                "Unknown error".into()
+            } else {
+                err_body.errorMessage
+            };
+            (etype, emsg)
+        }
+        Err(_) => {
+            let etype = header_error_type.unwrap_or_else(|| "Runtime.UnknownError".into());
+            let emsg = String::from_utf8_lossy(&body).into_owned();
+            let emsg = if emsg.is_empty() {
+                "Unknown error".into()
+            } else {
+                emsg
+            };
+            (etype, emsg)
+        }
+    };
+
+    warn!(
+        request_id = %uuid,
+        error_type = %error_type,
+        error_message = %error_message,
+        "invocation error received"
+    );
+
+    if state
+        .runtime_bridge
+        .fail_invocation(uuid, error_type, error_message)
+        .await
+    {
+        (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "OK"})))
+    } else {
+        let err = ServiceError::InvalidRequestContent(format!(
+            "Unknown request_id: {}",
+            request_id
+        ));
+        (err.status_code(), Json(serde_json::to_value(err.to_aws_response()).unwrap()))
+    }
 }
 
 /// POST /2018-06-01/runtime/init/error
-async fn init_error(State(_state): State<AppState>, _body: Bytes) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+///
+/// Called by the Lambda runtime when it fails to initialize (e.g. handler not
+/// found, syntax error). Drains pending invocations for the function and
+/// returns an error to each caller.
+async fn init_error(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let function_name = match headers
+        .get(HEADER_FUNCTION_NAME)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(name) => name.to_string(),
+        None => {
+            warn!("runtime /init/error called without {} header", HEADER_FUNCTION_NAME);
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Missing required header: {}",
+                HEADER_FUNCTION_NAME
+            ));
+            return (err.status_code(), Json(serde_json::to_value(err.to_aws_response()).unwrap()));
+        }
+    };
+
+    let (error_type, error_message) = match serde_json::from_slice::<RuntimeErrorRequest>(&body) {
+        Ok(err_body) => {
+            let etype = if err_body.errorType.is_empty() {
+                "Runtime.InitError".into()
+            } else {
+                err_body.errorType
+            };
+            let emsg = if err_body.errorMessage.is_empty() {
+                "Runtime failed to initialize".into()
+            } else {
+                err_body.errorMessage
+            };
+            (etype, emsg)
+        }
+        Err(_) => (
+            "Runtime.InitError".to_string(),
+            "Runtime failed to initialize".to_string(),
+        ),
+    };
+
+    info!(
+        function = %function_name,
+        error_type = %error_type,
+        error_message = %error_message,
+        "runtime init error received"
+    );
+
+    let failed_count = state.runtime_bridge.fail_init(&function_name).await;
+    if failed_count > 0 {
+        info!(
+            function = %function_name,
+            failed_count,
+            "failed pending invocations due to init error"
+        );
+    }
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "error"})))
 }
 
 #[cfg(test)]
@@ -550,45 +731,356 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_invocation_response_returns_not_implemented() {
+    async fn runtime_invocation_response_invalid_uuid_returns_400() {
         let app = runtime_routes().with_state(test_state());
         let resp = app
             .oneshot(
-                Request::post("/2018-06-01/runtime/invocation/abc-123/response")
-                    .body(Body::from("{}"))
+                Request::post("/2018-06-01/runtime/invocation/not-a-uuid/response")
+                    .body(Body::from(r#"{"result": "ok"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "InvalidRequestContentException");
     }
 
     #[tokio::test]
-    async fn runtime_invocation_error_returns_not_implemented() {
+    async fn runtime_invocation_response_unknown_request_id_returns_400() {
         let app = runtime_routes().with_state(test_state());
+        let unknown_id = uuid::Uuid::new_v4();
         let resp = app
             .oneshot(
-                Request::post("/2018-06-01/runtime/invocation/abc-123/error")
-                    .body(Body::from("{}"))
+                Request::post(format!(
+                    "/2018-06-01/runtime/invocation/{}/response",
+                    unknown_id
+                ))
+                .body(Body::from(r#"{"result": "ok"}"#))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn runtime_invocation_response_forwards_to_caller() {
+        use crate::types::Invocation;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (tx, rx) = mpsc::channel(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        // Queue an invocation
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request_id = uuid::Uuid::new_v4();
+        let inv = Invocation {
+            request_id,
+            function_name: "my-func".into(),
+            payload: bytes::Bytes::from(r#"{"input":"data"}"#),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
+            response_tx: resp_tx,
+        };
+        tx.send(inv).await.unwrap();
+
+        // First, dispatch the invocation via /next (this stores the pending response_tx)
+        let app = runtime_routes().with_state(state.clone());
+        let next_resp = app
+            .oneshot(
+                Request::get("/2018-06-01/runtime/invocation/next")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(next_resp.status(), StatusCode::OK);
+
+        // Now post the response
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!(
+                    "/2018-06-01/runtime/invocation/{}/response",
+                    request_id
+                ))
+                .body(Body::from(r#"{"result": "success"}"#))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Verify the caller received the result
+        let result = resp_rx.await.unwrap();
+        assert_eq!(
+            result,
+            crate::types::InvocationResult::Success {
+                body: r#"{"result": "success"}"#.into()
+            }
+        );
     }
 
     #[tokio::test]
-    async fn runtime_init_error_returns_not_implemented() {
+    async fn runtime_invocation_error_invalid_uuid_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/2018-06-01/runtime/invocation/not-a-uuid/error")
+                    .body(Body::from(r#"{"errorMessage":"bad","errorType":"RuntimeError"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn runtime_invocation_error_forwards_to_caller() {
+        use crate::types::Invocation;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (tx, rx) = mpsc::channel(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request_id = uuid::Uuid::new_v4();
+        let inv = Invocation {
+            request_id,
+            function_name: "my-func".into(),
+            payload: bytes::Bytes::from("{}"),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
+            response_tx: resp_tx,
+        };
+        tx.send(inv).await.unwrap();
+
+        // Dispatch via /next
+        let app = runtime_routes().with_state(state.clone());
+        let next_resp = app
+            .oneshot(
+                Request::get("/2018-06-01/runtime/invocation/next")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_resp.status(), StatusCode::OK);
+
+        // Post error with Lambda-Runtime-Function-Error-Type header
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!(
+                    "/2018-06-01/runtime/invocation/{}/error",
+                    request_id
+                ))
+                .header("Lambda-Runtime-Function-Error-Type", "Runtime.HandlerError")
+                .body(Body::from(
+                    r#"{"errorMessage":"something went wrong","errorType":"RuntimeError"}"#,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Verify error was forwarded
+        let result = resp_rx.await.unwrap();
+        assert_eq!(
+            result,
+            crate::types::InvocationResult::Error {
+                error_type: "RuntimeError".into(),
+                error_message: "something went wrong".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_invocation_error_uses_header_when_body_has_no_type() {
+        use crate::types::Invocation;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (tx, rx) = mpsc::channel(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request_id = uuid::Uuid::new_v4();
+        let inv = Invocation {
+            request_id,
+            function_name: "my-func".into(),
+            payload: bytes::Bytes::from("{}"),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
+            response_tx: resp_tx,
+        };
+        tx.send(inv).await.unwrap();
+
+        // Dispatch via /next
+        let app = runtime_routes().with_state(state.clone());
+        app.oneshot(
+            Request::get("/2018-06-01/runtime/invocation/next")
+                .header("Lambda-Runtime-Function-Name", "my-func")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Post error with type only in header, not body
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!(
+                    "/2018-06-01/runtime/invocation/{}/error",
+                    request_id
+                ))
+                .header("Lambda-Runtime-Function-Error-Type", "Runtime.ImportError")
+                .body(Body::from(r#"{"errorMessage":"module not found"}"#))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let result = resp_rx.await.unwrap();
+        assert_eq!(
+            result,
+            crate::types::InvocationResult::Error {
+                error_type: "Runtime.ImportError".into(),
+                error_message: "module not found".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_init_error_missing_header_returns_400() {
         let app = runtime_routes().with_state(test_state());
         let resp = app
             .oneshot(
                 Request::post("/2018-06-01/runtime/init/error")
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        r#"{"errorMessage":"handler not found","errorType":"Runtime.InitError"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn runtime_init_error_returns_accepted() {
+        use tokio::sync::mpsc;
+
+        let (_tx, rx) = mpsc::channel::<crate::types::Invocation>(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2018-06-01/runtime/init/error")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::from(
+                        r#"{"errorMessage":"handler not found","errorType":"Runtime.InitError"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn runtime_init_error_fails_pending_invocations() {
+        use crate::types::Invocation;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (tx, rx) = mpsc::channel(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        // Queue an invocation (simulating a caller waiting)
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let inv = Invocation {
+            request_id: uuid::Uuid::new_v4(),
+            function_name: "my-func".into(),
+            payload: bytes::Bytes::from("{}"),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
+            response_tx: resp_tx,
+        };
+        tx.send(inv).await.unwrap();
+
+        // Send init error
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2018-06-01/runtime/init/error")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::from(
+                        r#"{"errorMessage":"cannot import module","errorType":"Runtime.ImportModuleError"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // The queued invocation should have received an error
+        let result = resp_rx.await.unwrap();
+        assert_eq!(
+            result,
+            crate::types::InvocationResult::Error {
+                error_type: "InvalidRuntimeException".into(),
+                error_message: "Runtime failed to initialize".into(),
+            }
+        );
     }
 
     #[tokio::test]
