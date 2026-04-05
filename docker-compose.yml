@@ -1,0 +1,30 @@
+services:
+  localfunctions:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "9600:9600"
+      - "9601:9601"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./functions.json:/app/functions.json:ro
+      - ./functions:/app/functions:ro
+    group_add:
+      - "${DOCKER_GID:-0}"
+    environment:
+      - LOCAL_LAMBDA_HOST=0.0.0.0
+      - LOCAL_LAMBDA_PORT=9600
+      - LOCAL_LAMBDA_RUNTIME_PORT=9601
+      - LOCAL_LAMBDA_FUNCTIONS_FILE=/app/functions.json
+      - LOCAL_LAMBDA_DOCKER_NETWORK=localservices
+      - LOCAL_LAMBDA_PULL_IMAGES=true
+      - RUST_LOG=localfunctions=info
+    networks:
+      - localservices
+    restart: unless-stopped
+
+networks:
+  localservices:
+    name: localservices
+    driver: bridge
