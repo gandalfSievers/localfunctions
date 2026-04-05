@@ -1,10 +1,8 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 /// Service-level configuration loaded from environment variables.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Config {
     pub host: IpAddr,
@@ -27,13 +25,13 @@ impl Config {
         let runtime_port = parse_env("LOCAL_LAMBDA_RUNTIME_PORT", "9601")?;
         let region = parse_env::<String>("LOCAL_LAMBDA_REGION", "us-east-1")?;
         let account_id = parse_env::<String>("LOCAL_LAMBDA_ACCOUNT_ID", "000000000000")?;
-        let functions_file = parse_env::<PathBuf>("LOCAL_LAMBDA_FUNCTIONS_FILE", "./functions.json")?;
+        let functions_file =
+            parse_env::<PathBuf>("LOCAL_LAMBDA_FUNCTIONS_FILE", "./functions.json")?;
         let log_level = parse_env::<String>("LOCAL_LAMBDA_LOG_LEVEL", "info")?;
         let shutdown_timeout = parse_env("LOCAL_LAMBDA_SHUTDOWN_TIMEOUT", "30")?;
         let container_idle_timeout = parse_env("LOCAL_LAMBDA_CONTAINER_IDLE_TIMEOUT", "300")?;
         let max_containers = parse_env("LOCAL_LAMBDA_MAX_CONTAINERS", "20")?;
-        let docker_network =
-            parse_env::<String>("LOCAL_LAMBDA_DOCKER_NETWORK", "localfunctions")?;
+        let docker_network = parse_env::<String>("LOCAL_LAMBDA_DOCKER_NETWORK", "localfunctions")?;
 
         Ok(Config {
             host,
@@ -70,8 +68,10 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_defaults() {
         // Clear any env vars that might interfere
         for key in &[
@@ -105,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_custom_env_values() {
         std::env::set_var("LOCAL_LAMBDA_PORT", "8080");
         std::env::set_var("LOCAL_LAMBDA_REGION", "eu-west-1");
@@ -118,6 +119,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_invalid_port() {
         std::env::set_var("LOCAL_LAMBDA_PORT", "not_a_number");
         let result = Config::from_env();
@@ -126,6 +128,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_invalid_host() {
         std::env::set_var("LOCAL_LAMBDA_HOST", "not_an_ip");
         let result = Config::from_env();
