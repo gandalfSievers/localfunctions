@@ -40,6 +40,18 @@
         "LOCALSECRETS_URL": "http://host.docker.internal:9091",
         "LOCALOBJECTSTORAGE_URL": "http://host.docker.internal:9090"
       }
+    },
+    "my-func-with-layers": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./functions/my-func-with-layers",
+      "timeout": 30,
+      "memory_size": 128,
+      "layers": [
+        "./layers/common-utils",
+        "./layers/db-client"
+      ],
+      "environment": {}
     }
   },
   "runtime_images": {

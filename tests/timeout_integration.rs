@@ -68,6 +68,7 @@ async fn build_state(
             image_uri: None,
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
+            layers: vec![],
         },
     );
 

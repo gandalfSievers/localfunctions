@@ -45,6 +45,10 @@ pub struct FunctionConfig {
     /// Valid values: `x86_64` (default) or `arm64`.
     #[serde(default = "default_architecture")]
     pub architecture: String,
+    /// Local directory paths to mount as Lambda Layers at /opt.
+    /// Multiple layers are merged in order, with later layers taking precedence.
+    #[serde(default)]
+    pub layers: Vec<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -234,6 +238,7 @@ mod tests {
             image_uri: None,
             reserved_concurrent_executions: None,
             architecture: "arm64".into(),
+            layers: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -287,6 +292,7 @@ mod tests {
             image_uri: None,
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
+            layers: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -310,6 +316,7 @@ mod tests {
             image_uri: Some("my-lambda:latest".into()),
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
+            layers: vec![],
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("image_uri"));

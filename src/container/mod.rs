@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -690,6 +691,31 @@ impl ContainerManager {
             binds.push(format!("{}:/var/task:ro", code_path));
         }
 
+        // Mount Lambda Layers at /opt (read-only)
+        // When a single layer is configured, mount it directly at /opt.
+        // When multiple layers are configured, create a merged directory so
+        // later layers take precedence for conflicting files, matching AWS
+        // Lambda behavior.
+        if !function.layers.is_empty() {
+            let opt_path = if function.layers.len() == 1 {
+                function.layers[0].to_str().ok_or_else(|| {
+                    ServiceError::ServiceException(format!(
+                        "layer path contains invalid UTF-8: {:?}",
+                        function.layers[0]
+                    ))
+                })?.to_string()
+            } else {
+                // Merge multiple layers into a temporary directory
+                let merged = merge_layers(&function.name, &function.layers)?;
+                merged.to_str().ok_or_else(|| {
+                    ServiceError::ServiceException(
+                        "merged layer path contains invalid UTF-8".to_string(),
+                    )
+                })?.to_string()
+            };
+            binds.push(format!("{}:/opt:ro", opt_path));
+        }
+
         // Optionally mount host ~/.aws directory read-only
         if self.credential_config.mount_aws_dir {
             if let Some(aws_dir) = host_aws_config_dir() {
@@ -1356,6 +1382,55 @@ async fn handle_container_event(
     container_registry.stop_and_remove(&container_id, Duration::from_secs(2)).await;
 }
 
+/// Merge multiple layer directories into a single temporary directory.
+///
+/// Files from each layer are copied in order so that later layers take
+/// precedence for conflicting paths, matching AWS Lambda behaviour.
+/// The merged directory is placed under the system temp dir and must be
+/// cleaned up by the caller (or on container removal).
+fn merge_layers(function_name: &str, layers: &[PathBuf]) -> Result<PathBuf, ServiceError> {
+    let merged_dir = std::env::temp_dir().join(format!("localfunctions-layers-{}-{}", function_name, &uuid::Uuid::new_v4().to_string()[..8]));
+    std::fs::create_dir_all(&merged_dir).map_err(|e| {
+        ServiceError::ServiceException(format!(
+            "failed to create merged layers directory: {}", e
+        ))
+    })?;
+
+    for layer_path in layers {
+        copy_dir_recursive(layer_path, &merged_dir).map_err(|e| {
+            ServiceError::ServiceException(format!(
+                "failed to merge layer '{}': {}", layer_path.display(), e
+            ))
+        })?;
+    }
+
+    debug!(
+        function = %function_name,
+        merged_dir = %merged_dir.display(),
+        layer_count = layers.len(),
+        "merged layers into temp directory"
+    );
+
+    Ok(merged_dir)
+}
+
+/// Recursively copy the contents of `src` into `dst`, overwriting existing files.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path)?;
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Generate a short unique suffix for container names.
 fn uuid_short() -> String {
     let id = uuid::Uuid::new_v4();
@@ -1570,6 +1645,7 @@ mod tests {
             image_uri: None,
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
+            layers: vec![],
         }
     }
 
@@ -2852,6 +2928,7 @@ mod integration_tests {
             image_uri: None,
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
+            layers: vec![],
         };
 
         // Create and start
@@ -3169,5 +3246,66 @@ mod integration_tests {
         // 10240 / 1769 ≈ 5.79 → ~6 vCPUs
         assert!(quota > 500_000, "quota was {quota}");
         assert!(shares > 5000, "shares was {shares}");
+    }
+
+    // -- Layer merging --------------------------------------------------------
+
+    #[test]
+    fn merge_layers_single_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer1 = tmp.path().join("layer1");
+        std::fs::create_dir_all(layer1.join("python")).unwrap();
+        std::fs::write(layer1.join("python/utils.py"), "# utils").unwrap();
+
+        let merged = merge_layers("test-fn", &[layer1]).unwrap();
+        assert!(merged.join("python/utils.py").exists());
+        let content = std::fs::read_to_string(merged.join("python/utils.py")).unwrap();
+        assert_eq!(content, "# utils");
+
+        // Cleanup
+        std::fs::remove_dir_all(&merged).ok();
+    }
+
+    #[test]
+    fn merge_layers_later_layer_takes_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let layer1 = tmp.path().join("layer1");
+        std::fs::create_dir_all(layer1.join("python")).unwrap();
+        std::fs::write(layer1.join("python/utils.py"), "layer1 content").unwrap();
+        std::fs::write(layer1.join("python/shared.py"), "shared from layer1").unwrap();
+
+        let layer2 = tmp.path().join("layer2");
+        std::fs::create_dir_all(layer2.join("python")).unwrap();
+        std::fs::write(layer2.join("python/utils.py"), "layer2 content").unwrap();
+
+        let merged = merge_layers("test-fn", &[layer1, layer2]).unwrap();
+
+        // layer2 should overwrite layer1's utils.py
+        let utils = std::fs::read_to_string(merged.join("python/utils.py")).unwrap();
+        assert_eq!(utils, "layer2 content");
+
+        // layer1's shared.py should still be present
+        let shared = std::fs::read_to_string(merged.join("python/shared.py")).unwrap();
+        assert_eq!(shared, "shared from layer1");
+
+        // Cleanup
+        std::fs::remove_dir_all(&merged).ok();
+    }
+
+    #[test]
+    fn copy_dir_recursive_preserves_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::write(src.join("a/b/file.txt"), "deep").unwrap();
+        std::fs::write(src.join("top.txt"), "top").unwrap();
+
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dst.join("a/b/file.txt")).unwrap(), "deep");
+        assert_eq!(std::fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
     }
 }

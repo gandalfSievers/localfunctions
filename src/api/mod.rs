@@ -324,6 +324,18 @@ fn function_configuration_json(
         });
     }
 
+    if !f.layers.is_empty() {
+        let layer_arns: Vec<String> = f
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("arn:aws:lambda:local:000000000000:layer:{}:{}", p.display(), i + 1))
+            .collect();
+        config["Layers"] = serde_json::json!(
+            layer_arns.iter().map(|arn| serde_json::json!({"Arn": arn})).collect::<Vec<_>>()
+        );
+    }
+
     config
 }
 
@@ -1485,6 +1497,7 @@ mod tests {
                 image_uri: None,
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
+                layers: vec![],
             },
         );
         functions_map.insert(
@@ -1502,6 +1515,7 @@ mod tests {
                 image_uri: Some("my-image:latest".into()),
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
+                layers: vec![],
             },
         );
         let functions = FunctionsConfig {
@@ -2345,6 +2359,7 @@ mod tests {
                 image_uri: None,
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
+                layers: vec![],
             },
         );
         let functions = FunctionsConfig {
@@ -3151,6 +3166,7 @@ mod tests {
                 image_uri: None,
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
+                layers: vec![],
             },
         );
         let functions = FunctionsConfig {

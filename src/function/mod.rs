@@ -77,6 +77,12 @@ pub enum FunctionConfigError {
     #[error("function '{name}': invalid architecture '{value}' — must be 'x86_64' or 'arm64'")]
     InvalidArchitecture { name: String, value: String },
 
+    #[error("function '{name}': layer path '{path}' is invalid — directory traversal is not allowed")]
+    LayerDirectoryTraversal { name: String, path: String },
+
+    #[error("function '{name}': layer path '{path}' does not exist or is not a directory")]
+    LayerPathNotFound { name: String, path: String },
+
     #[error("configuration validation failed with {count} error(s):\n{details}")]
     ValidationErrors { count: usize, details: String },
 }
@@ -106,6 +112,8 @@ struct RawFunctionEntry {
     image_uri: Option<String>,
     reserved_concurrent_executions: Option<u64>,
     architecture: Option<String>,
+    #[serde(default)]
+    layers: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +313,26 @@ pub fn parse_functions_config(
             errors.push(e);
         }
 
+        // Validate and canonicalize layer paths
+        let mut layers = Vec::new();
+        for raw_layer_path in &entry.layers {
+            match canonicalize_layer_path(name, raw_layer_path, base_dir) {
+                Ok(p) => {
+                    if !p.exists() || !p.is_dir() {
+                        errors.push(FunctionConfigError::LayerPathNotFound {
+                            name: name.clone(),
+                            path: raw_layer_path.clone(),
+                        });
+                    }
+                    layers.push(p);
+                }
+                Err(e) => {
+                    errors.push(e);
+                    layers.push(base_dir.join(raw_layer_path));
+                }
+            }
+        }
+
         // Only build the config if there are no errors for this function
         // (we still continue to validate other functions)
         let config = FunctionConfig {
@@ -320,6 +348,7 @@ pub fn parse_functions_config(
             image_uri: entry.image_uri.clone(),
             reserved_concurrent_executions: entry.reserved_concurrent_executions,
             architecture,
+            layers,
         };
 
         functions.insert(name.clone(), config);
@@ -679,6 +708,43 @@ fn canonicalize_code_path(
         return Err(FunctionConfigError::DirectoryTraversal {
             name: name.to_string(),
             path: code_path.to_string(),
+        });
+    }
+
+    Ok(result)
+}
+
+/// Resolve and validate a layer path, preventing directory traversal.
+fn canonicalize_layer_path(
+    name: &str,
+    layer_path: &str,
+    base_dir: &Path,
+) -> Result<PathBuf, FunctionConfigError> {
+    let normalized = if Path::new(layer_path).is_absolute() {
+        PathBuf::from(layer_path)
+    } else {
+        base_dir.join(layer_path)
+    };
+
+    let mut result = PathBuf::new();
+    for component in normalized.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !result.pop() {
+                    return Err(FunctionConfigError::LayerDirectoryTraversal {
+                        name: name.to_string(),
+                        path: layer_path.to_string(),
+                    });
+                }
+            }
+            other => result.push(other),
+        }
+    }
+
+    if !result.starts_with(base_dir) {
+        return Err(FunctionConfigError::LayerDirectoryTraversal {
+            name: name.to_string(),
+            path: layer_path.to_string(),
         });
     }
 
@@ -1965,5 +2031,115 @@ mod tests {
         let err = parse_functions_config(json, dir.path()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid architecture"), "error: {msg}");
+    }
+
+    // -- Layers ---------------------------------------------------------------
+
+    #[test]
+    fn parse_config_with_layers() {
+        let dir = setup_dirs(&["code", "layers/common", "layers/utils"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "layers": ["./layers/common", "./layers/utils"]
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["f1"];
+        assert_eq!(f.layers.len(), 2);
+        assert!(f.layers[0].ends_with("layers/common"));
+        assert!(f.layers[1].ends_with("layers/utils"));
+    }
+
+    #[test]
+    fn parse_config_without_layers() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["f1"];
+        assert!(f.layers.is_empty());
+    }
+
+    #[test]
+    fn parse_config_layer_directory_traversal() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "layers": ["../../etc/secret"]
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "directory traversal");
+    }
+
+    #[test]
+    fn parse_config_layer_path_not_found() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "layers": ["./nonexistent-layer"]
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "does not exist");
+    }
+
+    #[test]
+    fn parse_config_layer_is_file_not_directory() {
+        let dir = setup_dirs(&["code"]);
+        // Create a file (not a directory) at the layer path
+        std::fs::write(dir.path().join("not-a-dir"), "hello").unwrap();
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "layers": ["./not-a-dir"]
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "does not exist");
+    }
+
+    #[test]
+    fn parse_config_empty_layers_array() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "layers": []
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let f = &config.functions["f1"];
+        assert!(f.layers.is_empty());
     }
 }
