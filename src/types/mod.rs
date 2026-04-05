@@ -56,6 +56,13 @@ pub struct FunctionConfig {
     /// AWS Lambda defaults to 2 retries (range 0-2).
     #[serde(default = "default_max_retry_attempts")]
     pub max_retry_attempts: u32,
+    /// Destination function name to invoke when an async invocation succeeds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_success: Option<String>,
+    /// Destination function name to invoke when an async invocation fails
+    /// (after all retries are exhausted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -276,6 +283,8 @@ mod tests {
             layers: vec![],
             function_url_enabled: false,
             max_retry_attempts: 2,
+            on_success: None,
+            on_failure: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -313,6 +322,75 @@ mod tests {
         assert!(config.reserved_concurrent_executions.is_none());
         assert_eq!(config.architecture, "x86_64");
         assert_eq!(config.max_retry_attempts, 2);
+        assert!(config.on_success.is_none());
+        assert!(config.on_failure.is_none());
+    }
+
+    #[test]
+    fn function_config_destinations_custom() {
+        let json = r#"{
+            "name": "f",
+            "runtime": "nodejs20.x",
+            "handler": "index.handler",
+            "code_path": "/code",
+            "on_success": "success-handler",
+            "on_failure": "failure-handler"
+        }"#;
+        let config: FunctionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.on_success, Some("success-handler".into()));
+        assert_eq!(config.on_failure, Some("failure-handler".into()));
+    }
+
+    #[test]
+    fn function_config_destinations_omitted_in_json_when_none() {
+        let config = FunctionConfig {
+            name: "f".into(),
+            runtime: "python3.12".into(),
+            handler: "h".into(),
+            code_path: PathBuf::from("/c"),
+            timeout: 3,
+            memory_size: 128,
+            ephemeral_storage_mb: 512,
+            environment: HashMap::new(),
+            image: None,
+            image_uri: None,
+            reserved_concurrent_executions: None,
+            architecture: "x86_64".into(),
+            layers: vec![],
+            function_url_enabled: false,
+            max_retry_attempts: 2,
+            on_success: None,
+            on_failure: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("on_success"));
+        assert!(!json.contains("on_failure"));
+    }
+
+    #[test]
+    fn function_config_destinations_present_in_json_when_set() {
+        let config = FunctionConfig {
+            name: "f".into(),
+            runtime: "python3.12".into(),
+            handler: "h".into(),
+            code_path: PathBuf::from("/c"),
+            timeout: 3,
+            memory_size: 128,
+            ephemeral_storage_mb: 512,
+            environment: HashMap::new(),
+            image: None,
+            image_uri: None,
+            reserved_concurrent_executions: None,
+            architecture: "x86_64".into(),
+            layers: vec![],
+            function_url_enabled: false,
+            max_retry_attempts: 2,
+            on_success: Some("dest-a".into()),
+            on_failure: Some("dest-b".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"on_success\":\"dest-a\""));
+        assert!(json.contains("\"on_failure\":\"dest-b\""));
     }
 
     #[test]
@@ -346,6 +424,8 @@ mod tests {
             layers: vec![],
             function_url_enabled: false,
             max_retry_attempts: 2,
+            on_success: None,
+            on_failure: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -372,6 +452,8 @@ mod tests {
             layers: vec![],
             function_url_enabled: false,
             max_retry_attempts: 2,
+            on_success: None,
+            on_failure: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("image_uri"));

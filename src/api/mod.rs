@@ -861,13 +861,13 @@ fn invoke_async_background(
         // Swap the invocation type so the inner handler runs the synchronous path.
         headers.insert("X-Amz-Invocation-Type", "RequestResponse".parse().unwrap());
 
-        // Determine per-function retry count (0-2, default 2).
-        let max_retries = state
+        // Look up per-function config for retries and destinations.
+        let (max_retries, on_success, on_failure) = state
             .functions
             .functions
             .get(&function_name)
-            .map(|f| f.max_retry_attempts)
-            .unwrap_or(2);
+            .map(|f| (f.max_retry_attempts, f.on_success.clone(), f.on_failure.clone()))
+            .unwrap_or((2, None, None));
 
         // AWS backoff pattern: 1 minute after first failure, 2 minutes after second.
         let backoff_durations = [
@@ -894,6 +894,22 @@ fn invoke_async_background(
 
             if status == StatusCode::OK {
                 info!(attempt, "async invocation completed successfully");
+
+                // Route to on_success destination if configured.
+                if let Some(ref dest) = on_success {
+                    route_to_destination(DestinationRouteParams {
+                        state: &state,
+                        destination_function: dest,
+                        source_function: &function_name,
+                        request_id: &request_id,
+                        condition: "Success",
+                        approximate_invoke_count: attempt + 1,
+                        request_payload: &body,
+                        response_payload: Some(&resp_body),
+                        error_status_code: None,
+                    })
+                    .await;
+                }
                 return;
             }
 
@@ -908,6 +924,22 @@ fn invoke_async_background(
                     response = %body_str,
                     "async invocation failed after all retries exhausted"
                 );
+
+                // Route to on_failure destination if configured.
+                if let Some(ref dest) = on_failure {
+                    route_to_destination(DestinationRouteParams {
+                        state: &state,
+                        destination_function: dest,
+                        source_function: &function_name,
+                        request_id: &request_id,
+                        condition: "RetriesExhausted",
+                        approximate_invoke_count: attempt,
+                        request_payload: &body,
+                        response_payload: Some(&resp_body),
+                        error_status_code: Some(status.as_u16()),
+                    })
+                    .await;
+                }
                 return;
             }
 
@@ -923,6 +955,167 @@ fn invoke_async_background(
             tokio::time::sleep(backoff).await;
         }
     })
+}
+
+/// Parameters for routing an async invocation result to a destination function.
+struct DestinationRouteParams<'a> {
+    state: &'a AppState,
+    destination_function: &'a str,
+    source_function: &'a str,
+    request_id: &'a Uuid,
+    condition: &'a str,
+    approximate_invoke_count: u32,
+    request_payload: &'a Bytes,
+    response_payload: Option<&'a [u8]>,
+    error_status_code: Option<u16>,
+}
+
+/// Build the standard Lambda destination event wrapper and invoke the
+/// destination function asynchronously (fire-and-forget via Event type).
+///
+/// The wrapper follows the AWS Lambda destination event format:
+/// <https://docs.aws.amazon.com/lambda/latest/dg/invocation-async.html#invocation-async-destinations>
+async fn route_to_destination(params: DestinationRouteParams<'_>) {
+    let DestinationRouteParams {
+        state,
+        destination_function,
+        source_function,
+        request_id,
+        condition,
+        approximate_invoke_count,
+        request_payload,
+        response_payload,
+        error_status_code,
+    } = params;
+    let function_arn = format!(
+        "arn:aws:lambda:{}:{}:function:{}",
+        state.config.region, state.config.account_id, source_function
+    );
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    // Format as ISO 8601 / RFC 3339 with milliseconds (matching AWS format).
+    // We avoid pulling in chrono by formatting manually from the unix timestamp.
+    let timestamp = {
+        // Days from epoch, accounting for leap years.
+        let days = secs / 86400;
+        let time_of_day = secs % 86400;
+        let (year, month, day) = epoch_days_to_ymd(days);
+        let hour = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
+        let second = time_of_day % 60;
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            year, month, day, hour, minute, second, millis
+        )
+    };
+
+    // Parse request payload as JSON value (fallback to raw string).
+    let req_payload_value: serde_json::Value =
+        serde_json::from_slice(request_payload).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(request_payload).into_owned())
+        });
+
+    // Parse response payload as JSON value (fallback to raw string).
+    let resp_payload_value: serde_json::Value = response_payload
+        .map(|b| {
+            serde_json::from_slice(b).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    let mut dest_event = serde_json::json!({
+        "version": "1.0",
+        "timestamp": timestamp,
+        "requestContext": {
+            "requestId": request_id.to_string(),
+            "functionArn": function_arn,
+            "condition": condition,
+            "approximateInvokeCount": approximate_invoke_count
+        },
+        "requestPayload": req_payload_value,
+        "responsePayload": resp_payload_value
+    });
+
+    // For failure destinations, include responseContext with error details.
+    if let Some(status_code) = error_status_code {
+        dest_event["responseContext"] = serde_json::json!({
+            "statusCode": status_code,
+            "executedVersion": "$LATEST",
+            "functionError": "Unhandled"
+        });
+    }
+
+    let dest_body = match serde_json::to_vec(&dest_event) {
+        Ok(b) => b,
+        Err(e) => {
+            error!(
+                destination = %destination_function,
+                source = %source_function,
+                error = %e,
+                "failed to serialize destination event"
+            );
+            return;
+        }
+    };
+
+    let mut dest_headers = HeaderMap::new();
+    dest_headers.insert("X-Amz-Invocation-Type", "Event".parse().unwrap());
+
+    let dest_request_id = Uuid::new_v4();
+    let span = info_span!(
+        "destination_invocation",
+        %dest_request_id,
+        source = %source_function,
+        destination = %destination_function,
+        %condition
+    );
+
+    info!(
+        destination = %destination_function,
+        source = %source_function,
+        %condition,
+        "routing async invocation result to destination"
+    );
+
+    // Fire-and-forget: spawn the destination invocation so we don't block
+    // the current task. The destination invocation itself goes through the
+    // normal async path (Event type) so it gets its own retry semantics.
+    let state_clone = state.clone();
+    let dest_fn = destination_function.to_string();
+    tokio::spawn(
+        async move {
+            let (_status, _headers, _body) = invoke_function_inner(
+                state_clone,
+                dest_fn,
+                dest_headers,
+                Bytes::from(dest_body),
+                dest_request_id,
+            )
+            .await;
+        }
+        .instrument(span),
+    );
+}
+
+/// Convert days since the Unix epoch to (year, month, day).
+fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm based on the civil-from-days formula (Howard Hinnant).
+    let days = days + 719_468; // shift epoch from 1970-01-01 to 0000-03-01
+    let era = days / 146_097;
+    let doe = days % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -2412,6 +2605,8 @@ mod tests {
                 layers: vec![],
                 function_url_enabled: false,
                 max_retry_attempts: 2,
+                on_success: None,
+                on_failure: None,
             },
         );
         functions_map.insert(
@@ -2432,6 +2627,8 @@ mod tests {
                 layers: vec![],
                 function_url_enabled: false,
                 max_retry_attempts: 2,
+                on_success: None,
+                on_failure: None,
             },
         );
         let functions = FunctionsConfig {
@@ -3287,6 +3484,8 @@ mod tests {
                 layers: vec![],
                 function_url_enabled: false,
                 max_retry_attempts: 2,
+                on_success: None,
+                on_failure: None,
             },
         );
         let functions = FunctionsConfig {
@@ -4144,6 +4343,8 @@ mod tests {
                 layers: vec![],
                 function_url_enabled: false,
                 max_retry_attempts: 2,
+                on_success: None,
+                on_failure: None,
             },
         );
         let functions = FunctionsConfig {
@@ -4964,6 +5165,8 @@ mod tests {
                 layers: vec![],
                 function_url_enabled: true,
                 max_retry_attempts: 2,
+                on_success: None,
+                on_failure: None,
             },
         );
         functions_map.insert(
@@ -4984,6 +5187,8 @@ mod tests {
                 layers: vec![],
                 function_url_enabled: false,
                 max_retry_attempts: 2,
+                on_success: None,
+                on_failure: None,
             },
         );
         let functions = FunctionsConfig {
@@ -5060,5 +5265,24 @@ mod tests {
             .unwrap();
         // Should not be 404 — the route with wildcard path matched.
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- epoch_days_to_ymd ---------------------------------------------------
+
+    #[test]
+    fn epoch_days_to_ymd_unix_epoch() {
+        assert_eq!(epoch_days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_known_date() {
+        // 2024-01-01 is day 19723 from epoch
+        assert_eq!(epoch_days_to_ymd(19723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_leap_day() {
+        // 2024-02-29 is day 19782 from epoch
+        assert_eq!(epoch_days_to_ymd(19782), (2024, 2, 29));
     }
 }

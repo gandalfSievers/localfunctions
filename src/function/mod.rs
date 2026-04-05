@@ -86,6 +86,12 @@ pub enum FunctionConfigError {
     #[error("function '{name}': layer path '{path}' does not exist or is not a directory")]
     LayerPathNotFound { name: String, path: String },
 
+    #[error("function '{name}': on_success destination '{destination}' does not refer to a known function")]
+    InvalidOnSuccessDestination { name: String, destination: String },
+
+    #[error("function '{name}': on_failure destination '{destination}' does not refer to a known function")]
+    InvalidOnFailureDestination { name: String, destination: String },
+
     #[error("configuration validation failed with {count} error(s):\n{details}")]
     ValidationErrors { count: usize, details: String },
 }
@@ -120,6 +126,8 @@ struct RawFunctionEntry {
     #[serde(default)]
     function_url_enabled: bool,
     max_retry_attempts: Option<u32>,
+    on_success: Option<String>,
+    on_failure: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -365,9 +373,35 @@ pub fn parse_functions_config(
             layers,
             function_url_enabled: entry.function_url_enabled,
             max_retry_attempts,
+            on_success: entry.on_success.clone(),
+            on_failure: entry.on_failure.clone(),
         };
 
         functions.insert(name.clone(), config);
+    }
+
+    // Validate destination references after all functions are loaded so that
+    // forward references work (e.g. function A's on_success points to B which
+    // is defined later in the file).
+    for name in &names {
+        if let Some(cfg) = functions.get(name) {
+            if let Some(ref dest) = cfg.on_success {
+                if !functions.contains_key(dest) {
+                    errors.push(FunctionConfigError::InvalidOnSuccessDestination {
+                        name: name.clone(),
+                        destination: dest.clone(),
+                    });
+                }
+            }
+            if let Some(ref dest) = cfg.on_failure {
+                if !functions.contains_key(dest) {
+                    errors.push(FunctionConfigError::InvalidOnFailureDestination {
+                        name: name.clone(),
+                        destination: dest.clone(),
+                    });
+                }
+            }
+        }
     }
 
     if !errors.is_empty() {
@@ -2231,5 +2265,149 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("max_retry_attempts"), "error should mention the field: {msg}");
         assert!(msg.contains("3"), "error should contain the invalid value: {msg}");
+    }
+
+    // -- Destination validation -----------------------------------------------
+
+    #[test]
+    fn on_success_destination_valid_function() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("code")).unwrap();
+        let json = r#"{
+            "functions": {
+                "producer": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "on_success": "consumer"
+                },
+                "consumer": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(
+            config.functions["producer"].on_success,
+            Some("consumer".into())
+        );
+        assert!(config.functions["consumer"].on_success.is_none());
+    }
+
+    #[test]
+    fn on_failure_destination_valid_function() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("code")).unwrap();
+        let json = r#"{
+            "functions": {
+                "producer": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "on_failure": "dlq-handler"
+                },
+                "dlq-handler": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(
+            config.functions["producer"].on_failure,
+            Some("dlq-handler".into())
+        );
+    }
+
+    #[test]
+    fn on_success_destination_unknown_function_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("code")).unwrap();
+        let json = r#"{
+            "functions": {
+                "producer": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "on_success": "nonexistent"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("on_success"), "error should mention on_success: {msg}");
+        assert!(msg.contains("nonexistent"), "error should mention the destination: {msg}");
+    }
+
+    #[test]
+    fn on_failure_destination_unknown_function_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("code")).unwrap();
+        let json = r#"{
+            "functions": {
+                "producer": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "on_failure": "nonexistent"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("on_failure"), "error should mention on_failure: {msg}");
+        assert!(msg.contains("nonexistent"), "error should mention the destination: {msg}");
+    }
+
+    #[test]
+    fn both_destinations_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("code")).unwrap();
+        let json = r#"{
+            "functions": {
+                "processor": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "on_success": "success-fn",
+                    "on_failure": "failure-fn"
+                },
+                "success-fn": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                },
+                "failure-fn": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        let proc = &config.functions["processor"];
+        assert_eq!(proc.on_success, Some("success-fn".into()));
+        assert_eq!(proc.on_failure, Some("failure-fn".into()));
+    }
+
+    #[test]
+    fn destinations_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("code")).unwrap();
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert!(config.functions["f1"].on_success.is_none());
+        assert!(config.functions["f1"].on_failure.is_none());
     }
 }

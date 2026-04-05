@@ -71,6 +71,8 @@ async fn build_concurrent_state(
             layers: vec![],
             function_url_enabled: false,
             max_retry_attempts: 2,
+            on_success: None,
+            on_failure: None,
         },
     );
 
