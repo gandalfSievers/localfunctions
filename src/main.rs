@@ -5,11 +5,14 @@ mod function;
 mod server;
 mod types;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use bollard::Docker;
 use tracing::{error, info};
 
 use container::DockerNetwork;
+use server::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,7 +37,7 @@ async fn main() -> Result<()> {
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
 
-    let network = DockerNetwork::new(docker, config.docker_network.clone());
+    let network = DockerNetwork::new(docker.clone(), config.docker_network.clone());
     network.ensure_created().await.map_err(|e| {
         error!(%e, "Docker network setup failed");
         anyhow::anyhow!("{}", e)
@@ -46,7 +49,29 @@ async fn main() -> Result<()> {
         "Docker network ready"
     );
 
-    // TODO: start Runtime API server, load functions, serve requests
+    // Load function definitions
+    let functions_config = function::load_functions_config(
+        &config.functions_file,
+        &std::env::current_dir()?,
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!(%e, "Failed to load functions config, starting with empty config");
+        function::FunctionsConfig {
+            functions: Default::default(),
+            runtime_images: Default::default(),
+        }
+    });
+
+    info!(count = functions_config.functions.len(), "functions loaded");
+
+    let state = AppState {
+        config: Arc::new(config),
+        docker,
+        functions: Arc::new(functions_config),
+    };
+
+    // Start both API servers (blocks until shutdown signal)
+    server::start(state.clone()).await?;
 
     // Shutdown: remove the Docker network
     if let Err(e) = network.remove().await {
