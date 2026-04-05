@@ -633,6 +633,9 @@ impl ContainerManager {
         // Memory limit in bytes (memory_size is in MB)
         let memory = (function.memory_size as i64) * 1024 * 1024;
 
+        // CPU allocation proportional to memory (matching AWS Lambda behavior)
+        let (cpu_period, cpu_quota, cpu_shares) = cpu_constraints(function.memory_size);
+
         // Labels for identification
         let mut labels = HashMap::new();
         labels.insert("managed-by".to_string(), "localfunctions".to_string());
@@ -644,6 +647,9 @@ impl ContainerManager {
         let host_config = HostConfig {
             binds: Some(binds),
             memory: Some(memory),
+            cpu_period: Some(cpu_period),
+            cpu_quota: Some(cpu_quota),
+            cpu_shares: Some(cpu_shares),
             network_mode: Some(self.network_name.clone()),
             extra_hosts: Some(container_extra_hosts()),
             // Explicitly no privileged mode, no port bindings
@@ -1266,6 +1272,33 @@ pub fn runtime_api_endpoint(runtime_port: u16) -> String {
         // special hostname which Docker resolves automatically.
         format!("host.docker.internal:{}", runtime_port)
     }
+}
+
+/// Compute Docker CPU constraints proportional to the function's memory size.
+///
+/// AWS Lambda allocates CPU power proportionally to configured memory. At
+/// **1769 MB** a function receives the equivalent of **1 full vCPU**. This
+/// function mirrors that mapping using Docker's `cpu_period` / `cpu_quota` /
+/// `cpu_shares` settings.
+///
+/// Returns `(cpu_period, cpu_quota, cpu_shares)` where:
+/// - `cpu_period` is fixed at 100 000 µs (Docker default).
+/// - `cpu_quota` is `memory_size / 1769 * cpu_period`, clamped to a minimum of
+///   2 000 µs (~2 % of a CPU) so that very-low-memory functions are not
+///   completely starved.
+/// - `cpu_shares` scales from the Docker baseline of 1024 at 1 vCPU, with a
+///   minimum of 2 (Docker minimum).
+pub fn cpu_constraints(memory_size_mb: u64) -> (i64, i64, i64) {
+    const CPU_PERIOD: i64 = 100_000; // microseconds
+    const FULL_VCPU_MB: f64 = 1769.0;
+    const MIN_QUOTA: f64 = 2_000.0;
+    const MIN_SHARES: f64 = 2.0;
+
+    let vcpu_fraction = memory_size_mb as f64 / FULL_VCPU_MB;
+    let cpu_quota = (vcpu_fraction * CPU_PERIOD as f64).round().max(MIN_QUOTA) as i64;
+    let cpu_shares = (vcpu_fraction * 1024.0).round().max(MIN_SHARES) as i64;
+
+    (CPU_PERIOD, cpu_quota, cpu_shares)
 }
 
 #[cfg(test)]
@@ -2530,5 +2563,48 @@ mod integration_tests {
             .stop_and_remove("nonexistent-container-id", Duration::from_secs(1))
             .await;
         assert!(result.is_ok());
+    }
+
+    // -- cpu_constraints ---------------------------------------------------
+
+    #[test]
+    fn cpu_constraints_1769mb_yields_one_vcpu() {
+        let (period, quota, shares) = cpu_constraints(1769);
+        assert_eq!(period, 100_000);
+        assert_eq!(quota, 100_000); // exactly 1 vCPU
+        assert_eq!(shares, 1024);
+    }
+
+    #[test]
+    fn cpu_constraints_128mb_default() {
+        let (period, quota, shares) = cpu_constraints(128);
+        assert_eq!(period, 100_000);
+        // 128 / 1769 ≈ 0.0724 → quota ≈ 7235
+        assert!(quota > 2_000 && quota < 10_000, "quota was {quota}");
+        assert!(shares > 2 && shares < 100, "shares was {shares}");
+    }
+
+    #[test]
+    fn cpu_constraints_3008mb_multi_vcpu() {
+        let (_period, quota, shares) = cpu_constraints(3008);
+        // 3008 / 1769 ≈ 1.70 → quota ≈ 170_040
+        assert!(quota > 100_000, "quota was {quota}");
+        assert!(shares > 1024, "shares was {shares}");
+    }
+
+    #[test]
+    fn cpu_constraints_very_small_memory_hits_minimum() {
+        let (_period, quota, shares) = cpu_constraints(1);
+        // 1 / 1769 ≈ 0.00057 → raw quota ≈ 57 < 2000 → clamped
+        assert_eq!(quota, 2_000);
+        assert_eq!(shares, 2);
+    }
+
+    #[test]
+    fn cpu_constraints_10240mb_max_lambda() {
+        let (_period, quota, shares) = cpu_constraints(10240);
+        // 10240 / 1769 ≈ 5.79 → ~6 vCPUs
+        assert!(quota > 500_000, "quota was {quota}");
+        assert!(shares > 5000, "shares was {shares}");
     }
 }
