@@ -51,6 +51,7 @@ pub struct Invocation {
     pub function_name: String,
     pub payload: Bytes,
     pub deadline: Instant,
+    pub trace_id: Option<String>,
     pub response_tx: oneshot::Sender<InvocationResult>,
 }
 
@@ -365,6 +366,7 @@ mod tests {
             function_name: "test-fn".into(),
             payload: Bytes::from("{}"),
             deadline: Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
             response_tx: tx,
         };
         assert_eq!(inv.function_name, "test-fn");
@@ -379,6 +381,7 @@ mod tests {
             function_name: "f".into(),
             payload: Bytes::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
+            trace_id: None,
             response_tx: tx,
         };
         // Simulate sending a result back

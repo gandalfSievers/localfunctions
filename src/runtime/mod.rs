@@ -106,6 +106,7 @@ mod tests {
             function_name: function_name.to_string(),
             payload: Bytes::from(r#"{"key":"value"}"#),
             deadline: Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
             response_tx: tx,
         };
         (inv, rx)

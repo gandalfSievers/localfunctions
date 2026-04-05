@@ -213,6 +213,13 @@ async fn next_invocation(
                 arn.parse().unwrap(),
             );
 
+            if let Some(ref trace_id) = invocation.trace_id {
+                response_headers.insert(
+                    "Lambda-Runtime-Trace-Id",
+                    trace_id.parse().unwrap(),
+                );
+            }
+
             debug!(
                 function = %function_name,
                 request_id = %invocation.request_id,
@@ -412,6 +419,7 @@ mod tests {
             function_name: "my-func".into(),
             payload: bytes::Bytes::from(r#"{"hello":"world"}"#),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -447,11 +455,66 @@ mod tests {
             .get("Lambda-Runtime-Invoked-Function-Arn")
             .is_some());
 
+        // Trace-Id header should be absent when not set
+        assert!(resp
+            .headers()
+            .get("Lambda-Runtime-Trace-Id")
+            .is_none());
+
         // Verify payload
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(body.as_ref(), br#"{"hello":"world"}"#);
+    }
+
+    #[tokio::test]
+    async fn runtime_next_invocation_includes_trace_id_header() {
+        use crate::types::Invocation;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (tx, rx) = mpsc::channel(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let trace_id = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+        let inv = Invocation {
+            request_id: uuid::Uuid::new_v4(),
+            function_name: "my-func".into(),
+            payload: bytes::Bytes::from("{}"),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            trace_id: Some(trace_id.to_string()),
+            response_tx: resp_tx,
+        };
+        tx.send(inv).await.unwrap();
+
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::get("/2018-06-01/runtime/invocation/next")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("Lambda-Runtime-Trace-Id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            trace_id
+        );
     }
 
     #[tokio::test]
