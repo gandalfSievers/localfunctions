@@ -357,13 +357,15 @@ fn invoke_base_headers(request_id: Uuid) -> HeaderMap {
 /// POST /2015-03-31/functions/{name}/invocations
 ///
 /// Supports the following AWS headers:
-/// - `X-Amz-Invocation-Type`: `RequestResponse` (default) or `Event` (async)
+/// - `X-Amz-Invocation-Type`: `RequestResponse` (default), `Event` (async), or `DryRun` (validation only)
 /// - `X-Amz-Log-Type`: `None` (default) or `Tail` — returns last 4KB of logs base64-encoded in `X-Amz-Log-Result`
 /// - `X-Amz-Client-Context`: passed through to the runtime
 ///
 /// Returns the function response body on success, or an AWS-format error.
 /// For `Event` invocation type, returns 202 Accepted immediately and executes
 /// the function in the background.
+/// For `DryRun` invocation type, validates the function exists and returns
+/// 204 No Content without executing the function.
 async fn invoke_function(
     State(state): State<AppState>,
     Path(raw_function_name): Path<String>,
@@ -437,13 +439,24 @@ async fn invoke_function_inner(
         }
     };
 
-    // Check X-Amz-Invocation-Type — RequestResponse (default) and Event are supported.
-    let is_event_invocation = match headers.get("X-Amz-Invocation-Type").and_then(|v| v.to_str().ok()) {
+    // Check X-Amz-Invocation-Type — RequestResponse (default), Event, and DryRun are supported.
+    let invocation_type = headers.get("X-Amz-Invocation-Type").and_then(|v| v.to_str().ok());
+
+    // DryRun: validate function exists and return 204 without executing.
+    if invocation_type == Some("DryRun") {
+        if state.functions.functions.get(&function_name).is_none() {
+            let err = ServiceError::ResourceNotFound(function_name);
+            return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
+        }
+        return (StatusCode::NO_CONTENT, invoke_base_headers(request_id), Vec::new());
+    }
+
+    let is_event_invocation = match invocation_type {
         Some("RequestResponse") | None => false,
         Some("Event") => true,
         Some(other) => {
             let err = ServiceError::InvalidRequestContent(format!(
-                "Unsupported invocation type '{}'. Supported types: RequestResponse, Event.",
+                "Unsupported invocation type '{}'. Supported types: RequestResponse, Event, DryRun.",
                 other
             ));
             return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
@@ -2560,7 +2573,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::post("/2015-03-31/functions/my-func/invocations")
-                    .header("X-Amz-Invocation-Type", "DryRun")
+                    .header("X-Amz-Invocation-Type", "Bogus")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -2573,6 +2586,51 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["Type"], "InvalidRequestContentException");
+    }
+
+    #[tokio::test]
+    async fn invoke_dryrun_returns_204_no_body() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "DryRun")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invoke_dryrun_nonexistent_function_returns_404() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/no-such-func/invocations")
+                    .header("X-Amz-Invocation-Type", "DryRun")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
     }
 
     #[tokio::test]
