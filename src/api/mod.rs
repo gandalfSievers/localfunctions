@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -48,6 +48,49 @@ fn generate_xray_trace_id() -> String {
 
 use crate::function::validate_function_name;
 use crate::server::AppState;
+
+// ---------------------------------------------------------------------------
+// Qualifier parsing
+// ---------------------------------------------------------------------------
+
+/// Query parameters accepted by the Invoke and GetFunction APIs.
+#[derive(Debug, Deserialize, Default)]
+struct QualifierParams {
+    #[serde(rename = "Qualifier")]
+    qualifier: Option<String>,
+}
+
+/// Parse a function name that may contain a colon-separated qualifier
+/// (e.g. `my-function:PROD`) and merge with an optional `?Qualifier=` query
+/// parameter. The query parameter takes precedence if both are present.
+///
+/// Returns `(base_name, qualifier)` where qualifier is `None` for unqualified
+/// requests and `Some(q)` when a qualifier was specified.
+fn parse_qualifier(raw_name: &str, query_qualifier: Option<&str>) -> (String, Option<String>) {
+    let (base_name, inline_qualifier) = match raw_name.split_once(':') {
+        Some((name, qual)) => (name.to_string(), Some(qual.to_string())),
+        None => (raw_name.to_string(), None),
+    };
+    let qualifier = query_qualifier
+        .map(|q| q.to_string())
+        .or(inline_qualifier);
+    (base_name, qualifier)
+}
+
+/// Validate that a qualifier is supported. Only `$LATEST` (or absent) is valid
+/// for this local emulator — all other qualifiers are treated as not found.
+///
+/// Returns `Ok(())` if the qualifier is acceptable, or `Err(ServiceError)` with
+/// a `ResourceNotFoundException` for unrecognized qualifiers.
+fn validate_qualifier(qualifier: &Option<String>, function_name: &str) -> Result<(), ServiceError> {
+    match qualifier.as_deref() {
+        None | Some("$LATEST") => Ok(()),
+        Some(q) => Err(ServiceError::ResourceNotFound(format!(
+            "Function not found: arn:aws:lambda:us-east-1:000000000000:function:{}:{}",
+            function_name, q
+        ))),
+    }
+}
 use crate::types::{ContainerState, ServiceError};
 
 #[derive(Debug, Serialize)]
@@ -156,11 +199,25 @@ async fn list_functions(State(state): State<AppState>) -> impl IntoResponse {
 /// GET /2015-03-31/functions/{name}
 async fn get_function(
     State(state): State<AppState>,
-    Path(function_name): Path<String>,
+    Path(raw_function_name): Path<String>,
+    Query(params): Query<QualifierParams>,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
+    // Parse qualifier from function name (colon-separated) or query parameter.
+    let (function_name, qualifier) =
+        parse_qualifier(&raw_function_name, params.qualifier.as_deref());
+
     // Validate function name.
     if let Err(e) = validate_function_name(&function_name) {
         let err = ServiceError::InvalidRequestContent(e.to_string());
+        return (
+            err.status_code(),
+            HeaderMap::new(),
+            err.to_aws_response().to_json_bytes(),
+        );
+    }
+
+    // Validate qualifier — only $LATEST is supported.
+    if let Err(err) = validate_qualifier(&qualifier, &function_name) {
         return (
             err.status_code(),
             HeaderMap::new(),
@@ -258,11 +315,26 @@ fn invoke_base_headers(request_id: Uuid) -> HeaderMap {
 /// the function in the background.
 async fn invoke_function(
     State(state): State<AppState>,
-    Path(function_name): Path<String>,
+    Path(raw_function_name): Path<String>,
+    Query(params): Query<QualifierParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let request_id = Uuid::new_v4();
+
+    // Parse qualifier from function name (colon-separated) or query parameter.
+    let (function_name, qualifier) =
+        parse_qualifier(&raw_function_name, params.qualifier.as_deref());
+
+    // Validate qualifier — only $LATEST is supported.
+    if let Err(err) = validate_qualifier(&qualifier, &function_name) {
+        return (
+            err.status_code(),
+            invoke_base_headers(request_id),
+            err.to_aws_response().to_json_bytes(),
+        );
+    }
+
     let span = info_span!("invocation", %request_id, function = %function_name);
 
     invoke_function_inner(state, function_name, headers, body, request_id)
@@ -2998,5 +3070,218 @@ mod tests {
         let id1 = generate_xray_trace_id();
         let id2 = generate_xray_trace_id();
         assert_ne!(id1, id2);
+    }
+
+    // -- Qualifier parsing unit tests -----------------------------------------
+
+    #[test]
+    fn parse_qualifier_no_qualifier() {
+        let (name, qual) = parse_qualifier("my-func", None);
+        assert_eq!(name, "my-func");
+        assert_eq!(qual, None);
+    }
+
+    #[test]
+    fn parse_qualifier_inline_colon() {
+        let (name, qual) = parse_qualifier("my-func:PROD", None);
+        assert_eq!(name, "my-func");
+        assert_eq!(qual, Some("PROD".into()));
+    }
+
+    #[test]
+    fn parse_qualifier_query_param() {
+        let (name, qual) = parse_qualifier("my-func", Some("STAGING"));
+        assert_eq!(name, "my-func");
+        assert_eq!(qual, Some("STAGING".into()));
+    }
+
+    #[test]
+    fn parse_qualifier_query_param_overrides_inline() {
+        let (name, qual) = parse_qualifier("my-func:DEV", Some("PROD"));
+        assert_eq!(name, "my-func");
+        assert_eq!(qual, Some("PROD".into()));
+    }
+
+    #[test]
+    fn parse_qualifier_dollar_latest() {
+        let (name, qual) = parse_qualifier("my-func:$LATEST", None);
+        assert_eq!(name, "my-func");
+        assert_eq!(qual, Some("$LATEST".into()));
+    }
+
+    #[test]
+    fn validate_qualifier_accepts_none() {
+        assert!(validate_qualifier(&None, "my-func").is_ok());
+    }
+
+    #[test]
+    fn validate_qualifier_accepts_latest() {
+        assert!(validate_qualifier(&Some("$LATEST".into()), "my-func").is_ok());
+    }
+
+    #[test]
+    fn validate_qualifier_rejects_unknown() {
+        let result = validate_qualifier(&Some("PROD".into()), "my-func");
+        assert!(result.is_err());
+    }
+
+    // -- Qualifier integration tests (Invoke API) -----------------------------
+
+    #[tokio::test]
+    async fn invoke_with_latest_qualifier_query_param() {
+        let app = invoke_routes().with_state(test_state());
+        // $LATEST qualifier should pass through to normal function lookup (404 because no function)
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations?Qualifier=$LATEST")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Not found because the function doesn't exist, but qualifier is accepted
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn invoke_with_unknown_qualifier_returns_404() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/alpha-func/invocations?Qualifier=PROD")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn invoke_with_colon_qualifier_latest() {
+        let app = invoke_routes().with_state(test_state());
+        // my-func:$LATEST — should parse and accept $LATEST
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func:$LATEST/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn invoke_with_colon_qualifier_unknown() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/alpha-func:PROD/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn invoke_with_version_number_qualifier() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/alpha-func/invocations?Qualifier=3")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    // -- Qualifier integration tests (GetFunction API) ------------------------
+
+    #[tokio::test]
+    async fn get_function_with_latest_qualifier() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::get("/2015-03-31/functions/alpha-func?Qualifier=$LATEST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Configuration"]["FunctionName"], "alpha-func");
+    }
+
+    #[tokio::test]
+    async fn get_function_with_unknown_qualifier_returns_404() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::get("/2015-03-31/functions/alpha-func?Qualifier=PROD")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn get_function_with_colon_qualifier_latest() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::get("/2015-03-31/functions/alpha-func:$LATEST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Configuration"]["FunctionName"], "alpha-func");
+    }
+
+    #[tokio::test]
+    async fn get_function_with_colon_qualifier_unknown() {
+        let app = invoke_routes().with_state(test_state_with_functions());
+        let resp = app
+            .oneshot(
+                Request::get("/2015-03-31/functions/alpha-func:STAGING")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
     }
 }
