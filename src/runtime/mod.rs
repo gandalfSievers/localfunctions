@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -38,6 +38,12 @@ pub struct RuntimeBridge {
     /// Pending invocations awaiting a response from the container runtime.
     /// Maps request_id → pending invocation (function name + oneshot sender).
     pending_invocations: Mutex<HashMap<Uuid, PendingInvocation>>,
+
+    /// Per-container readiness signals. A cold-started container registers a
+    /// `Notify` here; when the container calls `/next` for the first time
+    /// (`mark_ready`), the `Notify` fires so the invoker knows the bootstrap
+    /// completed.
+    ready_signals: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl RuntimeBridge {
@@ -62,6 +68,7 @@ impl RuntimeBridge {
             shutdown_rx,
             ready_containers: Mutex::new(HashMap::new()),
             pending_invocations: Mutex::new(HashMap::new()),
+            ready_signals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -87,13 +94,36 @@ impl RuntimeBridge {
     }
 
     /// Mark a container as ready (first call to /next signals cold start
-    /// complete).
+    /// complete). Also fires the readiness signal if one was registered.
     pub async fn mark_ready(&self, container_id: &str) {
         let mut ready = self.ready_containers.lock().await;
+        let mut signals = self.ready_signals.lock().await;
         if !ready.contains_key(container_id) {
             info!(container_id = %container_id, "container signalled readiness");
             ready.insert(container_id.to_string(), true);
         }
+        if let Some(notify) = signals.remove(container_id) {
+            notify.notify_one();
+        }
+    }
+
+    /// Register a readiness signal for a cold-started container.
+    ///
+    /// Returns an `Arc<Notify>` that will fire when the container calls `/next`
+    /// for the first time (i.e. bootstrap is complete). If the container is
+    /// already ready, the returned `Notify` is pre-fired.
+    pub async fn register_ready_signal(&self, container_id: &str) -> Arc<Notify> {
+        let ready = self.ready_containers.lock().await;
+        let mut signals = self.ready_signals.lock().await;
+
+        let notify = Arc::new(Notify::new());
+        if ready.contains_key(container_id) {
+            // Already ready (race: container called /next before we registered)
+            notify.notify_one();
+        } else {
+            signals.insert(container_id.to_string(), notify.clone());
+        }
+        notify
     }
 
     /// Check whether a container has signalled readiness.
@@ -641,5 +671,57 @@ mod tests {
             rx.await.unwrap(),
             InvocationResult::Success { body: "ok".into() }
         );
+    }
+
+    #[tokio::test]
+    async fn register_ready_signal_fires_on_mark_ready() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
+
+        let signal = bridge.register_ready_signal("ctr-1").await;
+
+        let bridge_clone = bridge.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            bridge_clone.mark_ready("ctr-1").await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            signal.notified(),
+        )
+        .await;
+        assert!(result.is_ok(), "signal should fire when mark_ready is called");
+    }
+
+    #[tokio::test]
+    async fn register_ready_signal_pre_fires_when_already_ready() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        bridge.mark_ready("ctr-2").await;
+        let signal = bridge.register_ready_signal("ctr-2").await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            signal.notified(),
+        )
+        .await;
+        assert!(result.is_ok(), "signal should be pre-fired for already-ready container");
+    }
+
+    #[tokio::test]
+    async fn register_ready_signal_does_not_fire_without_mark_ready() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let signal = bridge.register_ready_signal("ctr-3").await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            signal.notified(),
+        )
+        .await;
+        assert!(result.is_err(), "signal should not fire without mark_ready");
     }
 }

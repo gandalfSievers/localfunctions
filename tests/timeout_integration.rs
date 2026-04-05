@@ -43,6 +43,7 @@ async fn build_state(
         max_body_size: 6 * 1024 * 1024,
         log_format: LogFormat::Text,
         pull_images: false,
+        init_timeout: 10,
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();

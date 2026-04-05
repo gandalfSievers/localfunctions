@@ -22,6 +22,9 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Whether to automatically pull missing Docker images on startup.
     pub pull_images: bool,
+    /// Maximum time in seconds to wait for a container's bootstrap process to
+    /// call the Runtime API `/next` endpoint (default 10s).
+    pub init_timeout: u64,
 }
 
 /// Controls the format of log output.
@@ -73,6 +76,7 @@ impl Config {
             "LOCALFUNCTIONS_PULL_IMAGES",
             "false",
         )?;
+        let init_timeout = parse_env("LOCAL_LAMBDA_INIT_TIMEOUT", "10")?;
 
         Ok(Config {
             host,
@@ -89,6 +93,7 @@ impl Config {
             max_body_size,
             log_format,
             pull_images,
+            init_timeout,
         })
     }
 }
@@ -150,6 +155,7 @@ mod tests {
             "LOCAL_LAMBDA_MAX_BODY_SIZE",
             "LOCAL_LAMBDA_PULL_IMAGES",
             "LOCALFUNCTIONS_PULL_IMAGES",
+            "LOCAL_LAMBDA_INIT_TIMEOUT",
         ] {
             std::env::remove_var(key);
         }
@@ -169,6 +175,7 @@ mod tests {
         assert_eq!(config.max_body_size, 6 * 1024 * 1024);
         assert_eq!(config.log_format, LogFormat::Json);
         assert!(!config.pull_images);
+        assert_eq!(config.init_timeout, 10);
     }
 
     #[test]
@@ -358,5 +365,31 @@ mod tests {
         let result = Config::from_env();
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_PULL_IMAGES");
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_timeout_default() {
+        std::env::remove_var("LOCAL_LAMBDA_INIT_TIMEOUT");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.init_timeout, 10);
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_timeout_custom() {
+        std::env::set_var("LOCAL_LAMBDA_INIT_TIMEOUT", "30");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.init_timeout, 30);
+        std::env::remove_var("LOCAL_LAMBDA_INIT_TIMEOUT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_timeout_invalid() {
+        std::env::set_var("LOCAL_LAMBDA_INIT_TIMEOUT", "abc");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_INIT_TIMEOUT");
     }
 }

@@ -144,6 +144,7 @@ mod tests {
             max_body_size: 6 * 1024 * 1024,
             log_format: crate::config::LogFormat::Text,
             pull_images: false,
+            init_timeout: 10,
         };
         let docker = Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {

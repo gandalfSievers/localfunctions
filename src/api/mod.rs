@@ -166,14 +166,8 @@ async fn invoke_function_inner(
         }
         None => {
             debug!("no warm container available, cold starting");
-            match state.container_manager.create_and_start(function_config).await {
-                Ok(id) => {
-                    state
-                        .container_manager
-                        .set_state(&id, ContainerState::Busy)
-                        .await;
-                    id
-                }
+            let cold_id = match state.container_manager.create_and_start(function_config).await {
+                Ok(id) => id,
                 Err(e) => {
                     let err = ServiceError::ServiceException(e.to_string());
                     return (
@@ -181,6 +175,58 @@ async fn invoke_function_inner(
                         base_headers(),
                         err.to_aws_response().to_json_bytes(),
                     );
+                }
+            };
+
+            state
+                .container_manager
+                .set_state(&cold_id, ContainerState::Busy)
+                .await;
+
+            // Wait for the container's bootstrap process to complete (first
+            // /next call). Detect bootstrap failures early rather than waiting
+            // for the full function timeout.
+            let ready_signal = state
+                .runtime_bridge
+                .register_ready_signal(&cold_id)
+                .await;
+
+            let init_timeout = Duration::from_secs(state.config.init_timeout);
+            let mgr = state.container_manager.clone();
+            let wait_id = cold_id.clone();
+
+            enum BootstrapOutcome {
+                Ready,
+                Exited(Option<i64>),
+                Timeout,
+            }
+
+            let outcome = tokio::select! {
+                _ = ready_signal.notified() => BootstrapOutcome::Ready,
+                exit_code = async { mgr.wait_for_exit(&wait_id).await } => {
+                    BootstrapOutcome::Exited(exit_code)
+                }
+                _ = tokio::time::sleep(init_timeout) => {
+                    // Check if it became ready in the meantime
+                    if state.runtime_bridge.is_ready(&cold_id).await {
+                        BootstrapOutcome::Ready
+                    } else {
+                        BootstrapOutcome::Timeout
+                    }
+                }
+            };
+
+            match outcome {
+                BootstrapOutcome::Ready => cold_id,
+                BootstrapOutcome::Exited(exit_code) => {
+                    return bootstrap_failure_response(
+                        &state, &cold_id, &function_name, false, exit_code, base_headers(),
+                    ).await;
+                }
+                BootstrapOutcome::Timeout => {
+                    return bootstrap_failure_response(
+                        &state, &cold_id, &function_name, true, None, base_headers(),
+                    ).await;
                 }
             }
         }
@@ -325,6 +371,61 @@ async fn invoke_function_inner(
             (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
         }
     }
+}
+
+/// Build an error response for a bootstrap failure (container exited before
+/// calling /next, or init timeout expired).
+///
+/// Collects stderr from the container, logs a WARN, cleans up the container
+/// in the background, and returns a 502 with `InvalidRuntimeException`.
+async fn bootstrap_failure_response(
+    state: &AppState,
+    container_id: &str,
+    function_name: &str,
+    is_timeout: bool,
+    exit_code: Option<i64>,
+    headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let stderr = state
+        .container_manager
+        .get_container_stderr(container_id, "50")
+        .await;
+
+    warn!(
+        function = %function_name,
+        exit_code = ?exit_code,
+        stderr = %stderr.trim(),
+        "bootstrap failure: {}",
+        if is_timeout { "init timeout" } else { "process exited before calling /next" }
+    );
+
+    // Clean up the container in the background
+    let cleanup_mgr = state.container_manager.clone();
+    let cleanup_id = container_id.to_string();
+    tokio::spawn(async move {
+        let _ = cleanup_mgr
+            .stop_and_remove(&cleanup_id, Duration::from_secs(2))
+            .await;
+    });
+
+    let error_detail = if is_timeout {
+        format!(
+            "Bootstrap did not complete within {} seconds. Container stderr: {}",
+            state.config.init_timeout,
+            stderr.trim()
+        )
+    } else {
+        format!(
+            "Bootstrap process exited (code: {}) before calling Runtime API. Container stderr: {}",
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            stderr.trim()
+        )
+    };
+
+    let err = ServiceError::InvalidRuntime(error_detail);
+    (StatusCode::BAD_GATEWAY, headers, err.to_aws_response().to_json_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +862,7 @@ mod tests {
             max_body_size: 6 * 1024 * 1024,
             log_format: crate::config::LogFormat::Text,
             pull_images: false,
+            init_timeout: 10,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -1490,6 +1592,7 @@ mod tests {
             max_body_size: 6 * 1024 * 1024,
             log_format: crate::config::LogFormat::Text,
             pull_images: false,
+            init_timeout: 10,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 

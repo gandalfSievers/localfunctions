@@ -3,14 +3,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions,
+    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
 use bollard::Docker;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -869,6 +870,54 @@ impl ContainerManager {
             if let Err(e) = self.stop_and_remove(&container_id, Duration::from_secs(5)).await {
                 error!(container_id = %container_id, %e, "failed to reap idle container");
             }
+        }
+    }
+
+    /// Retrieve the stderr output from a container (last `tail` lines).
+    ///
+    /// Returns an empty string if logs cannot be retrieved (e.g. container
+    /// already removed).
+    pub async fn get_container_stderr(&self, container_id: &str, tail: &str) -> String {
+        let opts = LogsOptions::<String> {
+            stdout: false,
+            stderr: true,
+            tail: tail.to_string(),
+            ..Default::default()
+        };
+
+        let mut stream = self.docker.logs(container_id, Some(opts));
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(log) => output.push_str(&log.to_string()),
+                Err(_) => break,
+            }
+        }
+        output
+    }
+
+    /// Inspect a container and return its exit code, if available.
+    ///
+    /// Returns `None` if the container is still running or cannot be inspected.
+    pub async fn get_container_exit_code(&self, container_id: &str) -> Option<i64> {
+        match self.docker.inspect_container(container_id, None).await {
+            Ok(info) => info.state.and_then(|s| s.exit_code),
+            Err(_) => None,
+        }
+    }
+
+    /// Wait for a container to exit. Returns the exit status code.
+    ///
+    /// This blocks until the container process terminates. Used to detect
+    /// bootstrap failures where the container exits before calling `/next`.
+    pub async fn wait_for_exit(&self, container_id: &str) -> Option<i64> {
+        let mut stream = self.docker.wait_container(
+            container_id,
+            None::<WaitContainerOptions<String>>,
+        );
+        match stream.next().await {
+            Some(Ok(response)) => Some(response.status_code),
+            _ => None,
         }
     }
 
