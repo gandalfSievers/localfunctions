@@ -16,6 +16,8 @@ pub struct Config {
     pub container_idle_timeout: u64,
     pub max_containers: usize,
     pub docker_network: String,
+    /// Maximum request body size in bytes for the Invoke API (default 6 MB).
+    pub max_body_size: usize,
 }
 
 impl Config {
@@ -32,6 +34,7 @@ impl Config {
         let container_idle_timeout = parse_env("LOCAL_LAMBDA_CONTAINER_IDLE_TIMEOUT", "300")?;
         let max_containers = parse_env("LOCAL_LAMBDA_MAX_CONTAINERS", "20")?;
         let docker_network = parse_env::<String>("LOCAL_LAMBDA_DOCKER_NETWORK", "localfunctions")?;
+        let max_body_size = parse_env("LOCAL_LAMBDA_MAX_BODY_SIZE", "6291456")?; // 6 MB
 
         Ok(Config {
             host,
@@ -45,6 +48,7 @@ impl Config {
             container_idle_timeout,
             max_containers,
             docker_network,
+            max_body_size,
         })
     }
 }
@@ -86,6 +90,7 @@ mod tests {
             "LOCAL_LAMBDA_CONTAINER_IDLE_TIMEOUT",
             "LOCAL_LAMBDA_MAX_CONTAINERS",
             "LOCAL_LAMBDA_DOCKER_NETWORK",
+            "LOCAL_LAMBDA_MAX_BODY_SIZE",
         ] {
             std::env::remove_var(key);
         }
@@ -102,6 +107,7 @@ mod tests {
         assert_eq!(config.container_idle_timeout, 300);
         assert_eq!(config.max_containers, 20);
         assert_eq!(config.docker_network, "localfunctions");
+        assert_eq!(config.max_body_size, 6 * 1024 * 1024);
     }
 
     #[test]

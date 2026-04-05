@@ -5,7 +5,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::Serialize;
+use tracing::debug;
 
+use crate::function::validate_function_name;
 use crate::server::AppState;
 use crate::types::{AwsErrorResponse, ServiceError};
 
@@ -68,7 +70,19 @@ async fn invoke_function(
     Path(function_name): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let _ = body;
+    // Validate function name from the URL path.
+    if let Err(e) = validate_function_name(&function_name) {
+        let err = ServiceError::InvalidRequestContent(e.to_string());
+        return (err.status_code(), Json(err.to_aws_response()));
+    }
+
+    // Log payload at DEBUG level only — never at INFO or above.
+    debug!(
+        function = %function_name,
+        payload_size = body.len(),
+        payload = %String::from_utf8_lossy(&body),
+        "invoke request"
+    );
 
     // Reject immediately if the service is shutting down.
     if state.is_shutting_down() {
@@ -173,6 +187,7 @@ mod tests {
             container_idle_timeout: 300,
             max_containers: 20,
             docker_network: "localfunctions".into(),
+            max_body_size: 6 * 1024 * 1024,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -289,6 +304,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_invalid_function_name_with_spaces() {
+        let app = invoke_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/bad%20name/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "InvalidRequestContentException");
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_function_name_with_special_chars() {
+        let app = invoke_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/func%40%23/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_function_name_too_long() {
+        let long_name = "a".repeat(65);
+        let app = invoke_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::post(format!(
+                    "/2015-03-31/functions/{}/invocations",
+                    long_name
+                ))
+                .body(Body::from("{}"))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invoke_accepts_valid_function_name() {
+        let app = invoke_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-valid_func123/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should not be a 400 — the stub returns 500 ServiceException for valid names
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

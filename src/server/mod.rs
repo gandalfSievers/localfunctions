@@ -31,10 +31,11 @@ impl AppState {
     }
 }
 
-/// Create the external Invoke API router with a 6 MB request body limit.
+/// Create the external Invoke API router with a configurable request body limit.
 pub fn invoke_router(state: AppState) -> Router {
+    let max_body_size = state.config.max_body_size;
     api::invoke_routes()
-        .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }
 
@@ -137,6 +138,7 @@ mod tests {
             container_idle_timeout: 300,
             max_containers: 20,
             docker_network: "localfunctions".into(),
+            max_body_size: 6 * 1024 * 1024,
         };
         let docker = Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -207,6 +209,26 @@ mod tests {
                     .method("POST")
                     .uri("/2015-03-31/functions/test-fn/invocations")
                     .body(Body::from(big_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn invoke_router_respects_custom_body_limit() {
+        let mut state = test_state();
+        // Set a 1 KB limit
+        Arc::get_mut(&mut state.config).unwrap().max_body_size = 1024;
+        let app = invoke_router(state);
+        let body = vec![0u8; 2048]; // 2 KB — should be rejected
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/2015-03-31/functions/test-fn/invocations")
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await

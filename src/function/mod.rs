@@ -230,7 +230,10 @@ impl FunctionManager {
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-fn validate_function_name(name: &str) -> Result<(), FunctionConfigError> {
+/// Validate a function name: alphanumeric, hyphens, underscores only, max 64 chars.
+///
+/// Returns `Ok(())` if valid, or an error describing the violation.
+pub fn validate_function_name(name: &str) -> Result<(), FunctionConfigError> {
     if name.is_empty() {
         return Err(FunctionConfigError::InvalidFunctionName {
             name: name.to_string(),
