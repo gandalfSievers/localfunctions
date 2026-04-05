@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 http = "1"
 
+# Async stream utilities
+futures-util = "0.3"
+
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"

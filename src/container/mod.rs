@@ -1,13 +1,20 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use bollard::container::{RemoveContainerOptions, StopContainerOptions};
+use bollard::container::{
+    Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
+    StartContainerOptions, StopContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::models::HostConfig;
 use bollard::Docker;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
+use futures_util::TryStreamExt;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::types::{FunctionConfig, ServiceError};
+use crate::types::{ContainerState, FunctionConfig, ServiceError};
 
 /// Manages the Docker network used for communication between Lambda containers
 /// and the Runtime API.
@@ -223,6 +230,374 @@ impl ContainerRegistry {
 
         info!(count, "all containers cleaned up");
     }
+}
+
+// ---------------------------------------------------------------------------
+// ContainerManager
+// ---------------------------------------------------------------------------
+
+/// Metadata for a managed container with lifecycle state tracking.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ManagedContainer {
+    pub container_id: String,
+    pub function_name: String,
+    pub state: ContainerState,
+    pub image: String,
+}
+
+/// Creates and manages Docker containers for Lambda function execution.
+///
+/// Handles image resolution (from `runtime_images` mapping or custom image),
+/// lazy image pulling, container creation with correct mounts/env/limits,
+/// and container lifecycle (start, stop, remove).
+#[allow(dead_code)]
+pub struct ContainerManager {
+    docker: Docker,
+    runtime_images: HashMap<String, String>,
+    network_name: String,
+    runtime_port: u16,
+    region: String,
+    registry: Arc<ContainerRegistry>,
+    /// Tracks state of containers managed by this instance.
+    containers: RwLock<HashMap<String, ManagedContainer>>,
+}
+
+#[allow(dead_code)]
+impl ContainerManager {
+    /// Create a new `ContainerManager`.
+    ///
+    /// - `runtime_images`: mapping from runtime name (e.g. `"python3.12"`) to
+    ///   Docker image (e.g. `"public.ecr.aws/lambda/python:3.12"`).
+    /// - `network_name`: the Docker network to attach containers to.
+    /// - `registry`: shared `ContainerRegistry` for shutdown tracking.
+    pub fn new(
+        docker: Docker,
+        runtime_images: HashMap<String, String>,
+        network_name: String,
+        runtime_port: u16,
+        region: String,
+        registry: Arc<ContainerRegistry>,
+    ) -> Self {
+        Self {
+            docker,
+            runtime_images,
+            network_name,
+            runtime_port,
+            region,
+            registry,
+            containers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve the Docker image for a function.
+    ///
+    /// If the function has a custom `image` field, use that. Otherwise look up
+    /// the runtime in the `runtime_images` map.
+    pub fn resolve_image(&self, function: &FunctionConfig) -> Result<String, ServiceError> {
+        if let Some(ref image) = function.image {
+            return Ok(image.clone());
+        }
+
+        self.runtime_images
+            .get(&function.runtime)
+            .cloned()
+            .ok_or_else(|| {
+                ServiceError::InvalidRuntime(format!(
+                    "no image configured for runtime '{}' — add it to runtime_images or set a \
+                     custom image on the function",
+                    function.runtime
+                ))
+            })
+    }
+
+    /// Pull a Docker image if it is not already present locally.
+    ///
+    /// This is a lazy pull: if the image already exists, this is a no-op.
+    pub async fn ensure_image(&self, image: &str) -> Result<(), ServiceError> {
+        // Check if image exists locally
+        match self.docker.inspect_image(image).await {
+            Ok(_) => {
+                debug!(image = %image, "image already present locally");
+                return Ok(());
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Image not found locally — pull it
+            }
+            Err(e) => {
+                return Err(ServiceError::ServiceException(format!(
+                    "failed to inspect image '{}': {}",
+                    image, e
+                )));
+            }
+        }
+
+        info!(image = %image, "pulling image (not found locally)");
+
+        let opts = CreateImageOptions {
+            from_image: image,
+            ..Default::default()
+        };
+
+        self.docker
+            .create_image(Some(opts), None, None)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| {
+                ServiceError::ServiceException(format!("failed to pull image '{}': {}", image, e))
+            })?;
+
+        info!(image = %image, "image pulled successfully");
+        Ok(())
+    }
+
+    /// Create and start a container for the given function.
+    ///
+    /// This method:
+    /// 1. Resolves the Docker image (custom or from runtime_images)
+    /// 2. Pulls the image lazily if not present
+    /// 3. Creates the container with correct env vars, mounts, memory limits,
+    ///    network, and labels
+    /// 4. Starts the container
+    /// 5. Registers it in the ContainerRegistry and tracks its state
+    ///
+    /// Returns the container ID on success.
+    pub async fn create_and_start(
+        &self,
+        function: &FunctionConfig,
+    ) -> Result<String, ServiceError> {
+        let image = self.resolve_image(function)?;
+
+        // Lazy pull
+        self.ensure_image(&image).await?;
+
+        // Build environment variables
+        let env = lambda_env_vars(function, self.runtime_port, &self.region);
+
+        // Code path mount: read-only at /var/task
+        let code_path = function
+            .code_path
+            .to_str()
+            .ok_or_else(|| {
+                ServiceError::ServiceException(format!(
+                    "code_path contains invalid UTF-8: {:?}",
+                    function.code_path
+                ))
+            })?
+            .to_string();
+
+        let binds = vec![format!("{}:/var/task:ro", code_path)];
+
+        // Memory limit in bytes (memory_size is in MB)
+        let memory = (function.memory_size as i64) * 1024 * 1024;
+
+        // Labels for identification
+        let mut labels = HashMap::new();
+        labels.insert("managed-by".to_string(), "localfunctions".to_string());
+        labels.insert(
+            "localfunctions.function".to_string(),
+            function.name.clone(),
+        );
+
+        let host_config = HostConfig {
+            binds: Some(binds),
+            memory: Some(memory),
+            network_mode: Some(self.network_name.clone()),
+            // Explicitly no privileged mode, no port bindings
+            privileged: Some(false),
+            publish_all_ports: Some(false),
+            ..Default::default()
+        };
+
+        let container_config: ContainerConfig<String> = ContainerConfig {
+            image: Some(image.clone()),
+            env: Some(env),
+            labels: Some(labels),
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+
+        // Track as Starting
+        let container_name = format!("localfunctions-{}-{}", function.name, uuid_short());
+
+        debug!(
+            function = %function.name,
+            image = %image,
+            container_name = %container_name,
+            "creating container"
+        );
+
+        let create_opts = CreateContainerOptions {
+            name: container_name.as_str(),
+            platform: None,
+        };
+
+        let response = self
+            .docker
+            .create_container(Some(create_opts), container_config)
+            .await
+            .map_err(|e| {
+                ServiceError::ServiceException(format!(
+                    "failed to create container for '{}': {}",
+                    function.name, e
+                ))
+            })?;
+
+        let container_id = response.id;
+
+        // Insert as Starting state
+        {
+            let mut containers = self.containers.write().await;
+            containers.insert(
+                container_id.clone(),
+                ManagedContainer {
+                    container_id: container_id.clone(),
+                    function_name: function.name.clone(),
+                    state: ContainerState::Starting,
+                    image: image.clone(),
+                },
+            );
+        }
+
+        // Start the container
+        if let Err(e) = self
+            .docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await
+        {
+            // Clean up on failure
+            self.set_state(&container_id, ContainerState::Stopping).await;
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            self.containers.write().await.remove(&container_id);
+            return Err(ServiceError::ServiceException(format!(
+                "failed to start container for '{}': {}",
+                function.name, e
+            )));
+        }
+
+        // Register in the global registry for shutdown cleanup
+        self.registry
+            .register(container_id.clone(), function.name.clone())
+            .await;
+
+        // Transition to Idle
+        self.set_state(&container_id, ContainerState::Idle).await;
+
+        info!(
+            container_id = %container_id,
+            function = %function.name,
+            image = %image,
+            "container started"
+        );
+
+        Ok(container_id)
+    }
+
+    /// Update the state of a managed container.
+    pub async fn set_state(&self, container_id: &str, state: ContainerState) {
+        let mut containers = self.containers.write().await;
+        if let Some(entry) = containers.get_mut(container_id) {
+            debug!(
+                container_id = %container_id,
+                function = %entry.function_name,
+                old_state = ?entry.state,
+                new_state = ?state,
+                "container state transition"
+            );
+            entry.state = state;
+        }
+    }
+
+    /// Get the current state of a managed container.
+    pub async fn get_state(&self, container_id: &str) -> Option<ContainerState> {
+        self.containers
+            .read()
+            .await
+            .get(container_id)
+            .map(|c| c.state)
+    }
+
+    /// Stop and remove a single container.
+    ///
+    /// Transitions the container through Stopping state, stops it with the
+    /// given timeout, force-removes it, and deregisters it from both the
+    /// local tracking and the global registry.
+    pub async fn stop_and_remove(
+        &self,
+        container_id: &str,
+        timeout: Duration,
+    ) -> Result<(), ServiceError> {
+        self.set_state(container_id, ContainerState::Stopping).await;
+
+        let timeout_secs = timeout.as_secs().try_into().unwrap_or(i64::MAX);
+
+        if let Err(e) = self
+            .docker
+            .stop_container(
+                container_id,
+                Some(StopContainerOptions { t: timeout_secs }),
+            )
+            .await
+        {
+            if !is_benign_docker_error(&e) {
+                error!(container_id = %container_id, %e, "failed to stop container");
+            }
+        }
+
+        if let Err(e) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !is_benign_docker_error(&e) {
+                error!(container_id = %container_id, %e, "failed to remove container");
+                return Err(ServiceError::ServiceException(format!(
+                    "failed to remove container '{}': {}",
+                    container_id, e
+                )));
+            }
+        }
+
+        // Deregister from both local and global tracking
+        self.containers.write().await.remove(container_id);
+        self.registry.deregister(container_id).await;
+
+        info!(container_id = %container_id, "container stopped and removed");
+        Ok(())
+    }
+
+    /// Return the number of containers currently managed.
+    pub async fn count(&self) -> usize {
+        self.containers.read().await.len()
+    }
+
+    /// Get a snapshot of all managed containers.
+    pub async fn list(&self) -> Vec<ManagedContainer> {
+        self.containers.read().await.values().cloned().collect()
+    }
+}
+
+/// Generate a short unique suffix for container names.
+fn uuid_short() -> String {
+    let id = uuid::Uuid::new_v4();
+    id.to_string()[..8].to_string()
 }
 
 /// Returns true for Docker errors that indicate the container is already
@@ -515,6 +890,226 @@ mod tests {
         };
         assert!(!is_benign_docker_error(&err));
     }
+
+    // -- uuid_short --------------------------------------------------------
+
+    #[test]
+    fn uuid_short_is_8_chars() {
+        let s = uuid_short();
+        assert_eq!(s.len(), 8);
+    }
+
+    #[test]
+    fn uuid_short_is_unique() {
+        let a = uuid_short();
+        let b = uuid_short();
+        assert_ne!(a, b);
+    }
+
+    // -- ContainerManager: resolve_image -----------------------------------
+
+    fn make_runtime_images() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(
+            "python3.12".to_string(),
+            "public.ecr.aws/lambda/python:3.12".to_string(),
+        );
+        m.insert(
+            "nodejs20.x".to_string(),
+            "public.ecr.aws/lambda/nodejs:20".to_string(),
+        );
+        m
+    }
+
+    fn make_container_manager() -> ContainerManager {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        ContainerManager::new(
+            docker,
+            make_runtime_images(),
+            "test-network".to_string(),
+            9601,
+            "us-east-1".to_string(),
+            registry,
+        )
+    }
+
+    #[test]
+    fn resolve_image_from_runtime_images() {
+        let mgr = make_container_manager();
+        let func = make_test_function(); // runtime = "python3.12"
+        let image = mgr.resolve_image(&func).unwrap();
+        assert_eq!(image, "public.ecr.aws/lambda/python:3.12");
+    }
+
+    #[test]
+    fn resolve_image_from_runtime_images_nodejs() {
+        let mgr = make_container_manager();
+        let mut func = make_test_function();
+        func.runtime = "nodejs20.x".into();
+        let image = mgr.resolve_image(&func).unwrap();
+        assert_eq!(image, "public.ecr.aws/lambda/nodejs:20");
+    }
+
+    #[test]
+    fn resolve_image_custom_image_overrides_runtime() {
+        let mgr = make_container_manager();
+        let mut func = make_test_function();
+        func.image = Some("my-custom:latest".into());
+        let image = mgr.resolve_image(&func).unwrap();
+        assert_eq!(image, "my-custom:latest");
+    }
+
+    #[test]
+    fn resolve_image_custom_image_for_custom_runtime() {
+        let mgr = make_container_manager();
+        let mut func = make_test_function();
+        func.runtime = "custom".into();
+        func.image = Some("my-custom-runtime:v1".into());
+        let image = mgr.resolve_image(&func).unwrap();
+        assert_eq!(image, "my-custom-runtime:v1");
+    }
+
+    #[test]
+    fn resolve_image_unknown_runtime_returns_error() {
+        let mgr = make_container_manager();
+        let mut func = make_test_function();
+        func.runtime = "ruby3.2".into();
+        let err = mgr.resolve_image(&func).unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidRuntime(_)));
+        assert!(err.to_string().contains("ruby3.2"));
+    }
+
+    #[test]
+    fn resolve_image_empty_runtime_images() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mgr = ContainerManager::new(
+            docker,
+            HashMap::new(),
+            "net".into(),
+            9601,
+            "us-east-1".into(),
+            registry,
+        );
+        let func = make_test_function();
+        let err = mgr.resolve_image(&func).unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidRuntime(_)));
+    }
+
+    // -- ContainerManager: state tracking ----------------------------------
+
+    #[tokio::test]
+    async fn container_manager_starts_empty() {
+        let mgr = make_container_manager();
+        assert_eq!(mgr.count().await, 0);
+        assert!(mgr.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn container_manager_get_state_nonexistent_returns_none() {
+        let mgr = make_container_manager();
+        assert_eq!(mgr.get_state("nonexistent").await, None);
+    }
+
+    #[tokio::test]
+    async fn container_manager_set_and_get_state() {
+        let mgr = make_container_manager();
+
+        // Manually insert a container for testing state transitions
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "test-id".to_string(),
+                ManagedContainer {
+                    container_id: "test-id".to_string(),
+                    function_name: "test-func".to_string(),
+                    state: ContainerState::Starting,
+                    image: "test:latest".to_string(),
+                },
+            );
+        }
+
+        assert_eq!(
+            mgr.get_state("test-id").await,
+            Some(ContainerState::Starting)
+        );
+
+        mgr.set_state("test-id", ContainerState::Idle).await;
+        assert_eq!(
+            mgr.get_state("test-id").await,
+            Some(ContainerState::Idle)
+        );
+
+        mgr.set_state("test-id", ContainerState::Busy).await;
+        assert_eq!(
+            mgr.get_state("test-id").await,
+            Some(ContainerState::Busy)
+        );
+
+        mgr.set_state("test-id", ContainerState::Stopping).await;
+        assert_eq!(
+            mgr.get_state("test-id").await,
+            Some(ContainerState::Stopping)
+        );
+    }
+
+    #[tokio::test]
+    async fn container_manager_set_state_nonexistent_is_noop() {
+        let mgr = make_container_manager();
+        // Should not panic
+        mgr.set_state("nonexistent", ContainerState::Idle).await;
+        assert_eq!(mgr.get_state("nonexistent").await, None);
+    }
+
+    #[tokio::test]
+    async fn container_manager_list_returns_all() {
+        let mgr = make_container_manager();
+
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "id-1".to_string(),
+                ManagedContainer {
+                    container_id: "id-1".to_string(),
+                    function_name: "func-a".to_string(),
+                    state: ContainerState::Idle,
+                    image: "img-a:latest".to_string(),
+                },
+            );
+            containers.insert(
+                "id-2".to_string(),
+                ManagedContainer {
+                    container_id: "id-2".to_string(),
+                    function_name: "func-b".to_string(),
+                    state: ContainerState::Busy,
+                    image: "img-b:latest".to_string(),
+                },
+            );
+        }
+
+        assert_eq!(mgr.count().await, 2);
+        let list = mgr.list().await;
+        assert_eq!(list.len(), 2);
+        let names: Vec<&str> = list.iter().map(|c| c.function_name.as_str()).collect();
+        assert!(names.contains(&"func-a"));
+        assert!(names.contains(&"func-b"));
+    }
+
+    // -- ManagedContainer ---------------------------------------------------
+
+    #[test]
+    fn managed_container_clone() {
+        let mc = ManagedContainer {
+            container_id: "abc".into(),
+            function_name: "f".into(),
+            state: ContainerState::Idle,
+            image: "img:latest".into(),
+        };
+        let mc2 = mc.clone();
+        assert_eq!(mc2.container_id, "abc");
+        assert_eq!(mc2.state, ContainerState::Idle);
+    }
 }
 
 #[cfg(test)]
@@ -559,5 +1154,149 @@ mod integration_tests {
 
         // Should not error when network doesn't exist
         net.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn container_manager_create_start_stop_lifecycle() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let network_name = format!("lf-test-{}", uuid_short());
+
+        // Create network for the test
+        let net = DockerNetwork::new(docker.clone(), network_name.clone());
+        net.ensure_created().await.unwrap();
+
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mut runtime_images = HashMap::new();
+        runtime_images.insert(
+            "python3.12".to_string(),
+            "public.ecr.aws/lambda/python:3.12".to_string(),
+        );
+
+        let mgr = ContainerManager::new(
+            docker.clone(),
+            runtime_images,
+            network_name.clone(),
+            9601,
+            "us-east-1".to_string(),
+            registry.clone(),
+        );
+
+        // Create a temp directory for code
+        let code_dir = tempfile::tempdir().unwrap();
+
+        let func = FunctionConfig {
+            name: "test-func".into(),
+            runtime: "python3.12".into(),
+            handler: "main.handler".into(),
+            code_path: code_dir.path().to_path_buf(),
+            timeout: 30,
+            memory_size: 128,
+            environment: HashMap::from([("MY_VAR".into(), "my_value".into())]),
+            image: None,
+        };
+
+        // Create and start
+        let container_id = mgr.create_and_start(&func).await.unwrap();
+        assert!(!container_id.is_empty());
+
+        // Verify state is Idle after creation
+        assert_eq!(
+            mgr.get_state(&container_id).await,
+            Some(ContainerState::Idle)
+        );
+        assert_eq!(mgr.count().await, 1);
+
+        // Verify it's registered in the global registry
+        assert_eq!(registry.count().await, 1);
+
+        // Inspect container to verify configuration
+        let info = docker.inspect_container(&container_id, None).await.unwrap();
+
+        // Verify labels
+        let labels = info.config.as_ref().unwrap().labels.as_ref().unwrap();
+        assert_eq!(labels.get("managed-by"), Some(&"localfunctions".to_string()));
+        assert_eq!(
+            labels.get("localfunctions.function"),
+            Some(&"test-func".to_string())
+        );
+
+        // Verify host config
+        let host_config = info.host_config.as_ref().unwrap();
+        assert_eq!(host_config.privileged, Some(false));
+
+        // Verify memory limit (128 MB)
+        assert_eq!(host_config.memory, Some(128 * 1024 * 1024));
+
+        // Verify network
+        assert_eq!(
+            host_config.network_mode,
+            Some(network_name.clone())
+        );
+
+        // Verify volume mount
+        let binds = host_config.binds.as_ref().unwrap();
+        assert_eq!(binds.len(), 1);
+        assert!(binds[0].ends_with(":/var/task:ro"));
+
+        // Verify env vars
+        let env = info.config.as_ref().unwrap().env.as_ref().unwrap();
+        assert!(env.iter().any(|e| e == "AWS_LAMBDA_FUNCTION_NAME=test-func"));
+        assert!(env.iter().any(|e| e == "_HANDLER=main.handler"));
+        assert!(env.iter().any(|e| e == "MY_VAR=my_value"));
+
+        // Stop and remove
+        mgr.stop_and_remove(&container_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.count().await, 0);
+        assert_eq!(mgr.get_state(&container_id).await, None);
+        assert_eq!(registry.count().await, 0);
+
+        // Clean up network
+        net.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn container_manager_ensure_image_pulls_lazily() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mgr = ContainerManager::new(
+            docker,
+            HashMap::new(),
+            "test".into(),
+            9601,
+            "us-east-1".into(),
+            registry,
+        );
+
+        // Use a small, commonly available image
+        // This test verifies that ensure_image does not fail for a valid image
+        mgr.ensure_image("public.ecr.aws/lambda/python:3.12")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn container_manager_stop_nonexistent_container_handles_gracefully() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mgr = ContainerManager::new(
+            docker,
+            HashMap::new(),
+            "test".into(),
+            9601,
+            "us-east-1".into(),
+            registry,
+        );
+
+        // Stopping a nonexistent container should succeed (benign errors are swallowed)
+        let result = mgr
+            .stop_and_remove("nonexistent-container-id", Duration::from_secs(1))
+            .await;
+        assert!(result.is_ok());
     }
 }
