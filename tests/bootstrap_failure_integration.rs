@@ -118,6 +118,7 @@ async fn build_state(
 /// RuntimeBridge ready signal mechanism directly: we register a signal,
 /// don't fire it, and verify that the ready signal times out correctly.
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn ready_signal_timeout() {
     let (state, _shutdown_tx) = build_state("bootstrap-timeout-func", 30, 1).await;
 
@@ -133,6 +134,7 @@ async fn ready_signal_timeout() {
 
 /// Test: ready signal fires immediately when container is already ready.
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn ready_signal_fires_when_already_ready() {
     let (state, _shutdown_tx) = build_state("bootstrap-ready-func", 30, 10).await;
 
@@ -151,6 +153,7 @@ async fn ready_signal_fires_when_already_ready() {
 
 /// Test: ready signal fires when mark_ready is called after registration.
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn ready_signal_fires_on_mark_ready() {
     let (state, _shutdown_tx) = build_state("bootstrap-signal-func", 30, 10).await;
 
@@ -172,6 +175,7 @@ async fn ready_signal_fires_on_mark_ready() {
 /// Full end-to-end: invoke a function where the simulated container calls
 /// /next successfully (bootstrap succeeds), then responds normally.
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn bootstrap_success_then_invoke() {
     let (state, _shutdown_tx) = build_state("bootstrap-ok-func", 5, 2).await;
 
@@ -257,6 +261,7 @@ async fn bootstrap_success_then_invoke() {
 /// Full end-to-end: invoke a function where the simulated container reports
 /// an init error via POST /runtime/init/error.
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn bootstrap_init_error_returns_502() {
     let (state, _shutdown_tx) = build_state("bootstrap-fail-func", 5, 2).await;
 

@@ -112,6 +112,7 @@ async fn build_state(
 }
 
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn invoke_timeout_returns_200_with_unhandled_error() {
     // Configure a function with a very short timeout (1 second).
     let (state, _shutdown_tx) = build_state("timeout-func", 1).await;

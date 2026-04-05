@@ -115,6 +115,7 @@ async fn build_concurrent_state(
 }
 
 #[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
 async fn five_concurrent_invocations_all_return_correct_results() {
     let (state, _shutdown_tx) = build_concurrent_state("conc-func", 5).await;
 

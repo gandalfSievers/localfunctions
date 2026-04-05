@@ -1,0 +1,29 @@
+# Test infrastructure for localfunctions integration tests.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d   # start test infra
+#   cargo test -- --ignored                            # run integration tests
+#   docker compose -f docker-compose.test.yml down     # tear down
+#
+# The integration tests expect:
+#   - Docker daemon running and accessible
+#   - The "localfunctions-test" network available
+#   - Lambda runtime images pre-pulled (see below)
+#
+# Pre-pull required images:
+#   docker pull public.ecr.aws/lambda/python:3.12
+#   docker pull public.ecr.aws/lambda/nodejs:20
+
+services:
+  # Create the test network and exit. Integration tests attach containers
+  # to this network dynamically.
+  network-setup:
+    image: busybox:latest
+    command: ["true"]
+    networks:
+      - localfunctions-test
+
+networks:
+  localfunctions-test:
+    name: localfunctions-test
+    driver: bridge
