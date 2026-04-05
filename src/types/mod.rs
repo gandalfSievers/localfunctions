@@ -133,6 +133,13 @@ pub struct AwsErrorResponse {
     pub Message: String,
 }
 
+impl AwsErrorResponse {
+    /// Serialize to JSON bytes for use in raw response bodies.
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+}
+
 #[allow(dead_code)]
 impl ServiceError {
     /// Return the AWS error type string for this variant.

@@ -1,15 +1,15 @@
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::function::validate_function_name;
 use crate::server::AppState;
-use crate::types::{AwsErrorResponse, ServiceError};
+use crate::types::ServiceError;
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -124,18 +124,114 @@ pub fn runtime_routes() -> Router<AppState> {
         )
 }
 
+/// Header sent by containers to identify which function they serve.
+const HEADER_FUNCTION_NAME: &str = "Lambda-Runtime-Function-Name";
+/// Header sent by containers to identify themselves (optional).
+const HEADER_CONTAINER_ID: &str = "Lambda-Runtime-Container-Id";
+
 /// GET /2018-06-01/runtime/invocation/next
 ///
-/// Called by the Lambda runtime inside a container to get the next invocation.
-async fn next_invocation(State(_state): State<AppState>) -> impl IntoResponse {
-    // Stub — will block until an invocation is available
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(AwsErrorResponse {
-            Type: "ServiceException".into(),
-            Message: "Runtime API not yet implemented".into(),
-        }),
-    )
+/// Called by the Lambda runtime inside a container to long-poll for the next
+/// invocation. The container identifies itself via the
+/// `Lambda-Runtime-Function-Name` header.
+///
+/// On first call, signals that the container is ready (cold start complete).
+/// Keeps the connection open until an invocation arrives or the service shuts
+/// down.
+async fn next_invocation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Identify the function this container serves.
+    let function_name = match headers
+        .get(HEADER_FUNCTION_NAME)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(name) => name.to_string(),
+        None => {
+            warn!("runtime /next called without {} header", HEADER_FUNCTION_NAME);
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Missing required header: {}",
+                HEADER_FUNCTION_NAME
+            ));
+            return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+        }
+    };
+
+    // Verify the function exists.
+    if !state.runtime_bridge.has_function(&function_name) {
+        let err = ServiceError::ResourceNotFound(function_name);
+        return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+    }
+
+    // Mark container as ready on first /next call (cold start complete).
+    let container_id = headers
+        .get(HEADER_CONTAINER_ID)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&function_name);
+    state.runtime_bridge.mark_ready(container_id).await;
+
+    debug!(
+        function = %function_name,
+        container_id = %container_id,
+        "container long-polling for next invocation"
+    );
+
+    // Long-poll until an invocation is available or shutdown.
+    match state.runtime_bridge.next_invocation(&function_name).await {
+        Some(invocation) => {
+            // Compute deadline in epoch milliseconds.
+            let deadline_ms = {
+                let remaining = invocation
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                let epoch_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    + remaining.as_millis();
+                epoch_ms.to_string()
+            };
+
+            // Build the invoked function ARN.
+            let arn = format!(
+                "arn:aws:lambda:{}:{}:function:{}",
+                state.config.region, state.config.account_id, function_name
+            );
+
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(
+                "Lambda-Runtime-Aws-Request-Id",
+                invocation.request_id.to_string().parse().unwrap(),
+            );
+            response_headers.insert(
+                "Lambda-Runtime-Deadline-Ms",
+                deadline_ms.parse().unwrap(),
+            );
+            response_headers.insert(
+                "Lambda-Runtime-Invoked-Function-Arn",
+                arn.parse().unwrap(),
+            );
+
+            debug!(
+                function = %function_name,
+                request_id = %invocation.request_id,
+                "dispatching invocation to container"
+            );
+
+            (StatusCode::OK, response_headers, invocation.payload.to_vec())
+        }
+        None => {
+            // Channel closed or shutdown — return a 500 to let the runtime
+            // know it should exit.
+            let err = ServiceError::ServiceException("Runtime shutting down".into());
+            (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            )
+        }
+    }
 }
 
 /// POST /2018-06-01/runtime/invocation/:request_id/response
@@ -173,6 +269,7 @@ mod tests {
     use crate::config::Config;
     use crate::container::ContainerRegistry;
     use crate::function::FunctionsConfig;
+    use crate::runtime::RuntimeBridge;
 
     fn test_state() -> AppState {
         let config = Config {
@@ -194,12 +291,15 @@ mod tests {
             functions: HashMap::new(),
             runtime_images: HashMap::new(),
         };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), shutdown_rx));
         AppState {
             config: Arc::new(config),
             container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
             docker,
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime_bridge,
         }
     }
 
@@ -251,7 +351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_next_invocation_returns_not_implemented() {
+    async fn runtime_next_invocation_rejects_missing_function_header() {
         let app = runtime_routes().with_state(test_state());
         let resp = app
             .oneshot(
@@ -261,7 +361,129 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "InvalidRequestContentException");
+    }
+
+    #[tokio::test]
+    async fn runtime_next_invocation_rejects_unknown_function() {
+        let app = runtime_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/2018-06-01/runtime/invocation/next")
+                    .header("Lambda-Runtime-Function-Name", "nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn runtime_next_invocation_returns_queued_invocation() {
+        use crate::types::Invocation;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (tx, rx) = mpsc::channel(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        // Queue an invocation
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let request_id = uuid::Uuid::new_v4();
+        let inv = Invocation {
+            request_id,
+            function_name: "my-func".into(),
+            payload: bytes::Bytes::from(r#"{"hello":"world"}"#),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            response_tx: resp_tx,
+        };
+        tx.send(inv).await.unwrap();
+
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::get("/2018-06-01/runtime/invocation/next")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify required headers
+        assert_eq!(
+            resp.headers()
+                .get("Lambda-Runtime-Aws-Request-Id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            request_id.to_string()
+        );
+        assert!(resp
+            .headers()
+            .get("Lambda-Runtime-Deadline-Ms")
+            .is_some());
+        assert!(resp
+            .headers()
+            .get("Lambda-Runtime-Invoked-Function-Arn")
+            .is_some());
+
+        // Verify payload
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), br#"{"hello":"world"}"#);
+    }
+
+    #[tokio::test]
+    async fn runtime_next_invocation_returns_error_on_shutdown() {
+        use tokio::sync::mpsc;
+
+        let (_tx, rx) = mpsc::channel::<crate::types::Invocation>(10);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+
+        let mut state = test_state();
+        state.runtime_bridge = runtime_bridge;
+
+        // Trigger shutdown before the request
+        shutdown_tx.send(true).unwrap();
+
+        let app = runtime_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/2018-06-01/runtime/invocation/next")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

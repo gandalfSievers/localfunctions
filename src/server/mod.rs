@@ -11,6 +11,7 @@ use crate::api;
 use crate::config::Config;
 use crate::container::ContainerRegistry;
 use crate::function::FunctionsConfig;
+use crate::runtime::RuntimeBridge;
 
 /// Shared application state accessible by all route handlers.
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub struct AppState {
     pub functions: Arc<FunctionsConfig>,
     pub container_registry: Arc<ContainerRegistry>,
     pub shutting_down: Arc<AtomicBool>,
+    pub runtime_bridge: Arc<RuntimeBridge>,
 }
 
 impl AppState {
@@ -145,12 +147,15 @@ mod tests {
             functions: HashMap::new(),
             runtime_images: HashMap::new(),
         };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), shutdown_rx));
         AppState {
             config: Arc::new(config),
             container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
             docker,
             functions: Arc::new(functions),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            runtime_bridge,
         }
     }
 

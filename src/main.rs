@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod container;
 mod function;
+mod runtime;
 mod server;
 mod types;
 
@@ -14,6 +15,7 @@ use bollard::Docker;
 use tracing::{error, info};
 
 use container::{ContainerRegistry, DockerNetwork};
+use runtime::RuntimeBridge;
 use server::AppState;
 
 #[tokio::main]
@@ -66,6 +68,18 @@ async fn main() -> Result<()> {
 
     info!(count = functions_config.functions.len(), "functions loaded");
 
+    // Create per-function invocation channels for the runtime bridge.
+    let mut invocation_receivers = std::collections::HashMap::new();
+    let mut invocation_senders = std::collections::HashMap::new();
+    for name in functions_config.functions.keys() {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        invocation_senders.insert(name.clone(), tx);
+        invocation_receivers.insert(name.clone(), rx);
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_receivers, shutdown_rx));
+
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout);
     let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
 
@@ -75,6 +89,7 @@ async fn main() -> Result<()> {
         functions: Arc::new(functions_config),
         container_registry: container_registry.clone(),
         shutting_down: Arc::new(AtomicBool::new(false)),
+        runtime_bridge,
     };
 
     // Start both API servers (blocks until shutdown signal)
@@ -83,6 +98,9 @@ async fn main() -> Result<()> {
     // --- Graceful shutdown sequence ---
 
     info!("graceful shutdown started");
+
+    // Wake any long-polling runtime handlers so they can exit cleanly.
+    let _ = shutdown_tx.send(true);
 
     // Step 1: Wait for in-flight invocations to complete (up to timeout),
     //         then forcibly stop and remove all containers.
