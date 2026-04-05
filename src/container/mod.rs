@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
@@ -234,6 +234,89 @@ impl ContainerRegistry {
         }
 
         removed
+    }
+
+    /// Detect and remove orphan containers from previous runs.
+    ///
+    /// Queries Docker for containers with the `managed-by=localfunctions` label
+    /// and stops/removes them. This ensures no leftover containers consume
+    /// resources after an unclean shutdown.
+    pub async fn cleanup_orphans(&self) {
+        let mut filters = HashMap::new();
+        filters.insert("label", vec!["managed-by=localfunctions"]);
+
+        let opts = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+
+        let containers = match self.docker.list_containers(Some(opts)).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(%e, "failed to list orphan containers");
+                return;
+            }
+        };
+
+        if containers.is_empty() {
+            info!("no orphan containers found");
+            return;
+        }
+
+        info!(count = containers.len(), "orphan containers detected, cleaning up");
+
+        let mut handles = Vec::with_capacity(containers.len());
+        for container in &containers {
+            let id = match &container.id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+            let names = container
+                .names
+                .as_ref()
+                .map(|n| n.join(", "))
+                .unwrap_or_default();
+
+            info!(container_id = %id, names = %names, "cleaning up orphan container");
+
+            let docker = self.docker.clone();
+            handles.push(tokio::spawn(async move {
+                // Stop first (may already be stopped — that's fine)
+                if let Err(e) = docker
+                    .stop_container(&id, Some(StopContainerOptions { t: 5 }))
+                    .await
+                {
+                    if !is_benign_docker_error(&e) {
+                        warn!(container_id = %id, %e, "failed to stop orphan container");
+                    }
+                }
+
+                // Force-remove
+                if let Err(e) = docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    if !is_benign_docker_error(&e) {
+                        error!(container_id = %id, %e, "failed to remove orphan container");
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            if let Err(e) = handle.await {
+                error!(%e, "orphan cleanup task panicked");
+            }
+        }
+
+        info!(count = containers.len(), "orphan container cleanup complete");
     }
 
     /// Stop and remove all tracked containers.
@@ -1351,6 +1434,105 @@ mod integration_tests {
         mgr.ensure_image("public.ecr.aws/lambda/python:3.12")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn cleanup_orphans_completes_with_no_orphans() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = ContainerRegistry::new(docker);
+        // Should complete without error when there are no orphan containers
+        registry.cleanup_orphans().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn cleanup_orphans_removes_labeled_containers() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+
+        // Create a container with the managed-by=localfunctions label
+        let mut labels = HashMap::new();
+        labels.insert("managed-by", "localfunctions");
+        labels.insert("localfunctions.function", "orphan-test");
+
+        let config = ContainerConfig {
+            image: Some("hello-world:latest"),
+            labels: Some(labels),
+            ..Default::default()
+        };
+
+        let container = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: "localfunctions-orphan-test",
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .unwrap();
+
+        let container_id = container.id.clone();
+
+        // Verify the container exists
+        let info = docker.inspect_container(&container_id, None).await;
+        assert!(info.is_ok());
+
+        // Run cleanup
+        let registry = ContainerRegistry::new(docker.clone());
+        registry.cleanup_orphans().await;
+
+        // Verify the container was removed
+        let info = docker.inspect_container(&container_id, None).await;
+        assert!(info.is_err(), "orphan container should have been removed");
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn cleanup_orphans_does_not_remove_unrelated_containers() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+
+        // Create a container WITHOUT the managed-by=localfunctions label
+        let mut labels = HashMap::new();
+        labels.insert("managed-by", "something-else");
+
+        let config = ContainerConfig {
+            image: Some("hello-world:latest"),
+            labels: Some(labels),
+            ..Default::default()
+        };
+
+        let container = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: "unrelated-container-test",
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .unwrap();
+
+        let container_id = container.id.clone();
+
+        // Run cleanup
+        let registry = ContainerRegistry::new(docker.clone());
+        registry.cleanup_orphans().await;
+
+        // Verify the unrelated container still exists
+        let info = docker.inspect_container(&container_id, None).await;
+        assert!(info.is_ok(), "unrelated container should NOT have been removed");
+
+        // Clean up manually
+        let _ = docker
+            .remove_container(
+                &container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
     }
 
     #[tokio::test]

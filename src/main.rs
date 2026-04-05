@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
 
+    // Clean up any orphan containers from previous runs before proceeding.
+    let orphan_registry = ContainerRegistry::new(docker.clone());
+    orphan_registry.cleanup_orphans().await;
+
     let network = DockerNetwork::new(docker.clone(), config.docker_network.clone());
     network.ensure_created().await.map_err(|e| {
         error!(%e, "Docker network setup failed");
