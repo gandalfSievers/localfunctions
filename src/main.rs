@@ -53,18 +53,15 @@ async fn main() -> Result<()> {
         "Docker network ready"
     );
 
-    // Load function definitions
+    // Load and validate function definitions — fail fast if configuration is invalid
     let functions_config = function::load_functions_config(
         &config.functions_file,
         &std::env::current_dir()?,
     )
-    .unwrap_or_else(|e| {
-        tracing::warn!(%e, "Failed to load functions config, starting with empty config");
-        function::FunctionsConfig {
-            functions: Default::default(),
-            runtime_images: Default::default(),
-        }
-    });
+    .map_err(|e| {
+        error!("{}", e);
+        anyhow::anyhow!("Failed to load functions configuration")
+    })?;
 
     info!(count = functions_config.functions.len(), "functions loaded");
 

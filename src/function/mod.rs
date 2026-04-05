@@ -37,6 +37,29 @@ pub enum FunctionConfigError {
 
     #[error("function '{name}': runtime 'custom' requires an 'image' field")]
     MissingImageForCustomRuntime { name: String },
+
+    #[error("function '{name}': unknown runtime '{value}' — expected one of: {expected}")]
+    UnknownRuntime {
+        name: String,
+        value: String,
+        expected: String,
+    },
+
+    #[error("function '{name}': invalid handler '{value}' — {reason}")]
+    InvalidHandler {
+        name: String,
+        value: String,
+        reason: String,
+    },
+
+    #[error("function '{name}': code_path '{path}' does not exist or is not readable")]
+    CodePathNotFound { name: String, path: String },
+
+    #[error("function '{name}': invalid environment variable key '{key}' — must start with a letter and contain only alphanumeric characters and underscores")]
+    InvalidEnvironmentKey { name: String, key: String },
+
+    #[error("configuration validation failed with {count} error(s):\n{details}")]
+    ValidationErrors { count: usize, details: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +114,29 @@ pub fn load_functions_config(
     parse_functions_config(&content, base_dir)
 }
 
+/// Known runtime prefixes that localfunctions supports.
+const KNOWN_RUNTIMES: &[&str] = &[
+    "python3.",
+    "nodejs",
+    "java",
+    "dotnet",
+    "ruby",
+    "provided",
+    "custom",
+];
+
+/// Check whether a runtime string matches one of the known runtime prefixes.
+fn is_known_runtime(runtime: &str) -> bool {
+    KNOWN_RUNTIMES
+        .iter()
+        .any(|prefix| runtime.starts_with(prefix))
+}
+
 /// Parse and validate functions configuration from a JSON string.
+///
+/// All functions are validated and errors are collected. If any validation
+/// errors are found, they are returned together in a single
+/// `ValidationErrors` variant so the developer can fix them all at once.
 #[allow(dead_code)]
 pub fn parse_functions_config(
     json: &str,
@@ -100,32 +145,107 @@ pub fn parse_functions_config(
     let raw: RawFunctionsFile = serde_json::from_str(json)?;
 
     let mut functions = HashMap::new();
+    let mut errors: Vec<FunctionConfigError> = Vec::new();
 
-    for (name, entry) in raw.functions {
-        validate_function_name(&name)?;
-        validate_timeout(&name, entry.timeout.unwrap_or(30))?;
-        validate_memory_size(&name, entry.memory_size.unwrap_or(128))?;
+    // Sort keys for deterministic error ordering
+    let mut names: Vec<String> = raw.functions.keys().cloned().collect();
+    names.sort();
 
-        let code_path = canonicalize_code_path(&name, &entry.code_path, base_dir)?;
+    for name in &names {
+        let entry = &raw.functions[name];
 
+        // Validate function name
+        if let Err(e) = validate_function_name(name) {
+            errors.push(e);
+            // Skip further validation for this function since the name is invalid
+            continue;
+        }
+
+        let timeout = entry.timeout.unwrap_or(30);
+        let memory_size = entry.memory_size.unwrap_or(128);
+
+        // Validate runtime
+        if !is_known_runtime(&entry.runtime) {
+            errors.push(FunctionConfigError::UnknownRuntime {
+                name: name.clone(),
+                value: entry.runtime.clone(),
+                expected: KNOWN_RUNTIMES.join(", "),
+            });
+        }
+
+        // Validate handler format
+        if let Err(e) = validate_handler(name, &entry.handler, &entry.runtime) {
+            errors.push(e);
+        }
+
+        // Validate timeout
+        if let Err(e) = validate_timeout(name, timeout) {
+            errors.push(e);
+        }
+
+        // Validate memory size
+        if let Err(e) = validate_memory_size(name, memory_size) {
+            errors.push(e);
+        }
+
+        // Validate code_path (traversal check)
+        let code_path = match canonicalize_code_path(name, &entry.code_path, base_dir) {
+            Ok(p) => {
+                // Validate code_path existence
+                if !p.exists() {
+                    errors.push(FunctionConfigError::CodePathNotFound {
+                        name: name.clone(),
+                        path: entry.code_path.clone(),
+                    });
+                }
+                p
+            }
+            Err(e) => {
+                errors.push(e);
+                // Use a placeholder so we can continue validation
+                base_dir.join(&entry.code_path)
+            }
+        };
+
+        // Validate custom runtime requires image
         if entry.runtime == "custom" && entry.image.is_none() {
-            return Err(FunctionConfigError::MissingImageForCustomRuntime {
+            errors.push(FunctionConfigError::MissingImageForCustomRuntime {
                 name: name.clone(),
             });
         }
 
+        // Validate environment variable keys
+        for key in entry.environment.keys() {
+            if let Err(e) = validate_env_key(name, key) {
+                errors.push(e);
+            }
+        }
+
+        // Only build the config if there are no errors for this function
+        // (we still continue to validate other functions)
         let config = FunctionConfig {
             name: name.clone(),
-            runtime: entry.runtime,
-            handler: entry.handler,
+            runtime: entry.runtime.clone(),
+            handler: entry.handler.clone(),
             code_path,
-            timeout: entry.timeout.unwrap_or(30),
-            memory_size: entry.memory_size.unwrap_or(128),
-            environment: entry.environment,
-            image: entry.image,
+            timeout,
+            memory_size,
+            environment: entry.environment.clone(),
+            image: entry.image.clone(),
         };
 
-        functions.insert(name, config);
+        functions.insert(name.clone(), config);
+    }
+
+    if !errors.is_empty() {
+        let count = errors.len();
+        let details = errors
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("  {}. {}", i + 1, e))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(FunctionConfigError::ValidationErrors { count, details });
     }
 
     Ok(FunctionsConfig {
@@ -230,6 +350,66 @@ impl FunctionManager {
 // Validation helpers
 // ---------------------------------------------------------------------------
 
+/// Validate handler format based on the runtime.
+///
+/// For non-custom runtimes, the handler must be in `module.function` format
+/// (i.e., contain at least one dot). For `custom` runtimes, any non-empty
+/// handler is accepted.
+fn validate_handler(
+    name: &str,
+    handler: &str,
+    runtime: &str,
+) -> Result<(), FunctionConfigError> {
+    if handler.is_empty() {
+        return Err(FunctionConfigError::InvalidHandler {
+            name: name.to_string(),
+            value: handler.to_string(),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    if runtime != "custom" && !handler.contains('.') {
+        return Err(FunctionConfigError::InvalidHandler {
+            name: name.to_string(),
+            value: handler.to_string(),
+            reason: format!(
+                "handler for runtime '{}' must be in 'module.function' format (e.g., 'main.handler')",
+                runtime
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate an environment variable key.
+///
+/// Keys must start with a letter and contain only alphanumeric characters and
+/// underscores (matching the POSIX convention for environment variable names).
+fn validate_env_key(name: &str, key: &str) -> Result<(), FunctionConfigError> {
+    if key.is_empty() {
+        return Err(FunctionConfigError::InvalidEnvironmentKey {
+            name: name.to_string(),
+            key: key.to_string(),
+        });
+    }
+    let first = key.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() {
+        return Err(FunctionConfigError::InvalidEnvironmentKey {
+            name: name.to_string(),
+            key: key.to_string(),
+        });
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(FunctionConfigError::InvalidEnvironmentKey {
+            name: name.to_string(),
+            key: key.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validate a function name: alphanumeric, hyphens, underscores only, max 64 chars.
 ///
 /// Returns `Ok(())` if valid, or an error describing the violation.
@@ -328,14 +508,40 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn base() -> PathBuf {
-        PathBuf::from("/project")
+    /// Create a temp directory with the given subdirectories for use as code paths.
+    fn setup_dirs(subdirs: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in subdirs {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        dir
+    }
+
+    /// Helper: assert an error is `ValidationErrors` and its message contains the given text.
+    fn assert_validation_error_contains(err: &FunctionConfigError, expected: &str) {
+        match err {
+            FunctionConfigError::ValidationErrors { details, .. } => {
+                assert!(
+                    details.contains(expected),
+                    "expected error details to contain {:?}, got:\n{}",
+                    expected,
+                    details
+                );
+            }
+            other => {
+                panic!(
+                    "expected ValidationErrors, got: {}",
+                    other
+                );
+            }
+        }
     }
 
     // -- Valid config --------------------------------------------------------
 
     #[test]
     fn parse_valid_full_config() {
+        let dir = setup_dirs(&["functions/my-python-func", "functions/my-node-func"]);
         let json = r#"{
             "functions": {
                 "my-python-func": {
@@ -361,7 +567,7 @@ mod tests {
             }
         }"#;
 
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         assert_eq!(config.functions.len(), 2);
         assert_eq!(config.runtime_images.len(), 2);
 
@@ -380,6 +586,7 @@ mod tests {
 
     #[test]
     fn parse_minimal_config() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
@@ -390,7 +597,7 @@ mod tests {
             }
         }"#;
 
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         let f = &config.functions["f1"];
         assert_eq!(f.timeout, 30);
         assert_eq!(f.memory_size, 128);
@@ -401,6 +608,7 @@ mod tests {
 
     #[test]
     fn parse_custom_runtime_with_image() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "custom-func": {
@@ -412,16 +620,17 @@ mod tests {
             }
         }"#;
 
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         let f = &config.functions["custom-func"];
         assert_eq!(f.runtime, "custom");
         assert_eq!(f.image, Some("my-custom:latest".to_string()));
     }
 
-    // -- Missing required fields ---------------------------------------------
+    // -- Missing required fields (serde-level errors, not wrapped) -----------
 
     #[test]
     fn error_missing_runtime() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
@@ -430,13 +639,14 @@ mod tests {
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert!(matches!(err, FunctionConfigError::ParseJson(_)));
         assert!(err.to_string().contains("runtime"));
     }
 
     #[test]
     fn error_missing_handler() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
@@ -445,13 +655,14 @@ mod tests {
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert!(matches!(err, FunctionConfigError::ParseJson(_)));
         assert!(err.to_string().contains("handler"));
     }
 
     #[test]
     fn error_missing_code_path() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
@@ -460,15 +671,16 @@ mod tests {
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert!(matches!(err, FunctionConfigError::ParseJson(_)));
         assert!(err.to_string().contains("code_path"));
     }
 
     #[test]
     fn error_missing_functions_key() {
+        let dir = setup_dirs(&[]);
         let json = r#"{ "runtime_images": {} }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert!(matches!(err, FunctionConfigError::ParseJson(_)));
     }
 
@@ -476,79 +688,73 @@ mod tests {
 
     #[test]
     fn error_function_name_with_spaces() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "bad name": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code"
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(
-            err,
-            FunctionConfigError::InvalidFunctionName { .. }
-        ));
-        assert!(err.to_string().contains("bad name"));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "bad name");
     }
 
     #[test]
     fn error_function_name_with_special_chars() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "func@#$": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code"
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(
-            err,
-            FunctionConfigError::InvalidFunctionName { .. }
-        ));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "func@#$");
     }
 
     #[test]
     fn error_function_name_too_long() {
+        let dir = setup_dirs(&["code"]);
         let long_name = "a".repeat(65);
         let json = format!(
-            "{{\n\"functions\": {{\n\"{}\": {{\n\"runtime\": \"python3.12\",\n\"handler\": \"h\",\n\"code_path\": \"./code\"\n}}\n}}\n}}",
+            "{{\n\"functions\": {{\n\"{}\": {{\n\"runtime\": \"python3.12\",\n\"handler\": \"m.h\",\n\"code_path\": \"./code\"\n}}\n}}\n}}",
             long_name
         );
-        let err = parse_functions_config(&json, &base()).unwrap_err();
-        assert!(matches!(
-            err,
-            FunctionConfigError::InvalidFunctionName { .. }
-        ));
-        assert!(err.to_string().contains("64"));
+        let err = parse_functions_config(&json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "64");
     }
 
     #[test]
     fn valid_function_name_64_chars() {
+        let dir = setup_dirs(&["code"]);
         let name = "a".repeat(64);
         let json = format!(
-            "{{\n\"functions\": {{\n\"{}\": {{\n\"runtime\": \"python3.12\",\n\"handler\": \"h\",\n\"code_path\": \"./code\"\n}}\n}}\n}}",
+            "{{\n\"functions\": {{\n\"{}\": {{\n\"runtime\": \"python3.12\",\n\"handler\": \"m.h\",\n\"code_path\": \"./code\"\n}}\n}}\n}}",
             name
         );
-        let config = parse_functions_config(&json, &base()).unwrap();
+        let config = parse_functions_config(&json, dir.path()).unwrap();
         assert!(config.functions.contains_key(&name));
     }
 
     #[test]
     fn valid_function_name_with_hyphens_and_underscores() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "my-func_v2": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code"
                 }
             }
         }"#;
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         assert!(config.functions.contains_key("my-func_v2"));
     }
 
@@ -556,113 +762,120 @@ mod tests {
 
     #[test]
     fn error_directory_traversal_dotdot() {
+        let dir = setup_dirs(&[]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "../../../etc/passwd"
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::DirectoryTraversal { .. }));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "directory traversal");
     }
 
     #[test]
     fn error_directory_traversal_embedded() {
+        let dir = setup_dirs(&[]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./functions/../../secret"
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::DirectoryTraversal { .. }));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "directory traversal");
     }
 
     #[test]
     fn valid_code_path_stays_within_base() {
+        let dir = setup_dirs(&["functions/code"]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./functions/../functions/code"
                 }
             }
         }"#;
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         let f = &config.functions["f1"];
-        assert!(f.code_path.starts_with("/project"));
+        assert!(f.code_path.starts_with(dir.path()));
     }
 
     // -- Timeout boundary values ---------------------------------------------
 
     #[test]
     fn error_timeout_zero() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code",
                     "timeout": 0
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::InvalidTimeout { .. }));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "invalid timeout");
     }
 
     #[test]
     fn error_timeout_901() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code",
                     "timeout": 901
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(err, FunctionConfigError::InvalidTimeout { .. }));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "invalid timeout");
     }
 
     #[test]
     fn valid_timeout_1() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code",
                     "timeout": 1
                 }
             }
         }"#;
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         assert_eq!(config.functions["f1"].timeout, 1);
     }
 
     #[test]
     fn valid_timeout_900() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code",
                     "timeout": 900
                 }
             }
         }"#;
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         assert_eq!(config.functions["f1"].timeout, 900);
     }
 
@@ -670,27 +883,26 @@ mod tests {
 
     #[test]
     fn error_memory_size_zero() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
                     "runtime": "python3.12",
-                    "handler": "h",
+                    "handler": "m.h",
                     "code_path": "./code",
                     "memory_size": 0
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(
-            err,
-            FunctionConfigError::InvalidMemorySize { .. }
-        ));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "invalid memory_size");
     }
 
     // -- Custom runtime requires image ---------------------------------------
 
     #[test]
     fn error_custom_runtime_without_image() {
+        let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
                 "f1": {
@@ -700,19 +912,214 @@ mod tests {
                 }
             }
         }"#;
-        let err = parse_functions_config(json, &base()).unwrap_err();
-        assert!(matches!(
-            err,
-            FunctionConfigError::MissingImageForCustomRuntime { .. }
-        ));
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "requires an 'image' field");
+    }
+
+    // -- Unknown runtime -----------------------------------------------------
+
+    #[test]
+    fn error_unknown_runtime() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "cobol42",
+                    "handler": "m.h",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "unknown runtime");
+        assert_validation_error_contains(&err, "cobol42");
+    }
+
+    // -- Handler format validation -------------------------------------------
+
+    #[test]
+    fn error_handler_missing_dot_for_python() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "module.function");
+    }
+
+    #[test]
+    fn valid_handler_custom_runtime_no_dot() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "custom",
+                    "handler": "bootstrap",
+                    "code_path": "./code",
+                    "image": "my-image:latest"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].handler, "bootstrap");
+    }
+
+    // -- Code path existence -------------------------------------------------
+
+    #[test]
+    fn error_code_path_not_found() {
+        let dir = setup_dirs(&[]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./nonexistent"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "does not exist");
+    }
+
+    // -- Environment variable key validation ---------------------------------
+
+    #[test]
+    fn error_env_key_starts_with_number() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "environment": {
+                        "1BAD_KEY": "value"
+                    }
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "1BAD_KEY");
+    }
+
+    #[test]
+    fn error_env_key_with_hyphen() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "environment": {
+                        "BAD-KEY": "value"
+                    }
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "BAD-KEY");
+    }
+
+    #[test]
+    fn valid_env_keys() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "environment": {
+                        "TABLE_NAME": "t",
+                        "AWS_REGION": "us-east-1",
+                        "Foo123": "bar"
+                    }
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].environment.len(), 3);
+    }
+
+    // -- Multiple errors collected -------------------------------------------
+
+    #[test]
+    fn multiple_errors_collected() {
+        let dir = setup_dirs(&[]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./nonexistent",
+                    "timeout": 0,
+                    "memory_size": 0
+                },
+                "f2": {
+                    "runtime": "cobol42",
+                    "handler": "nope",
+                    "code_path": "./also-missing"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        match &err {
+            FunctionConfigError::ValidationErrors { count, details } => {
+                // f1: code_path not found + timeout + memory_size = 3
+                // f2: unknown runtime + handler no dot + code_path not found = 3
+                // Total >= 6
+                assert!(
+                    *count >= 6,
+                    "expected at least 6 errors, got {}: {}",
+                    count,
+                    details
+                );
+            }
+            other => panic!("expected ValidationErrors, got: {}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_functions_all_errors_reported() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "timeout": 0
+                },
+                "f2": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "timeout": 999
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        // Both functions' errors should be present
+        assert!(msg.contains("f1"), "should mention f1 in: {}", msg);
+        assert!(msg.contains("f2"), "should mention f2 in: {}", msg);
     }
 
     // -- Malformed JSON ------------------------------------------------------
 
     #[test]
     fn error_malformed_json() {
+        let dir = setup_dirs(&[]);
         let json = "{ not valid json }";
-        let err = parse_functions_config(json, &base()).unwrap_err();
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
         assert!(matches!(err, FunctionConfigError::ParseJson(_)));
     }
 
@@ -720,7 +1127,8 @@ mod tests {
 
     #[test]
     fn error_missing_file() {
-        let err = load_functions_config(Path::new("/nonexistent/functions.json"), &base()).unwrap_err();
+        let dir = setup_dirs(&[]);
+        let err = load_functions_config(Path::new("/nonexistent/functions.json"), dir.path()).unwrap_err();
         assert!(matches!(err, FunctionConfigError::ReadFile { .. }));
     }
 
@@ -755,6 +1163,7 @@ mod tests {
     // -- FunctionManager -----------------------------------------------------
 
     fn test_functions_config() -> FunctionsConfig {
+        let dir = setup_dirs(&["functions/py", "functions/node"]);
         let json = r#"{
             "functions": {
                 "my-python-func": {
@@ -774,7 +1183,10 @@ mod tests {
                 "python3.12": "public.ecr.aws/lambda/python:3.12"
             }
         }"#;
-        parse_functions_config(json, &base()).unwrap()
+        // Note: dir is kept alive because the temp dir stays in scope
+        // within the calling test function's stack. We use dir.path() here
+        // but the paths resolve to real temp dirs.
+        parse_functions_config(json, dir.path()).unwrap()
     }
 
     #[test]
@@ -869,6 +1281,7 @@ mod tests {
 
     #[test]
     fn runtime_images_parsed() {
+        let dir = setup_dirs(&[]);
         let json = r#"{
             "functions": {},
             "runtime_images": {
@@ -877,11 +1290,44 @@ mod tests {
             }
         }"#;
 
-        let config = parse_functions_config(json, &base()).unwrap();
+        let config = parse_functions_config(json, dir.path()).unwrap();
         assert_eq!(config.runtime_images.len(), 2);
         assert_eq!(
             config.runtime_images["python3.12"],
             "public.ecr.aws/lambda/python:3.12"
         );
+    }
+
+    // -- Known runtimes accepted ---------------------------------------------
+
+    #[test]
+    fn all_known_runtimes_accepted() {
+        let dir = setup_dirs(&["code"]);
+        let runtimes = vec![
+            "python3.12", "nodejs20.x", "java21", "dotnet8",
+            "ruby3.3", "provided.al2023", "custom",
+        ];
+        for rt in runtimes {
+            let handler = if rt == "custom" { "bootstrap" } else { "m.h" };
+            let image = if rt == "custom" {
+                r#", "image": "img:latest""#
+            } else {
+                ""
+            };
+            let json = format!(
+                r#"{{
+                    "functions": {{
+                        "f1": {{
+                            "runtime": "{}",
+                            "handler": "{}",
+                            "code_path": "./code"{}
+                        }}
+                    }}
+                }}"#,
+                rt, handler, image
+            );
+            let result = parse_functions_config(&json, dir.path());
+            assert!(result.is_ok(), "runtime '{}' should be accepted, got: {:?}", rt, result.err());
+        }
     }
 }
