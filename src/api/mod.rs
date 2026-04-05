@@ -476,6 +476,11 @@ async fn invoke_function_inner(
         "invoking function"
     );
 
+    // Start streaming container stdout/stderr in the background.
+    let log_handle = state
+        .container_manager
+        .stream_container_logs(&container_id, &function_name, request_id);
+
     // Submit the invocation to the runtime bridge.
     let response_rx = match state
         .runtime_bridge
@@ -485,6 +490,7 @@ async fn invoke_function_inner(
         Ok(rx) => rx,
         Err(e) => {
             // If submit fails (e.g. channel closed), release the container.
+            log_handle.abort();
             state.container_manager.release_container(&container_id).await;
             let err = ServiceError::ServiceException(e.to_string());
             return (
@@ -498,7 +504,7 @@ async fn invoke_function_inner(
     // Wait for the response with the configured timeout.
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), response_rx).await;
 
-    match result {
+    let response = match result {
         Ok(Ok(invocation_result)) => match invocation_result {
             crate::types::InvocationResult::Success { body } => {
                 // AWS enforces a 6,291,556 byte limit on synchronous invocation responses.
@@ -520,14 +526,15 @@ async fn invoke_function_inner(
                             SYNC_RESPONSE_MAX_BYTES
                         ),
                     });
-                    return (
+                    (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         resp_headers,
                         serde_json::to_vec(&error_body).unwrap(),
-                    );
+                    )
+                } else {
+                    info!("invocation succeeded");
+                    (StatusCode::OK, invoke_base_headers(request_id), body_bytes)
                 }
-                info!("invocation succeeded");
-                (StatusCode::OK, invoke_base_headers(request_id), body_bytes)
             }
             crate::types::InvocationResult::Error {
                 error_type,
@@ -607,7 +614,12 @@ async fn invoke_function_inner(
             });
             (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
         }
-    }
+    };
+
+    // Stop streaming container logs now that the invocation is complete.
+    log_handle.abort();
+
+    response
 }
 
 /// Execute an invocation in the background for Event-type invocations.

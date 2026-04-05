@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogOutput,
+    LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
     WaitContainerOptions,
 };
 use bollard::image::CreateImageOptions;
@@ -16,6 +16,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
+
+use uuid::Uuid;
 
 use crate::runtime::RuntimeBridge;
 use crate::types::{ContainerState, FunctionConfig, ServiceError};
@@ -1021,6 +1023,73 @@ impl ContainerManager {
             }
         }
         output
+    }
+
+    /// Stream stdout and stderr from a container in real-time.
+    ///
+    /// Spawns a background task that follows the container's log output and
+    /// emits each line via `tracing::info!`, prefixed with the function name
+    /// and request ID. The returned `JoinHandle` can be aborted to stop
+    /// streaming (e.g. when the invocation completes).
+    ///
+    /// Log lines are emitted at INFO level so they respect the configured log
+    /// verbosity. Stderr lines are tagged with `stream="stderr"` and stdout
+    /// with `stream="stdout"`.
+    pub fn stream_container_logs(
+        &self,
+        container_id: &str,
+        function_name: &str,
+        request_id: Uuid,
+    ) -> tokio::task::JoinHandle<()> {
+        let opts = LogsOptions::<String> {
+            follow: true,
+            stdout: true,
+            stderr: true,
+            since: 0,
+            timestamps: false,
+            ..Default::default()
+        };
+
+        let mut stream = self.docker.logs(container_id, Some(opts));
+        let function_name = function_name.to_string();
+
+        tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(log) => {
+                        let (stream_name, line) = match log {
+                            LogOutput::StdOut { message } => {
+                                ("stdout", String::from_utf8_lossy(&message).into_owned())
+                            }
+                            LogOutput::StdErr { message } => {
+                                ("stderr", String::from_utf8_lossy(&message).into_owned())
+                            }
+                            _ => continue,
+                        };
+                        // Trim trailing newline to avoid double-spacing in log output.
+                        let line = line.trim_end_matches('\n');
+                        if !line.is_empty() {
+                            info!(
+                                function = %function_name,
+                                request_id = %request_id,
+                                stream = stream_name,
+                                "{}",
+                                line
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            function = %function_name,
+                            request_id = %request_id,
+                            error = %e,
+                            "container log stream ended"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
     }
 
     /// Inspect a container and return its exit code, if available.
@@ -2955,6 +3024,66 @@ mod integration_tests {
             .stop_and_remove("nonexistent-container-id", Duration::from_secs(1))
             .await;
         assert!(result.is_ok());
+    }
+
+    // -- stream_container_logs ----------------------------------------------
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn stream_container_logs_nonexistent_container_completes_gracefully() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mgr = ContainerManager::new(
+            docker,
+            HashMap::new(),
+            "test".into(),
+            9601,
+            "us-east-1".into(),
+            registry,
+            20,
+            CredentialForwardingConfig::default(),
+        );
+
+        // Streaming from a nonexistent container should complete quickly without panicking.
+        let handle = mgr.stream_container_logs(
+            "nonexistent-container-id",
+            "test-func",
+            Uuid::new_v4(),
+        );
+
+        // The task should finish on its own (stream error → break).
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle,
+        )
+        .await;
+        assert!(result.is_ok(), "stream task should complete when container doesn't exist");
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker daemon
+    async fn stream_container_logs_can_be_aborted() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mgr = ContainerManager::new(
+            docker,
+            HashMap::new(),
+            "test".into(),
+            9601,
+            "us-east-1".into(),
+            registry,
+            20,
+            CredentialForwardingConfig::default(),
+        );
+
+        let handle = mgr.stream_container_logs(
+            "nonexistent-container-id",
+            "test-func",
+            Uuid::new_v4(),
+        );
+
+        // Aborting should not panic.
+        handle.abort();
     }
 
     // -- cpu_constraints ---------------------------------------------------
