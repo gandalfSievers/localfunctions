@@ -31,7 +31,7 @@ pub struct FunctionConfig {
 
 #[allow(dead_code)]
 fn default_timeout() -> u64 {
-    3
+    30
 }
 
 #[allow(dead_code)]
@@ -212,7 +212,7 @@ mod tests {
         }"#;
 
         let config: FunctionConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.timeout, 3);
+        assert_eq!(config.timeout, 30);
         assert_eq!(config.memory_size, 128);
         assert!(config.environment.is_empty());
         assert!(config.image.is_none());
