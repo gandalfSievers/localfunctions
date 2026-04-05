@@ -6,13 +6,15 @@ mod runtime;
 mod server;
 mod types;
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use bollard::Docker;
-use tracing::{error, info};
+use futures_util::TryStreamExt;
+use tracing::{error, info, warn};
 
 use container::{ContainerRegistry, DockerNetwork};
 use runtime::RuntimeBridge;
@@ -79,6 +81,10 @@ async fn main() -> Result<()> {
 
     info!(count = functions_config.functions.len(), "functions loaded");
 
+    // Verify that all required Docker images are available locally.
+    // If pull_images is enabled, missing images are pulled automatically.
+    verify_runtime_images(&docker, &functions_config, config.pull_images).await?;
+
     // Create per-function invocation channels for the runtime bridge.
     let mut invocation_receivers = std::collections::HashMap::new();
     let mut invocation_senders = std::collections::HashMap::new();
@@ -128,6 +134,115 @@ async fn main() -> Result<()> {
     }
 
     info!("shutdown complete");
+
+    Ok(())
+}
+
+/// Collect all unique Docker images required by the configured functions and
+/// verify that each one is available locally. When `pull_images` is true,
+/// missing images are pulled automatically; otherwise the server fails to start
+/// with a clear error naming the missing images.
+async fn verify_runtime_images(
+    docker: &Docker,
+    functions_config: &function::FunctionsConfig,
+    pull_images: bool,
+) -> Result<()> {
+    // Collect unique images: per-function custom images and runtime_images values.
+    let mut images: HashSet<String> = HashSet::new();
+    let mut image_to_functions: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for (name, func) in &functions_config.functions {
+        let image = if let Some(ref img) = func.image {
+            img.clone()
+        } else if let Some(img) = functions_config.runtime_images.get(&func.runtime) {
+            img.clone()
+        } else {
+            // This is already validated by load_functions_config, skip.
+            continue;
+        };
+        images.insert(image.clone());
+        image_to_functions
+            .entry(image)
+            .or_default()
+            .push(name.clone());
+    }
+
+    if images.is_empty() {
+        return Ok(());
+    }
+
+    let mut missing: Vec<(String, Vec<String>)> = Vec::new();
+
+    for image in &images {
+        match docker.inspect_image(image).await {
+            Ok(_) => {
+                info!(image = %image, "runtime image available");
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                if pull_images {
+                    info!(image = %image, "pulling missing runtime image");
+                    let opts = bollard::image::CreateImageOptions {
+                        from_image: image.as_str(),
+                        ..Default::default()
+                    };
+                    match docker
+                        .create_image(Some(opts), None, None)
+                        .try_collect::<Vec<_>>()
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(image = %image, "runtime image pulled successfully");
+                        }
+                        Err(e) => {
+                            let funcs = image_to_functions
+                                .get(image)
+                                .map(|v| v.join(", "))
+                                .unwrap_or_default();
+                            error!(
+                                image = %image,
+                                functions = %funcs,
+                                error = %e,
+                                "failed to pull runtime image"
+                            );
+                            missing.push((image.clone(), image_to_functions.get(image).cloned().unwrap_or_default()));
+                        }
+                    }
+                } else {
+                    let funcs = image_to_functions
+                        .get(image)
+                        .map(|v| v.join(", "))
+                        .unwrap_or_default();
+                    error!(
+                        image = %image,
+                        functions = %funcs,
+                        "runtime image not found locally (set LOCAL_LAMBDA_PULL_IMAGES=true to pull automatically)"
+                    );
+                    missing.push((image.clone(), image_to_functions.get(image).cloned().unwrap_or_default()));
+                }
+            }
+            Err(e) => {
+                warn!(image = %image, error = %e, "failed to inspect runtime image");
+                missing.push((image.clone(), image_to_functions.get(image).cloned().unwrap_or_default()));
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        let details: Vec<String> = missing
+            .iter()
+            .map(|(img, funcs)| format!("  - {} (used by: {})", img, funcs.join(", ")))
+            .collect();
+        let msg = format!(
+            "missing {} runtime image(s):\n{}",
+            missing.len(),
+            details.join("\n")
+        );
+        error!("{}", msg);
+        return Err(anyhow::anyhow!("{}", msg));
+    }
 
     Ok(())
 }

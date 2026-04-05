@@ -20,6 +20,8 @@ pub struct Config {
     pub max_body_size: usize,
     /// Log output format: "json" for structured JSON, "text" for human-readable.
     pub log_format: LogFormat,
+    /// Whether to automatically pull missing Docker images on startup.
+    pub pull_images: bool,
 }
 
 /// Controls the format of log output.
@@ -66,6 +68,11 @@ impl Config {
         let max_containers = parse_env("LOCAL_LAMBDA_MAX_CONTAINERS", "20")?;
         let docker_network = parse_env::<String>("LOCAL_LAMBDA_DOCKER_NETWORK", "localfunctions")?;
         let max_body_size = parse_env("LOCAL_LAMBDA_MAX_BODY_SIZE", "6291456")?; // 6 MB
+        let pull_images = parse_env_with_alias::<bool>(
+            "LOCAL_LAMBDA_PULL_IMAGES",
+            "LOCALFUNCTIONS_PULL_IMAGES",
+            "false",
+        )?;
 
         Ok(Config {
             host,
@@ -81,6 +88,7 @@ impl Config {
             docker_network,
             max_body_size,
             log_format,
+            pull_images,
         })
     }
 }
@@ -140,6 +148,8 @@ mod tests {
             "LOCAL_LAMBDA_MAX_CONTAINERS",
             "LOCAL_LAMBDA_DOCKER_NETWORK",
             "LOCAL_LAMBDA_MAX_BODY_SIZE",
+            "LOCAL_LAMBDA_PULL_IMAGES",
+            "LOCALFUNCTIONS_PULL_IMAGES",
         ] {
             std::env::remove_var(key);
         }
@@ -158,6 +168,7 @@ mod tests {
         assert_eq!(config.docker_network, "localfunctions");
         assert_eq!(config.max_body_size, 6 * 1024 * 1024);
         assert_eq!(config.log_format, LogFormat::Json);
+        assert!(!config.pull_images);
     }
 
     #[test]
@@ -298,5 +309,54 @@ mod tests {
     fn test_log_format_display() {
         assert_eq!(LogFormat::Json.to_string(), "json");
         assert_eq!(LogFormat::Text.to_string(), "text");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pull_images_default_false() {
+        std::env::remove_var("LOCAL_LAMBDA_PULL_IMAGES");
+        std::env::remove_var("LOCALFUNCTIONS_PULL_IMAGES");
+        let config = Config::from_env().unwrap();
+        assert!(!config.pull_images);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pull_images_enabled_via_primary() {
+        std::env::set_var("LOCAL_LAMBDA_PULL_IMAGES", "true");
+        std::env::remove_var("LOCALFUNCTIONS_PULL_IMAGES");
+        let config = Config::from_env().unwrap();
+        assert!(config.pull_images);
+        std::env::remove_var("LOCAL_LAMBDA_PULL_IMAGES");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pull_images_enabled_via_alias() {
+        std::env::remove_var("LOCAL_LAMBDA_PULL_IMAGES");
+        std::env::set_var("LOCALFUNCTIONS_PULL_IMAGES", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.pull_images);
+        std::env::remove_var("LOCALFUNCTIONS_PULL_IMAGES");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pull_images_primary_overrides_alias() {
+        std::env::set_var("LOCAL_LAMBDA_PULL_IMAGES", "false");
+        std::env::set_var("LOCALFUNCTIONS_PULL_IMAGES", "true");
+        let config = Config::from_env().unwrap();
+        assert!(!config.pull_images);
+        std::env::remove_var("LOCAL_LAMBDA_PULL_IMAGES");
+        std::env::remove_var("LOCALFUNCTIONS_PULL_IMAGES");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pull_images_invalid_value() {
+        std::env::set_var("LOCAL_LAMBDA_PULL_IMAGES", "yes");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_PULL_IMAGES");
     }
 }
