@@ -1118,13 +1118,12 @@ async fn invoke_function_streaming_inner(
 
     // Spawn a task to read chunks and forward as event stream frames.
     tokio::spawn(async move {
-        let timeout_duration = Duration::from_secs(timeout_secs);
         let mut had_error = false;
         let mut error_code = String::new();
         let mut error_details = String::new();
 
         loop {
-            match tokio::time::timeout(timeout_duration, stream_rx.recv()).await {
+            match tokio::time::timeout_at(deadline, stream_rx.recv()).await {
                 Ok(Some(chunk)) => match chunk {
                     crate::types::StreamChunk::Data(data) => {
                         let frame = eventstream::encode_payload_chunk(&data);
@@ -1406,10 +1405,10 @@ async fn next_invocation(
                         stx,
                     )
                     .await;
-            } else {
+            } else if let Some(tx) = response_tx {
                 state
                     .runtime_bridge
-                    .store_pending(request_id, function_name.clone(), dispatched_container_id, response_tx)
+                    .store_pending(request_id, function_name.clone(), dispatched_container_id, tx)
                     .await;
             }
 
@@ -2264,7 +2263,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
             client_context: None,
-            response_tx: resp_tx,
+            response_tx: Some(resp_tx),
             stream_tx: None,
         };
         tx.send(inv).await.unwrap();
@@ -2337,7 +2336,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: Some(trace_id.to_string()),
             client_context: None,
-            response_tx: resp_tx,
+            response_tx: Some(resp_tx),
             stream_tx: None,
         };
         tx.send(inv).await.unwrap();
@@ -2458,7 +2457,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
             client_context: None,
-            response_tx: resp_tx,
+            response_tx: Some(resp_tx),
             stream_tx: None,
         };
         tx.send(inv).await.unwrap();
@@ -2539,7 +2538,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
             client_context: None,
-            response_tx: resp_tx,
+            response_tx: Some(resp_tx),
             stream_tx: None,
         };
         tx.send(inv).await.unwrap();
@@ -2610,7 +2609,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
             client_context: None,
-            response_tx: resp_tx,
+            response_tx: Some(resp_tx),
             stream_tx: None,
         };
         tx.send(inv).await.unwrap();
@@ -2727,7 +2726,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
             client_context: None,
-            response_tx: resp_tx,
+            response_tx: Some(resp_tx),
             stream_tx: None,
         };
         tx.send(inv).await.unwrap();
@@ -2940,7 +2939,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             bridge
                 .complete_invocation(inv.request_id, r#"{"result":"ok"}"#.into())
@@ -2982,7 +2981,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             bridge
                 .fail_invocation(
@@ -3138,7 +3137,7 @@ mod tests {
         tokio::spawn(async move {
             if let Some(inv) = runtime_bridge.next_invocation("my-func").await {
                 runtime_bridge
-                    .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                    .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                     .await;
                 let _ = runtime_bridge
                     .complete_invocation(inv.request_id, "ok".into())
@@ -3221,7 +3220,7 @@ mod tests {
         tokio::spawn(async move {
             if let Some(inv) = runtime_bridge.next_invocation("my-func").await {
                 runtime_bridge
-                    .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                    .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                     .await;
                 let _ = runtime_bridge
                     .complete_invocation(inv.request_id, "ok".into())
@@ -3257,7 +3256,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             bridge
                 .complete_invocation(inv.request_id, "ok".into())
@@ -3292,7 +3291,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             bridge
                 .complete_invocation(inv.request_id, "ok".into())
@@ -3323,7 +3322,7 @@ mod tests {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             let ctx = inv.client_context.clone();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             bridge
                 .complete_invocation(inv.request_id, "done".into())
@@ -3427,7 +3426,7 @@ mod tests {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             let ctx = inv.client_context.clone();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             bridge
                 .complete_invocation(inv.request_id, "ok".into())
@@ -3467,7 +3466,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             let oversized_body = "x".repeat(6_291_557);
             bridge
@@ -3523,7 +3522,7 @@ mod tests {
         tokio::spawn(async move {
             let inv = bridge.next_invocation("my-func").await.unwrap();
             bridge
-                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx.unwrap())
                 .await;
             let body = "x".repeat(6_291_556);
             bridge.complete_invocation(inv.request_id, body).await;
@@ -3559,7 +3558,7 @@ mod tests {
                     inv.request_id,
                     "my-func".into(),
                     Some("test-container-id".into()),
-                    inv.response_tx,
+                    inv.response_tx.unwrap(),
                 )
                 .await;
             // Intentionally never respond — simulates a function that hangs.
@@ -3615,7 +3614,7 @@ mod tests {
                     request_id,
                     "my-func".into(),
                     Some("ctr-timeout-test".into()),
-                    inv.response_tx,
+                    inv.response_tx.unwrap(),
                 )
                 .await;
 

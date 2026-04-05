@@ -176,7 +176,7 @@ impl RuntimeBridge {
             deadline,
             trace_id,
             client_context,
-            response_tx,
+            response_tx: Some(response_tx),
             stream_tx: None,
         };
 
@@ -209,9 +209,6 @@ impl RuntimeBridge {
             .get(function_name)
             .ok_or_else(|| ServiceError::ResourceNotFound(function_name.to_string()))?;
 
-        // Dummy oneshot — for streaming, the mpsc channel is used instead.
-        let (response_tx, _response_rx) = oneshot::channel();
-
         let (stream_tx, stream_rx) = mpsc::channel(64);
 
         let invocation = Invocation {
@@ -221,7 +218,7 @@ impl RuntimeBridge {
             deadline,
             trace_id,
             client_context,
-            response_tx,
+            response_tx: None,
             stream_tx: Some(stream_tx),
         };
 
@@ -289,22 +286,20 @@ impl RuntimeBridge {
         &self,
         request_id: Uuid,
     ) -> Option<(mpsc::Sender<StreamChunk>, Option<String>)> {
-        let pending = self.pending_invocations.lock().await.remove(&request_id);
-        match pending {
+        let mut pending = self.pending_invocations.lock().await;
+        match pending.get(&request_id) {
             Some(PendingInvocation {
-                response_channel: ResponseChannel::Streaming(tx),
-                container_id,
+                response_channel: ResponseChannel::Streaming(_),
                 ..
-            }) => Some((tx, container_id)),
-            Some(p) => {
-                // Put it back — it wasn't streaming.
-                let request_id_copy = request_id;
-                self.pending_invocations
-                    .lock()
-                    .await
-                    .insert(request_id_copy, p);
-                None
+            }) => {
+                // Confirmed streaming — remove and extract.
+                let p = pending.remove(&request_id).unwrap();
+                match p.response_channel {
+                    ResponseChannel::Streaming(tx) => Some((tx, p.container_id)),
+                    _ => unreachable!(),
+                }
             }
+            Some(_) => None, // Oneshot invocation — leave it in place.
             None => None,
         }
     }
@@ -469,7 +464,14 @@ impl RuntimeBridge {
         if let Some(queue) = self.queues.get(function_name) {
             let mut rx = queue.lock().await;
             while let Ok(inv) = rx.try_recv() {
-                let _ = inv.response_tx.send(init_error.clone());
+                if let Some(tx) = inv.response_tx {
+                    let _ = tx.send(init_error.clone());
+                } else if let Some(stream_tx) = inv.stream_tx {
+                    let _ = stream_tx.send(StreamChunk::Error {
+                        error_type: "InvalidRuntimeException".into(),
+                        error_message: "Runtime failed to initialize".into(),
+                    }).await;
+                }
                 count += 1;
             }
         }
@@ -521,7 +523,7 @@ mod tests {
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
             client_context: None,
-            response_tx: tx,
+            response_tx: Some(tx),
             stream_tx: None,
         };
         (inv, rx)

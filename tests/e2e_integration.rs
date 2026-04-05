@@ -540,6 +540,203 @@ async fn e2e_shutdown_rejects_new_invocations() {
     runtime_handle.abort();
 }
 
+/// Spawn a simulated container runtime that picks up /next and sends a
+/// multi-chunk streaming response, simulating a Lambda function using
+/// response streaming.
+fn spawn_streaming_runtime(
+    runtime_addr: std::net::SocketAddr,
+    function_name: &str,
+    container_id: &str,
+    chunks: Vec<Vec<u8>>,
+) -> tokio::task::JoinHandle<()> {
+    let function_name = function_name.to_string();
+    let container_id = container_id.to_string();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+
+        let next_resp = client
+            .get(format!(
+                "http://{}/2018-06-01/runtime/invocation/next",
+                runtime_addr
+            ))
+            .header("Lambda-Runtime-Function-Name", &function_name)
+            .header("Lambda-Runtime-Container-Id", &container_id)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(next_resp.status(), 200);
+
+        let request_id = next_resp
+            .headers()
+            .get("Lambda-Runtime-Aws-Request-Id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Send the streaming response as a single body composed of all chunks.
+        // The runtime-side handler streams the body and forwards each HTTP chunk
+        // through the mpsc channel.
+        let body_bytes: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        let resp = client
+            .post(format!(
+                "http://{}/2018-06-01/runtime/invocation/{}/response",
+                runtime_addr, request_id
+            ))
+            .body(body_bytes)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 202);
+    })
+}
+
+/// Parse event stream frames from raw bytes, returning the headers and
+/// payload of each message.
+fn parse_event_stream_frames(data: &[u8]) -> Vec<(Vec<(String, String)>, Vec<u8>)> {
+    let mut frames = Vec::new();
+    let mut offset = 0;
+
+    while offset + 12 <= data.len() {
+        let total_len =
+            u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let headers_len =
+            u32::from_be_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+
+        if offset + total_len > data.len() {
+            break;
+        }
+
+        // Parse headers (after 12-byte prelude)
+        let headers_start = offset + 12;
+        let headers_end = headers_start + headers_len;
+        let mut headers = Vec::new();
+        let mut h = headers_start;
+        while h < headers_end {
+            let name_len = data[h] as usize;
+            h += 1;
+            let name = String::from_utf8_lossy(&data[h..h + name_len]).into_owned();
+            h += name_len;
+            let _value_type = data[h];
+            h += 1;
+            let value_len =
+                u16::from_be_bytes(data[h..h + 2].try_into().unwrap()) as usize;
+            h += 2;
+            let value = String::from_utf8_lossy(&data[h..h + value_len]).into_owned();
+            h += value_len;
+            headers.push((name, value));
+        }
+
+        // Payload is between headers end and message CRC (last 4 bytes)
+        let payload_end = offset + total_len - 4;
+        let payload = data[headers_end..payload_end].to_vec();
+
+        frames.push((headers, payload));
+        offset += total_len;
+    }
+
+    frames
+}
+
+/// End-to-end streaming invocation: submit a streaming invoke, the simulated
+/// runtime sends a multi-chunk response, and the caller receives event stream
+/// frames with correct encoding.
+#[tokio::test]
+#[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
+async fn e2e_streaming_invocation_receives_event_stream_frames() {
+    let (state, _shutdown_tx) =
+        build_e2e_state(vec![("stream-func", "python3.12", "main.handler", 30)]).await;
+
+    let (invoke_addr, runtime_addr, invoke_handle, runtime_handle) =
+        start_servers(state).await;
+
+    let chunk1 = b"Hello, ".to_vec();
+    let chunk2 = b"streaming ".to_vec();
+    let chunk3 = b"world!".to_vec();
+
+    let runtime_task = spawn_streaming_runtime(
+        runtime_addr,
+        "stream-func",
+        "e2e-container-stream-func",
+        vec![chunk1.clone(), chunk2.clone(), chunk3.clone()],
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://{}/2021-11-15/functions/stream-func/response-streaming-invocations",
+            invoke_addr
+        ))
+        .body(r#"{"stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // The response should use chunked transfer encoding with event stream frames.
+    let body_bytes = resp.bytes().await.unwrap();
+
+    // Parse event stream frames from the binary response.
+    let frames = parse_event_stream_frames(&body_bytes);
+
+    // We should have at least one PayloadChunk and one InvokeComplete frame.
+    assert!(
+        frames.len() >= 2,
+        "expected at least 2 frames (payload + complete), got {}",
+        frames.len()
+    );
+
+    // Collect payload data from PayloadChunk frames.
+    let mut payload_data = Vec::new();
+    let mut has_invoke_complete = false;
+
+    for (headers, payload) in &frames {
+        let event_type = headers
+            .iter()
+            .find(|(k, _)| k == ":event-type")
+            .map(|(_, v)| v.as_str());
+        let message_type = headers
+            .iter()
+            .find(|(k, _)| k == ":message-type")
+            .map(|(_, v)| v.as_str());
+
+        match event_type {
+            Some("PayloadChunk") => {
+                assert_eq!(message_type, Some("event"));
+                payload_data.extend_from_slice(payload);
+            }
+            Some("InvokeComplete") => {
+                assert_eq!(message_type, Some("event"));
+                has_invoke_complete = true;
+            }
+            _ => {}
+        }
+    }
+
+    // The concatenated payload should match the original chunks.
+    let expected: Vec<u8> = [chunk1, chunk2, chunk3].concat();
+    assert_eq!(
+        payload_data, expected,
+        "streamed payload should match sent chunks"
+    );
+    assert!(
+        has_invoke_complete,
+        "should have an InvokeComplete frame"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), runtime_task)
+        .await
+        .expect("runtime should complete")
+        .expect("runtime should not panic");
+
+    invoke_handle.abort();
+    runtime_handle.abort();
+}
+
 /// Verify that invoking a non-existent function returns 404.
 #[tokio::test]
 #[ignore] // Requires Docker daemon — run with `cargo test -- --ignored`
