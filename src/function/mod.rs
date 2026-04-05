@@ -80,6 +80,9 @@ pub enum FunctionConfigError {
     #[error("function '{name}': layer path '{path}' is invalid — directory traversal is not allowed")]
     LayerDirectoryTraversal { name: String, path: String },
 
+    #[error("function '{name}': invalid max_retry_attempts {value} — must be between 0 and 2")]
+    InvalidMaxRetryAttempts { name: String, value: u32 },
+
     #[error("function '{name}': layer path '{path}' does not exist or is not a directory")]
     LayerPathNotFound { name: String, path: String },
 
@@ -116,6 +119,7 @@ struct RawFunctionEntry {
     layers: Vec<String>,
     #[serde(default)]
     function_url_enabled: bool,
+    max_retry_attempts: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +338,15 @@ pub fn parse_functions_config(
             }
         }
 
+        // Validate max_retry_attempts
+        let max_retry_attempts = entry.max_retry_attempts.unwrap_or(2);
+        if max_retry_attempts > 2 {
+            errors.push(FunctionConfigError::InvalidMaxRetryAttempts {
+                name: name.clone(),
+                value: max_retry_attempts,
+            });
+        }
+
         // Only build the config if there are no errors for this function
         // (we still continue to validate other functions)
         let config = FunctionConfig {
@@ -351,6 +364,7 @@ pub fn parse_functions_config(
             architecture,
             layers,
             function_url_enabled: entry.function_url_enabled,
+            max_retry_attempts,
         };
 
         functions.insert(name.clone(), config);
@@ -2143,5 +2157,79 @@ mod tests {
         let config = parse_functions_config(json, dir.path()).unwrap();
         let f = &config.functions["f1"];
         assert!(f.layers.is_empty());
+    }
+
+    #[test]
+    fn parse_config_max_retry_attempts_defaults_to_2() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].max_retry_attempts, 2);
+    }
+
+    #[test]
+    fn parse_config_max_retry_attempts_zero() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "max_retry_attempts": 0
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].max_retry_attempts, 0);
+    }
+
+    #[test]
+    fn parse_config_max_retry_attempts_valid_values() {
+        let dir = setup_dirs(&["code"]);
+        for value in [0, 1, 2] {
+            let json = format!(
+                r#"{{
+                    "functions": {{
+                        "f1": {{
+                            "runtime": "python3.12",
+                            "handler": "main.handler",
+                            "code_path": "./code",
+                            "max_retry_attempts": {}
+                        }}
+                    }}
+                }}"#,
+                value
+            );
+            let config = parse_functions_config(&json, dir.path()).unwrap();
+            assert_eq!(config.functions["f1"].max_retry_attempts, value);
+        }
+    }
+
+    #[test]
+    fn parse_config_max_retry_attempts_invalid_above_2() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "max_retry_attempts": 3
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("max_retry_attempts"), "error should mention the field: {msg}");
+        assert!(msg.contains("3"), "error should contain the invalid value: {msg}");
     }
 }

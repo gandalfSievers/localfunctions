@@ -10,7 +10,7 @@ use base64::Engine;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -846,6 +846,10 @@ async fn invoke_function_inner(
 /// Runs the full synchronous invocation path; errors are logged but not
 /// returned to any caller. Timeout enforcement and container cleanup still
 /// apply through the normal invoke path.
+///
+/// Failed invocations are retried up to `max_retry_attempts` times (default 2,
+/// matching AWS Lambda behavior). Backoff between retries follows the AWS
+/// pattern: 1 minute after the first failure, 2 minutes after the second.
 fn invoke_async_background(
     state: AppState,
     function_name: String,
@@ -856,15 +860,67 @@ fn invoke_async_background(
     Box::pin(async move {
         // Swap the invocation type so the inner handler runs the synchronous path.
         headers.insert("X-Amz-Invocation-Type", "RequestResponse".parse().unwrap());
-        let (status, _headers, _body) =
-            invoke_function_inner(state, function_name, headers, body, request_id).await;
-        match status {
-            StatusCode::OK => {
-                info!("async invocation completed successfully");
+
+        // Determine per-function retry count (0-2, default 2).
+        let max_retries = state
+            .functions
+            .functions
+            .get(&function_name)
+            .map(|f| f.max_retry_attempts)
+            .unwrap_or(2);
+
+        // AWS backoff pattern: 1 minute after first failure, 2 minutes after second.
+        let backoff_durations = [
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(120),
+        ];
+
+        let mut attempt = 0u32;
+        loop {
+            let rid = if attempt == 0 {
+                request_id
+            } else {
+                Uuid::new_v4()
+            };
+
+            let (status, _headers, resp_body) = invoke_function_inner(
+                state.clone(),
+                function_name.clone(),
+                headers.clone(),
+                body.clone(),
+                rid,
+            )
+            .await;
+
+            if status == StatusCode::OK {
+                info!(attempt, "async invocation completed successfully");
+                return;
             }
-            status => {
-                warn!(%status, "async invocation completed with error");
+
+            attempt += 1;
+            if attempt > max_retries {
+                let body_str = String::from_utf8_lossy(&resp_body);
+                error!(
+                    %status,
+                    attempt = attempt - 1,
+                    max_retries,
+                    function = %function_name,
+                    response = %body_str,
+                    "async invocation failed after all retries exhausted"
+                );
+                return;
             }
+
+            let backoff = backoff_durations[(attempt - 1) as usize];
+            warn!(
+                %status,
+                attempt,
+                max_retries,
+                function = %function_name,
+                backoff_secs = backoff.as_secs(),
+                "async invocation failed, retrying after backoff"
+            );
+            tokio::time::sleep(backoff).await;
         }
     })
 }
@@ -2355,6 +2411,7 @@ mod tests {
                 architecture: "x86_64".into(),
                 layers: vec![],
                 function_url_enabled: false,
+                max_retry_attempts: 2,
             },
         );
         functions_map.insert(
@@ -2374,6 +2431,7 @@ mod tests {
                 architecture: "x86_64".into(),
                 layers: vec![],
                 function_url_enabled: false,
+                max_retry_attempts: 2,
             },
         );
         let functions = FunctionsConfig {
@@ -3228,6 +3286,7 @@ mod tests {
                 architecture: "x86_64".into(),
                 layers: vec![],
                 function_url_enabled: false,
+                max_retry_attempts: 2,
             },
         );
         let functions = FunctionsConfig {
@@ -4084,6 +4143,7 @@ mod tests {
                 architecture: "x86_64".into(),
                 layers: vec![],
                 function_url_enabled: false,
+                max_retry_attempts: 2,
             },
         );
         let functions = FunctionsConfig {
@@ -4903,6 +4963,7 @@ mod tests {
                 architecture: "x86_64".into(),
                 layers: vec![],
                 function_url_enabled: true,
+                max_retry_attempts: 2,
             },
         );
         functions_map.insert(
@@ -4922,6 +4983,7 @@ mod tests {
                 architecture: "x86_64".into(),
                 layers: vec![],
                 function_url_enabled: false,
+                max_retry_attempts: 2,
             },
         );
         let functions = FunctionsConfig {

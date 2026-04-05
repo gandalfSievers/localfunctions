@@ -1695,6 +1695,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            max_retry_attempts: 2,
         }
     }
 
@@ -2989,6 +2990,7 @@ mod integration_tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            max_retry_attempts: 2,
         };
 
         // Create and start

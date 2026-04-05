@@ -52,6 +52,10 @@ pub struct FunctionConfig {
     /// When true, this function gets a Function URL endpoint at `/{name}/`.
     #[serde(default)]
     pub function_url_enabled: bool,
+    /// Maximum number of retries for failed async (Event) invocations.
+    /// AWS Lambda defaults to 2 retries (range 0-2).
+    #[serde(default = "default_max_retry_attempts")]
+    pub max_retry_attempts: u32,
 }
 
 #[allow(dead_code)]
@@ -72,6 +76,11 @@ fn default_ephemeral_storage_mb() -> u64 {
 #[allow(dead_code)]
 fn default_architecture() -> String {
     "x86_64".to_string()
+}
+
+#[allow(dead_code)]
+fn default_max_retry_attempts() -> u32 {
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +275,7 @@ mod tests {
             architecture: "arm64".into(),
             layers: vec![],
             function_url_enabled: false,
+            max_retry_attempts: 2,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -302,6 +312,20 @@ mod tests {
         assert!(config.image_uri.is_none());
         assert!(config.reserved_concurrent_executions.is_none());
         assert_eq!(config.architecture, "x86_64");
+        assert_eq!(config.max_retry_attempts, 2);
+    }
+
+    #[test]
+    fn function_config_max_retry_attempts_custom() {
+        let json = r#"{
+            "name": "f",
+            "runtime": "nodejs20.x",
+            "handler": "index.handler",
+            "code_path": "/code",
+            "max_retry_attempts": 0
+        }"#;
+        let config: FunctionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_retry_attempts, 0);
     }
 
     #[test]
@@ -321,6 +345,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            max_retry_attempts: 2,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -346,6 +371,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            max_retry_attempts: 2,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("image_uri"));

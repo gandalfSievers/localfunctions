@@ -67,6 +67,7 @@ async fn build_state(
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            max_retry_attempts: 2,
         },
     );
 
