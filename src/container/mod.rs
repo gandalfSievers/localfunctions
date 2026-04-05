@@ -601,6 +601,7 @@ impl ContainerManager {
             binds: Some(binds),
             memory: Some(memory),
             network_mode: Some(self.network_name.clone()),
+            extra_hosts: Some(container_extra_hosts()),
             // Explicitly no privileged mode, no port bindings
             privileged: Some(false),
             publish_all_ports: Some(false),
@@ -968,6 +969,23 @@ pub fn lambda_env_vars(
     vars.into_iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect()
+}
+
+/// Build the `extra_hosts` entries for a Lambda container.
+///
+/// Returns `["host.docker.internal:host-gateway"]` so that containers can
+/// resolve `host.docker.internal` to the host machine on all platforms.
+/// On macOS/Windows Docker Desktop this mapping is added automatically, but
+/// on Linux the explicit `host-gateway` directive is required.  Including it
+/// unconditionally is harmless and keeps the behaviour consistent.
+///
+/// This allows Lambda functions to reach other local* services (e.g.
+/// localObjectStorage, localSecrets) running on the host via
+/// `host.docker.internal:<port>`.  When other services run as Docker
+/// containers on the same user-defined bridge network, Docker's embedded DNS
+/// resolves their container names automatically — no extra config needed.
+pub fn container_extra_hosts() -> Vec<String> {
+    vec!["host.docker.internal:host-gateway".to_string()]
 }
 
 /// Build the `AWS_LAMBDA_RUNTIME_API` endpoint value that containers should
@@ -1675,6 +1693,35 @@ mod tests {
         // Can claim again
         let reclaimed = mgr.claim_idle_container("test-func").await;
         assert_eq!(reclaimed, Some("ctr-1".to_string()));
+    }
+
+    // -- container_extra_hosts -----------------------------------------------
+
+    #[test]
+    fn container_extra_hosts_contains_host_gateway() {
+        let hosts = container_extra_hosts();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0], "host.docker.internal:host-gateway");
+    }
+
+    #[test]
+    fn lambda_env_vars_passes_through_endpoint_url_vars() {
+        let mut func = make_test_function();
+        func.environment.insert(
+            "AWS_ENDPOINT_URL_S3".into(),
+            "http://host.docker.internal:9090".into(),
+        );
+        func.environment.insert(
+            "AWS_ENDPOINT_URL_SECRETS_MANAGER".into(),
+            "http://host.docker.internal:9091".into(),
+        );
+        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        assert!(vars.contains(
+            &"AWS_ENDPOINT_URL_S3=http://host.docker.internal:9090".to_string()
+        ));
+        assert!(vars.contains(
+            &"AWS_ENDPOINT_URL_SECRETS_MANAGER=http://host.docker.internal:9091".to_string()
+        ));
     }
 }
 

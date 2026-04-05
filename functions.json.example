@@ -18,6 +18,19 @@
       "timeout": 10,
       "memory_size": 128,
       "environment": {}
+    },
+    "my-func-with-local-services": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./functions/my-func-with-local-services",
+      "timeout": 30,
+      "memory_size": 256,
+      "environment": {
+        "AWS_ENDPOINT_URL_S3": "http://host.docker.internal:9090",
+        "AWS_ENDPOINT_URL_SECRETS_MANAGER": "http://host.docker.internal:9091",
+        "LOCALSECRETS_URL": "http://host.docker.internal:9091",
+        "LOCALOBJECTSTORAGE_URL": "http://host.docker.internal:9090"
+      }
     }
   },
   "runtime_images": {
