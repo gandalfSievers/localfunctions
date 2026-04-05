@@ -1,0 +1,24 @@
+# Build artifacts
+/target
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Data directory
+/data
+
+# Editor swap files
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+
+# Project orchestration
+.pralph/

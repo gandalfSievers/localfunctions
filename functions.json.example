@@ -1,0 +1,28 @@
+{
+  "functions": {
+    "my-python-func": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./functions/my-python-func",
+      "timeout": 30,
+      "memory_size": 128,
+      "environment": {
+        "TABLE_NAME": "my-table",
+        "BUCKET_NAME": "my-bucket"
+      }
+    },
+    "my-node-func": {
+      "runtime": "nodejs20.x",
+      "handler": "index.handler",
+      "code_path": "./functions/my-node-func",
+      "timeout": 10,
+      "memory_size": 128,
+      "environment": {}
+    }
+  },
+  "runtime_images": {
+    "python3.12": "public.ecr.aws/lambda/python:3.12",
+    "nodejs20.x": "public.ecr.aws/lambda/nodejs:20",
+    "provided.al2023": "public.ecr.aws/lambda/provided:al2023"
+  }
+}
