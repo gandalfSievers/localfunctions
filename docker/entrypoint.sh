@@ -1,7 +1,6 @@
 #!/bin/sh
 set -e
 
-# Signal forwarding — ensure clean shutdown
-trap 'kill -TERM $PID; wait $PID' TERM INT
-
+# exec replaces the shell with the binary, making it PID 1 so it
+# receives SIGTERM/SIGINT directly from Docker — no trap needed.
 exec /usr/local/bin/localfunctions "$@"
