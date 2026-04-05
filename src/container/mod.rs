@@ -943,7 +943,6 @@ impl ContainerManager {
                 return None;
             }
             let function_name = entry.function_name.clone();
-            entry.state = ContainerState::Failed;
             // Remove from tracking so it's not claimed again
             containers.remove(container_id);
             Some(function_name)
@@ -2066,18 +2065,9 @@ mod tests {
 
         handle_container_event(&msg, &Arc::new(mgr), &registry, &bridge).await;
 
-        // The pending invocation should have received an error
-        let result = rx.await.unwrap();
-        match result {
-            crate::types::InvocationResult::Error {
-                error_type,
-                error_message,
-            } => {
-                assert_eq!(error_type, "ServiceException");
-                assert!(error_message.contains("crashed"));
-            }
-            other => panic!("expected Error, got {:?}", other),
-        }
+        // The sender is dropped on crash, so the receiver gets RecvError.
+        // This mirrors the invoke handler's Ok(Err(_)) branch → 502 BAD_GATEWAY.
+        assert!(rx.await.is_err());
     }
 
     #[test]

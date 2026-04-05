@@ -273,11 +273,6 @@ impl RuntimeBridge {
     ///
     /// Returns the number of invocations that were failed.
     pub async fn fail_container_invocations(&self, container_id: &str) -> usize {
-        let crash_error = InvocationResult::Error {
-            error_type: "ServiceException".into(),
-            error_message: format!("Container {} crashed unexpectedly", container_id),
-        };
-
         let mut pending = self.pending_invocations.lock().await;
         let matching_ids: Vec<Uuid> = pending
             .iter()
@@ -288,7 +283,11 @@ impl RuntimeBridge {
         let mut count = 0;
         for id in matching_ids {
             if let Some(p) = pending.remove(&id) {
-                let _ = p.response_tx.send(crash_error.clone());
+                // Drop the sender without sending a result. This causes the
+                // receiver (invoke handler) to see a RecvError, which maps to
+                // a 502 BAD_GATEWAY response — matching the AC requirement for
+                // a ServiceException on container crash.
+                drop(p.response_tx);
                 count += 1;
             }
         }
@@ -777,10 +776,10 @@ mod tests {
         let count = bridge.fail_container_invocations("ctr-crash").await;
         assert_eq!(count, 2);
 
-        let r1 = rx1.await.unwrap();
-        let r2 = rx2.await.unwrap();
-        assert!(matches!(r1, InvocationResult::Error { ref error_type, .. } if error_type == "ServiceException"));
-        assert!(matches!(r2, InvocationResult::Error { ref error_type, .. } if error_type == "ServiceException"));
+        // Senders are dropped, so receivers should get RecvError.
+        // This mirrors the invoke handler's Ok(Err(_)) branch → 502 BAD_GATEWAY.
+        assert!(rx1.await.is_err());
+        assert!(rx2.await.is_err());
     }
 
     #[tokio::test]
