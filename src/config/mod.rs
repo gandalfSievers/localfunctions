@@ -29,6 +29,13 @@ pub struct Config {
     /// `max_containers` are in use (default 10s). If no slot becomes available
     /// within this period, the invocation is rejected with 429.
     pub container_acquire_timeout: u64,
+    /// Whether to forward host AWS credentials (AWS_ACCESS_KEY_ID,
+    /// AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN) into function containers.
+    /// Default: true.
+    pub forward_aws_credentials: bool,
+    /// Whether to mount the host ~/.aws directory read-only into function
+    /// containers (at /root/.aws). Default: false.
+    pub mount_aws_credentials: bool,
 }
 
 /// Controls the format of log output.
@@ -82,6 +89,8 @@ impl Config {
         )?;
         let init_timeout = parse_env("LOCAL_LAMBDA_INIT_TIMEOUT", "10")?;
         let container_acquire_timeout = parse_env("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT", "10")?;
+        let forward_aws_credentials = parse_env("LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS", "true")?;
+        let mount_aws_credentials = parse_env("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS", "false")?;
 
         Ok(Config {
             host,
@@ -100,6 +109,8 @@ impl Config {
             pull_images,
             init_timeout,
             container_acquire_timeout,
+            forward_aws_credentials,
+            mount_aws_credentials,
         })
     }
 }
@@ -163,6 +174,8 @@ mod tests {
             "LOCALFUNCTIONS_PULL_IMAGES",
             "LOCAL_LAMBDA_INIT_TIMEOUT",
             "LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT",
+            "LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS",
+            "LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS",
         ] {
             std::env::remove_var(key);
         }
@@ -184,6 +197,8 @@ mod tests {
         assert!(!config.pull_images);
         assert_eq!(config.init_timeout, 10);
         assert_eq!(config.container_acquire_timeout, 10);
+        assert!(config.forward_aws_credentials);
+        assert!(!config.mount_aws_credentials);
     }
 
     #[test]
@@ -425,5 +440,39 @@ mod tests {
         let result = Config::from_env();
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_forward_aws_credentials_default_true() {
+        std::env::remove_var("LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS");
+        let config = Config::from_env().unwrap();
+        assert!(config.forward_aws_credentials);
+    }
+
+    #[test]
+    #[serial]
+    fn test_forward_aws_credentials_disabled() {
+        std::env::set_var("LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.forward_aws_credentials);
+        std::env::remove_var("LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_mount_aws_credentials_default_false() {
+        std::env::remove_var("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS");
+        let config = Config::from_env().unwrap();
+        assert!(!config.mount_aws_credentials);
+    }
+
+    #[test]
+    #[serial]
+    fn test_mount_aws_credentials_enabled() {
+        std::env::set_var("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.mount_aws_credentials);
+        std::env::remove_var("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS");
     }
 }

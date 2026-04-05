@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use localfunctions::config::{Config, LogFormat};
-use localfunctions::container::{ContainerManager, ContainerRegistry};
+use localfunctions::container::{ContainerManager, ContainerRegistry, CredentialForwardingConfig};
 use localfunctions::function::FunctionsConfig;
 use localfunctions::runtime::RuntimeBridge;
 use localfunctions::server::AppState;
@@ -42,6 +42,8 @@ async fn build_state(
         pull_images: false,
         init_timeout,
         container_acquire_timeout: 10,
+        forward_aws_credentials: true,
+        mount_aws_credentials: false,
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
@@ -85,6 +87,7 @@ async fn build_state(
         "us-east-1".into(),
         container_registry.clone(),
         20,
+        CredentialForwardingConfig::default(),
     ));
 
     // Pre-populate an idle container so the invoke handler doesn't attempt

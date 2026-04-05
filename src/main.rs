@@ -16,7 +16,7 @@ use bollard::Docker;
 use futures_util::TryStreamExt;
 use tracing::{error, info, warn};
 
-use container::{ContainerManager, ContainerRegistry, DockerNetwork, monitor_container_events};
+use container::{ContainerManager, ContainerRegistry, CredentialForwardingConfig, DockerNetwork, monitor_container_events};
 use runtime::RuntimeBridge;
 use server::AppState;
 
@@ -103,6 +103,10 @@ async fn main() -> Result<()> {
     let container_idle_timeout = Duration::from_secs(config.container_idle_timeout);
     let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
 
+    let credential_config = CredentialForwardingConfig {
+        forward_env: config.forward_aws_credentials,
+        mount_aws_dir: config.mount_aws_credentials,
+    };
     let container_manager = Arc::new(ContainerManager::new(
         docker.clone(),
         functions_config.runtime_images.clone(),
@@ -111,6 +115,7 @@ async fn main() -> Result<()> {
         config.region.clone(),
         container_registry.clone(),
         config.max_containers,
+        credential_config,
     ));
 
     let state = AppState {

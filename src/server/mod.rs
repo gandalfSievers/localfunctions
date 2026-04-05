@@ -10,6 +10,8 @@ use tracing::info;
 use crate::api;
 use crate::config::Config;
 use crate::container::{ContainerManager, ContainerRegistry};
+#[cfg(test)]
+use crate::container::CredentialForwardingConfig;
 use crate::function::FunctionsConfig;
 use crate::runtime::RuntimeBridge;
 
@@ -146,6 +148,8 @@ mod tests {
             pull_images: false,
             init_timeout: 10,
             container_acquire_timeout: 10,
+            forward_aws_credentials: true,
+            mount_aws_credentials: false,
         };
         let docker = Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -163,6 +167,7 @@ mod tests {
             "us-east-1".into(),
             container_registry.clone(),
             20,
+            CredentialForwardingConfig::default(),
         ));
         AppState {
             config: Arc::new(config),

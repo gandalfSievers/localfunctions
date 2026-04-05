@@ -854,7 +854,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
-    use crate::container::{ContainerManager, ContainerRegistry};
+    use crate::container::{ContainerManager, ContainerRegistry, CredentialForwardingConfig};
     use crate::function::FunctionsConfig;
     use crate::runtime::RuntimeBridge;
 
@@ -876,6 +876,8 @@ mod tests {
             pull_images: false,
             init_timeout: 10,
             container_acquire_timeout: 10,
+            forward_aws_credentials: true,
+            mount_aws_credentials: false,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -893,6 +895,7 @@ mod tests {
             "us-east-1".into(),
             container_registry.clone(),
             20,
+            CredentialForwardingConfig::default(),
         ));
         AppState {
             config: Arc::new(config),
@@ -1608,6 +1611,8 @@ mod tests {
             pull_images: false,
             init_timeout: 10,
             container_acquire_timeout: 10,
+            forward_aws_credentials: true,
+            mount_aws_credentials: false,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -1651,6 +1656,7 @@ mod tests {
             "us-east-1".into(),
             container_registry.clone(),
             20,
+            CredentialForwardingConfig::default(),
         ));
 
         // Pre-populate an idle container so the invoke handler doesn't attempt
@@ -2144,6 +2150,8 @@ mod tests {
             pull_images: false,
             init_timeout: 10,
             container_acquire_timeout: 0, // no wait — reject immediately
+            forward_aws_credentials: true,
+            mount_aws_credentials: false,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -2182,6 +2190,7 @@ mod tests {
             "us-east-1".into(),
             container_registry.clone(),
             1, // 1 slot
+            CredentialForwardingConfig::default(),
         ));
 
         // Fill the only slot with a Busy container so no idle container is

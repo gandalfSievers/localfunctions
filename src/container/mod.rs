@@ -20,6 +20,26 @@ use tracing::{debug, error, info, warn};
 use crate::runtime::RuntimeBridge;
 use crate::types::{ContainerState, FunctionConfig, ServiceError};
 
+/// Configuration for host AWS credential forwarding into function containers.
+#[derive(Debug, Clone)]
+pub struct CredentialForwardingConfig {
+    /// Forward host AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
+    /// AWS_SESSION_TOKEN (if set) as environment variables.
+    pub forward_env: bool,
+    /// Mount the host ~/.aws directory read-only at /root/.aws inside
+    /// containers and forward AWS_PROFILE if set.
+    pub mount_aws_dir: bool,
+}
+
+impl Default for CredentialForwardingConfig {
+    fn default() -> Self {
+        Self {
+            forward_env: true,
+            mount_aws_dir: false,
+        }
+    }
+}
+
 /// Manages the Docker network used for communication between Lambda containers
 /// and the Runtime API.
 #[allow(dead_code)]
@@ -464,6 +484,9 @@ pub struct ContainerManager {
     /// permit; when all permits are taken, new container creation blocks until
     /// a permit is released (container removed).
     container_semaphore: Arc<Semaphore>,
+    /// Controls whether and how host AWS credentials are forwarded to
+    /// function containers.
+    credential_config: CredentialForwardingConfig,
 }
 
 #[allow(dead_code)]
@@ -474,6 +497,7 @@ impl ContainerManager {
     ///   Docker image (e.g. `"public.ecr.aws/lambda/python:3.12"`).
     /// - `network_name`: the Docker network to attach containers to.
     /// - `registry`: shared `ContainerRegistry` for shutdown tracking.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         docker: Docker,
         runtime_images: HashMap<String, String>,
@@ -482,6 +506,7 @@ impl ContainerManager {
         region: String,
         registry: Arc<ContainerRegistry>,
         max_containers: usize,
+        credential_config: CredentialForwardingConfig,
     ) -> Self {
         Self {
             docker,
@@ -492,6 +517,7 @@ impl ContainerManager {
             registry,
             containers: RwLock::new(HashMap::new()),
             container_semaphore: Arc::new(Semaphore::new(max_containers)),
+            credential_config,
         }
     }
 
@@ -613,8 +639,13 @@ impl ContainerManager {
         // Lazy pull
         self.ensure_image(&image).await?;
 
-        // Build environment variables
-        let env = lambda_env_vars(function, self.runtime_port, &self.region);
+        // Build environment variables (with optional host credential forwarding)
+        let env = lambda_env_vars(
+            function,
+            self.runtime_port,
+            &self.region,
+            &self.credential_config,
+        );
 
         // Code path mount: read-only at /var/task
         let code_path = function
@@ -628,7 +659,14 @@ impl ContainerManager {
             })?
             .to_string();
 
-        let binds = vec![format!("{}:/var/task:ro", code_path)];
+        let mut binds = vec![format!("{}:/var/task:ro", code_path)];
+
+        // Optionally mount host ~/.aws directory read-only
+        if self.credential_config.mount_aws_dir {
+            if let Some(aws_dir) = host_aws_config_dir() {
+                binds.push(format!("{}:/root/.aws:ro", aws_dir));
+            }
+        }
 
         // Memory limit in bytes (memory_size is in MB)
         let memory = (function.memory_size as i64) * 1024 * 1024;
@@ -1201,13 +1239,18 @@ fn is_benign_docker_error(e: &bollard::errors::Error) -> bool {
 /// Build the complete set of environment variables to inject into a Lambda
 /// function container.
 ///
-/// System variables (AWS_LAMBDA_FUNCTION_NAME, _HANDLER, etc.) are set first,
-/// then user-configured variables are merged in. User variables do **not**
-/// override the system variables.
+/// Priority order (highest to lowest):
+/// 1. System variables (AWS_LAMBDA_FUNCTION_NAME, _HANDLER, etc.)
+/// 2. Per-function environment variables from functions.json
+/// 3. Forwarded host AWS credentials (when enabled)
+///
+/// Per-function environment variable overrides take precedence over forwarded
+/// host credentials, allowing functions to use their own credentials.
 pub fn lambda_env_vars(
     function: &FunctionConfig,
     runtime_port: u16,
     region: &str,
+    credential_config: &CredentialForwardingConfig,
 ) -> Vec<String> {
     let runtime_api = runtime_api_endpoint(runtime_port);
 
@@ -1238,15 +1281,49 @@ pub fn lambda_env_vars(
         "localfunctions/latest".into(),
     );
 
-    // Merge user-configured environment variables without overriding system vars
+    // Merge user-configured environment variables without overriding system vars.
+    // User vars are inserted before host credentials so they take precedence
+    // over forwarded credentials.
     for (key, value) in &function.environment {
         vars.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+
+    // Forward host AWS credentials when enabled. These are inserted with
+    // or_insert so per-function overrides (already in vars) take precedence.
+    if credential_config.forward_env {
+        for key in &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                vars.entry((*key).to_string())
+                    .or_insert(val);
+            }
+        }
+    }
+
+    // When mounting ~/.aws, forward AWS_PROFILE so the SDK inside the
+    // container uses the same profile as the host.
+    if credential_config.mount_aws_dir {
+        if let Ok(val) = std::env::var("AWS_PROFILE") {
+            vars.entry("AWS_PROFILE".to_string()).or_insert(val);
+        }
     }
 
     // Convert to Docker's "KEY=VALUE" format
     vars.into_iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect()
+}
+
+/// Return the host ~/.aws directory path if it exists.
+fn host_aws_config_dir() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".aws"))
+        .filter(|p| p.is_dir())
+        .and_then(|p| p.to_str().map(String::from))
 }
 
 /// Build the `extra_hosts` entries for a Lambda container.
@@ -1312,6 +1389,7 @@ pub fn cpu_constraints(memory_size_mb: u64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn runtime_api_endpoint_contains_port() {
@@ -1344,35 +1422,35 @@ mod tests {
     #[test]
     fn lambda_env_vars_contains_function_name() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_NAME=my-func".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_handler() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"_HANDLER=main.handler".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_memory_size() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=256".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_runtime_api() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=host.docker.internal:9601".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_region() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "eu-west-1");
+        let vars = lambda_env_vars(&func, 9601, "eu-west-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_REGION=eu-west-1".to_string()));
         assert!(vars.contains(&"AWS_DEFAULT_REGION=eu-west-1".to_string()));
     }
@@ -1380,21 +1458,21 @@ mod tests {
     #[test]
     fn lambda_env_vars_contains_version() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_VERSION=$LATEST".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_log_group() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_LOG_GROUP_NAME=/aws/lambda/my-func".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_log_stream() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_LOG_STREAM_NAME=localfunctions/latest".to_string()));
     }
 
@@ -1402,7 +1480,7 @@ mod tests {
     fn lambda_env_vars_includes_user_vars() {
         let mut func = make_test_function();
         func.environment.insert("TABLE_NAME".into(), "my-table".into());
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"TABLE_NAME=my-table".to_string()));
     }
 
@@ -1411,7 +1489,7 @@ mod tests {
         let mut func = make_test_function();
         func.environment.insert("AWS_LAMBDA_FUNCTION_NAME".into(), "hacked".into());
         func.environment.insert("_HANDLER".into(), "evil.handler".into());
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         // System values must win
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_NAME=my-func".to_string()));
         assert!(vars.contains(&"_HANDLER=main.handler".to_string()));
@@ -1421,15 +1499,23 @@ mod tests {
     #[test]
     fn lambda_env_vars_custom_port() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 3000, "us-east-1");
+        let vars = lambda_env_vars(&func, 3000, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=host.docker.internal:3000".to_string()));
     }
 
     #[test]
+    #[serial]
     fn lambda_env_vars_count() {
-        // 9 system vars with no user vars
+        // 9 system vars with no user vars (and no host credentials)
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("AWS_SESSION_TOKEN");
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let no_creds = CredentialForwardingConfig {
+            forward_env: false,
+            mount_aws_dir: false,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &no_creds);
         assert_eq!(vars.len(), 9);
     }
 
@@ -1563,6 +1649,7 @@ mod tests {
             "us-east-1".to_string(),
             registry,
             20,
+            CredentialForwardingConfig::default(),
         )
     }
 
@@ -1624,6 +1711,7 @@ mod tests {
             "us-east-1".into(),
             registry,
             20,
+            CredentialForwardingConfig::default(),
         );
         let func = make_test_function();
         let err = mgr.resolve_image(&func).unwrap_err();
@@ -2183,13 +2271,166 @@ mod tests {
             "AWS_ENDPOINT_URL_SECRETS_MANAGER".into(),
             "http://host.docker.internal:9091".into(),
         );
-        let vars = lambda_env_vars(&func, 9601, "us-east-1");
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
         assert!(vars.contains(
             &"AWS_ENDPOINT_URL_S3=http://host.docker.internal:9090".to_string()
         ));
         assert!(vars.contains(
             &"AWS_ENDPOINT_URL_SECRETS_MANAGER=http://host.docker.internal:9091".to_string()
         ));
+    }
+
+    // -- Credential forwarding tests ----------------------------------------
+
+    #[test]
+    #[serial]
+    fn credential_forwarding_injects_host_aws_env_vars() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        std::env::set_var("AWS_SESSION_TOKEN", "FwoGZXIvYXdzEBY_session_token");
+
+        let func = make_test_function();
+        let config = CredentialForwardingConfig {
+            forward_env: true,
+            mount_aws_dir: false,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+
+        assert!(vars.contains(&"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE".to_string()));
+        assert!(vars.contains(&"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()));
+        assert!(vars.contains(&"AWS_SESSION_TOKEN=FwoGZXIvYXdzEBY_session_token".to_string()));
+
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("AWS_SESSION_TOKEN");
+    }
+
+    #[test]
+    #[serial]
+    fn credential_forwarding_disabled_does_not_inject() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+
+        let func = make_test_function();
+        let config = CredentialForwardingConfig {
+            forward_env: false,
+            mount_aws_dir: false,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+
+        assert!(!vars.iter().any(|v| v.starts_with("AWS_ACCESS_KEY_ID=")));
+        assert!(!vars.iter().any(|v| v.starts_with("AWS_SECRET_ACCESS_KEY=")));
+
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn credential_forwarding_skips_unset_session_token() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+        std::env::remove_var("AWS_SESSION_TOKEN");
+
+        let func = make_test_function();
+        let config = CredentialForwardingConfig {
+            forward_env: true,
+            mount_aws_dir: false,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+
+        assert!(vars.contains(&"AWS_ACCESS_KEY_ID=AKIATEST".to_string()));
+        assert!(vars.contains(&"AWS_SECRET_ACCESS_KEY=secret".to_string()));
+        assert!(!vars.iter().any(|v| v.starts_with("AWS_SESSION_TOKEN=")));
+
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn per_function_env_overrides_forwarded_credentials() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "HOST_KEY");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "HOST_SECRET");
+
+        let mut func = make_test_function();
+        func.environment.insert("AWS_ACCESS_KEY_ID".into(), "FUNC_KEY".into());
+        func.environment.insert("AWS_SECRET_ACCESS_KEY".into(), "FUNC_SECRET".into());
+
+        let config = CredentialForwardingConfig {
+            forward_env: true,
+            mount_aws_dir: false,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+
+        // Per-function values must win over host credentials
+        assert!(vars.contains(&"AWS_ACCESS_KEY_ID=FUNC_KEY".to_string()));
+        assert!(vars.contains(&"AWS_SECRET_ACCESS_KEY=FUNC_SECRET".to_string()));
+        assert!(!vars.iter().any(|v| v.contains("HOST_KEY")));
+        assert!(!vars.iter().any(|v| v.contains("HOST_SECRET")));
+
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn aws_profile_forwarded_when_mount_enabled() {
+        std::env::set_var("AWS_PROFILE", "my-dev-profile");
+
+        let func = make_test_function();
+        let config = CredentialForwardingConfig {
+            forward_env: false,
+            mount_aws_dir: true,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+
+        assert!(vars.contains(&"AWS_PROFILE=my-dev-profile".to_string()));
+
+        std::env::remove_var("AWS_PROFILE");
+    }
+
+    #[test]
+    #[serial]
+    fn aws_profile_not_forwarded_when_mount_disabled() {
+        std::env::set_var("AWS_PROFILE", "my-dev-profile");
+
+        let func = make_test_function();
+        let config = CredentialForwardingConfig {
+            forward_env: true,
+            mount_aws_dir: false,
+        };
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+
+        assert!(!vars.iter().any(|v| v.starts_with("AWS_PROFILE=")));
+
+        std::env::remove_var("AWS_PROFILE");
+    }
+
+    #[test]
+    fn credential_forwarding_config_default() {
+        let config = CredentialForwardingConfig::default();
+        assert!(config.forward_env);
+        assert!(!config.mount_aws_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn credentials_not_exposed_in_debug_output() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/secret");
+
+        let config = CredentialForwardingConfig {
+            forward_env: true,
+            mount_aws_dir: false,
+        };
+        // The config struct itself should not contain credentials
+        let debug_str = format!("{:?}", config);
+        assert!(!debug_str.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!debug_str.contains("wJalrXUtnFEMI/secret"));
+
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     }
 
     // -- Container slot / semaphore tests -----------------------------------
@@ -2228,6 +2469,7 @@ mod tests {
             "us-east-1".into(),
             registry,
             2, // only 2 slots
+            CredentialForwardingConfig::default(),
         );
 
         // Take both slots
@@ -2353,6 +2595,7 @@ mod integration_tests {
             "us-east-1".to_string(),
             registry.clone(),
             20,
+            CredentialForwardingConfig::default(),
         );
 
         // Create a temp directory for code
@@ -2450,6 +2693,7 @@ mod integration_tests {
             "us-east-1".into(),
             registry,
             20,
+            CredentialForwardingConfig::default(),
         );
 
         // Use a small, commonly available image
@@ -2571,6 +2815,7 @@ mod integration_tests {
             "us-east-1".into(),
             registry,
             20,
+            CredentialForwardingConfig::default(),
         );
 
         // Stopping a nonexistent container should succeed (benign errors are swallowed)
