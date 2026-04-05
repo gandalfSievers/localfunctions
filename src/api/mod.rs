@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -192,7 +193,7 @@ async fn next_invocation(
             // results back to the original invoke caller.
             state
                 .runtime_bridge
-                .store_pending(request_id, response_tx)
+                .store_pending(request_id, function_name.clone(), response_tx)
                 .await;
 
             // Compute deadline in epoch milliseconds.
@@ -267,6 +268,43 @@ struct RuntimeErrorRequest {
     stackTrace: Vec<String>,
 }
 
+/// Parse a runtime error from the request body and optional header.
+///
+/// Returns `(error_type, error_message)`. Falls back to `default_error_type`
+/// when neither the body nor the header provides an error type.
+fn parse_runtime_error(
+    body: &Bytes,
+    header_error_type: Option<String>,
+    default_error_type: &str,
+    default_error_message: &str,
+) -> (String, String) {
+    match serde_json::from_slice::<RuntimeErrorRequest>(body) {
+        Ok(err_body) => {
+            let etype = if err_body.errorType.is_empty() {
+                header_error_type.unwrap_or_else(|| default_error_type.into())
+            } else {
+                err_body.errorType
+            };
+            let emsg = if err_body.errorMessage.is_empty() {
+                default_error_message.into()
+            } else {
+                err_body.errorMessage
+            };
+            (etype, emsg)
+        }
+        Err(_) => {
+            let etype = header_error_type.unwrap_or_else(|| default_error_type.into());
+            let emsg = String::from_utf8_lossy(body).into_owned();
+            let emsg = if emsg.is_empty() {
+                default_error_message.into()
+            } else {
+                emsg
+            };
+            (etype, emsg)
+        }
+    }
+}
+
 /// POST /2018-06-01/runtime/invocation/:request_id/response
 ///
 /// Called by the Lambda runtime after successfully processing an invocation.
@@ -333,31 +371,12 @@ async fn invocation_error(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let (error_type, error_message) = match serde_json::from_slice::<RuntimeErrorRequest>(&body) {
-        Ok(err_body) => {
-            let etype = if err_body.errorType.is_empty() {
-                header_error_type.unwrap_or_else(|| "Runtime.UnknownError".into())
-            } else {
-                err_body.errorType
-            };
-            let emsg = if err_body.errorMessage.is_empty() {
-                "Unknown error".into()
-            } else {
-                err_body.errorMessage
-            };
-            (etype, emsg)
-        }
-        Err(_) => {
-            let etype = header_error_type.unwrap_or_else(|| "Runtime.UnknownError".into());
-            let emsg = String::from_utf8_lossy(&body).into_owned();
-            let emsg = if emsg.is_empty() {
-                "Unknown error".into()
-            } else {
-                emsg
-            };
-            (etype, emsg)
-        }
-    };
+    let (error_type, error_message) = parse_runtime_error(
+        &body,
+        header_error_type,
+        "Runtime.UnknownError",
+        "Unknown error",
+    );
 
     warn!(
         request_id = %uuid,
@@ -384,8 +403,12 @@ async fn invocation_error(
 /// POST /2018-06-01/runtime/init/error
 ///
 /// Called by the Lambda runtime when it fails to initialize (e.g. handler not
-/// found, syntax error). Drains pending invocations for the function and
-/// returns an error to each caller.
+/// found, syntax error). Fails all pending invocations for the function with
+/// a 502 InvalidRuntimeException, then stops and removes the container.
+///
+/// NOTE: This endpoint requires a `Lambda-Runtime-Function-Name` header to
+/// identify which function failed. This is a localfunctions extension — the
+/// real AWS Runtime API identifies the function from the container context.
 async fn init_error(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -406,25 +429,12 @@ async fn init_error(
         }
     };
 
-    let (error_type, error_message) = match serde_json::from_slice::<RuntimeErrorRequest>(&body) {
-        Ok(err_body) => {
-            let etype = if err_body.errorType.is_empty() {
-                "Runtime.InitError".into()
-            } else {
-                err_body.errorType
-            };
-            let emsg = if err_body.errorMessage.is_empty() {
-                "Runtime failed to initialize".into()
-            } else {
-                err_body.errorMessage
-            };
-            (etype, emsg)
-        }
-        Err(_) => (
-            "Runtime.InitError".to_string(),
-            "Runtime failed to initialize".to_string(),
-        ),
-    };
+    let (error_type, error_message) = parse_runtime_error(
+        &body,
+        None,
+        "Runtime.InitError",
+        "Runtime failed to initialize",
+    );
 
     info!(
         function = %function_name,
@@ -433,6 +443,7 @@ async fn init_error(
         "runtime init error received"
     );
 
+    // Fail all pending invocations (both queued and already dispatched).
     let failed_count = state.runtime_bridge.fail_init(&function_name).await;
     if failed_count > 0 {
         info!(
@@ -442,7 +453,26 @@ async fn init_error(
         );
     }
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "error"})))
+    // Stop and remove the container(s) for this function.
+    let timeout = Duration::from_secs(state.config.shutdown_timeout);
+    let removed = state
+        .container_registry
+        .stop_and_remove_by_function(&function_name, timeout)
+        .await;
+    if !removed.is_empty() {
+        info!(
+            function = %function_name,
+            removed_count = removed.len(),
+            "stopped and removed containers due to init error"
+        );
+    }
+
+    // Return 502 InvalidRuntimeException to match AWS behavior.
+    let err_response = serde_json::json!({
+        "Type": "InvalidRuntimeException",
+        "Message": format!("Runtime failed to initialize: {}", error_message),
+    });
+    (StatusCode::BAD_GATEWAY, Json(err_response))
 }
 
 #[cfg(test)]
@@ -997,7 +1027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_init_error_returns_accepted() {
+    async fn runtime_init_error_returns_502_invalid_runtime_exception() {
         use tokio::sync::mpsc;
 
         let (_tx, rx) = mpsc::channel::<crate::types::Invocation>(10);
@@ -1022,12 +1052,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "error");
+        assert_eq!(json["Type"], "InvalidRuntimeException");
+        assert!(json["Message"].as_str().unwrap().contains("handler not found"));
     }
 
     #[tokio::test]
@@ -1070,7 +1101,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
         // The queued invocation should have received an error
         let result = resp_rx.await.unwrap();

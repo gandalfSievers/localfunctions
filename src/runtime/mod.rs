@@ -7,6 +7,12 @@ use uuid::Uuid;
 
 use crate::types::{Invocation, InvocationResult};
 
+/// A dispatched invocation waiting for a response from the container runtime.
+struct PendingInvocation {
+    function_name: String,
+    response_tx: oneshot::Sender<InvocationResult>,
+}
+
 /// Bridges the Invoke API (which sends invocations) and the Runtime API (where
 /// containers long-poll for work). Holds per-function invocation receivers and
 /// tracks which containers have signalled readiness.
@@ -23,8 +29,8 @@ pub struct RuntimeBridge {
     ready_containers: Mutex<HashMap<String, bool>>,
 
     /// Pending invocations awaiting a response from the container runtime.
-    /// Maps request_id → oneshot sender for the invocation result.
-    pending_invocations: Mutex<HashMap<Uuid, oneshot::Sender<InvocationResult>>>,
+    /// Maps request_id → pending invocation (function name + oneshot sender).
+    pending_invocations: Mutex<HashMap<Uuid, PendingInvocation>>,
 }
 
 impl RuntimeBridge {
@@ -102,12 +108,13 @@ impl RuntimeBridge {
     pub async fn store_pending(
         &self,
         request_id: Uuid,
+        function_name: String,
         response_tx: oneshot::Sender<InvocationResult>,
     ) {
         self.pending_invocations
             .lock()
             .await
-            .insert(request_id, response_tx);
+            .insert(request_id, PendingInvocation { function_name, response_tx });
     }
 
     /// Complete a pending invocation with a success result.
@@ -115,10 +122,10 @@ impl RuntimeBridge {
     /// Returns `true` if the invocation was found and the result was sent,
     /// `false` if the request_id was not found or the receiver was dropped.
     pub async fn complete_invocation(&self, request_id: Uuid, body: String) -> bool {
-        let tx = self.pending_invocations.lock().await.remove(&request_id);
-        match tx {
-            Some(sender) => {
-                if sender.send(InvocationResult::Success { body }).is_err() {
+        let pending = self.pending_invocations.lock().await.remove(&request_id);
+        match pending {
+            Some(p) => {
+                if p.response_tx.send(InvocationResult::Success { body }).is_err() {
                     warn!(%request_id, "invocation caller already dropped");
                     false
                 } else {
@@ -139,10 +146,10 @@ impl RuntimeBridge {
         error_type: String,
         error_message: String,
     ) -> bool {
-        let tx = self.pending_invocations.lock().await.remove(&request_id);
-        match tx {
-            Some(sender) => {
-                if sender
+        let pending = self.pending_invocations.lock().await.remove(&request_id);
+        match pending {
+            Some(p) => {
+                if p.response_tx
                     .send(InvocationResult::Error {
                         error_type,
                         error_message,
@@ -162,29 +169,46 @@ impl RuntimeBridge {
     /// Fail all pending invocations for a given function with an init error.
     /// Used when the runtime fails to initialize.
     ///
+    /// This drains both:
+    /// - Queued invocations (not yet dispatched to a container via /next)
+    /// - Dispatched invocations (already sent to a container via /next, sitting
+    ///   in pending_invocations)
+    ///
     /// Returns the number of invocations that were failed.
     pub async fn fail_init(
         &self,
         function_name: &str,
     ) -> usize {
-        // Drain pending invocations from the queue for this function and fail
-        // them. These are invocations that were queued but not yet dispatched
-        // to a container (the container failed before calling /next).
-        let queue = match self.queues.get(function_name) {
-            Some(q) => q,
-            None => return 0,
+        let init_error = InvocationResult::Error {
+            error_type: "InvalidRuntimeException".into(),
+            error_message: "Runtime failed to initialize".into(),
         };
 
-        let mut rx = queue.lock().await;
         let mut count = 0;
 
-        // Drain all currently queued invocations (non-blocking).
-        while let Ok(inv) = rx.try_recv() {
-            let _ = inv.response_tx.send(InvocationResult::Error {
-                error_type: "InvalidRuntimeException".into(),
-                error_message: "Runtime failed to initialize".into(),
-            });
-            count += 1;
+        // 1. Drain queued invocations (not yet dispatched via /next).
+        if let Some(queue) = self.queues.get(function_name) {
+            let mut rx = queue.lock().await;
+            while let Ok(inv) = rx.try_recv() {
+                let _ = inv.response_tx.send(init_error.clone());
+                count += 1;
+            }
+        }
+
+        // 2. Drain dispatched invocations (already sent via /next, awaiting
+        //    response in pending_invocations).
+        let mut pending = self.pending_invocations.lock().await;
+        let matching_ids: Vec<Uuid> = pending
+            .iter()
+            .filter(|(_, p)| p.function_name == function_name)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in matching_ids {
+            if let Some(p) = pending.remove(&id) {
+                let _ = p.response_tx.send(init_error.clone());
+                count += 1;
+            }
         }
 
         count
@@ -335,7 +359,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4();
-        bridge.store_pending(request_id, tx).await;
+        bridge.store_pending(request_id, "test-func".into(), tx).await;
 
         assert!(bridge.complete_invocation(request_id, "done".into()).await);
         assert_eq!(
@@ -361,7 +385,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4();
-        bridge.store_pending(request_id, tx).await;
+        bridge.store_pending(request_id, "test-func".into(), tx).await;
 
         assert!(bridge
             .fail_invocation(request_id, "RuntimeError".into(), "boom".into())
@@ -408,6 +432,42 @@ mod tests {
         let r2 = rx2.await.unwrap();
         assert!(matches!(r1, InvocationResult::Error { ref error_type, .. } if error_type == "InvalidRuntimeException"));
         assert!(matches!(r2, InvocationResult::Error { ref error_type, .. } if error_type == "InvalidRuntimeException"));
+    }
+
+    #[tokio::test]
+    async fn fail_init_drains_dispatched_pending_invocations() {
+        let (_tx, rx) = mpsc::channel(10);
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let mut receivers = HashMap::new();
+        receivers.insert("test-func".to_string(), rx);
+
+        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+
+        // Simulate two invocations that were already dispatched via /next
+        // and are sitting in pending_invocations.
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        bridge.store_pending(id1, "test-func".into(), tx1).await;
+        bridge.store_pending(id2, "test-func".into(), tx2).await;
+
+        // Also store one for a different function — should NOT be failed.
+        let (tx3, mut rx3) = oneshot::channel();
+        let id3 = Uuid::new_v4();
+        bridge.store_pending(id3, "other-func".into(), tx3).await;
+
+        let count = bridge.fail_init("test-func").await;
+        assert_eq!(count, 2);
+
+        // Both callers for test-func should receive init errors.
+        let r1 = rx1.await.unwrap();
+        let r2 = rx2.await.unwrap();
+        assert!(matches!(r1, InvocationResult::Error { ref error_type, .. } if error_type == "InvalidRuntimeException"));
+        assert!(matches!(r2, InvocationResult::Error { ref error_type, .. } if error_type == "InvalidRuntimeException"));
+
+        // The other-func invocation should still be pending (not failed).
+        assert!(rx3.try_recv().is_err());
     }
 
     #[tokio::test]

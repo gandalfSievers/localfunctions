@@ -162,6 +162,80 @@ impl ContainerRegistry {
         self.containers.read().await.len()
     }
 
+    /// Stop and remove all containers for a given function.
+    ///
+    /// Returns the container IDs that were cleaned up.
+    pub async fn stop_and_remove_by_function(
+        &self,
+        function_name: &str,
+        timeout: Duration,
+    ) -> Vec<String> {
+        let timeout_secs = timeout.as_secs().try_into().unwrap_or(i64::MAX);
+        let mut removed = Vec::new();
+
+        // Collect matching container IDs under a read lock.
+        let ids: Vec<String> = {
+            let map = self.containers.read().await;
+            map.values()
+                .filter(|c| c.function_name == function_name)
+                .map(|c| c.container_id.clone())
+                .collect()
+        };
+
+        if ids.is_empty() {
+            return removed;
+        }
+
+        info!(function = %function_name, count = ids.len(), "stopping containers for failed function");
+
+        let mut handles = Vec::with_capacity(ids.len());
+        for id in ids {
+            let docker = self.docker.clone();
+            let cid = id.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = docker
+                    .stop_container(&cid, Some(StopContainerOptions { t: timeout_secs }))
+                    .await
+                {
+                    if !is_benign_docker_error(&e) {
+                        error!(container_id = %cid, %e, "failed to stop container");
+                    }
+                }
+                if let Err(e) = docker
+                    .remove_container(
+                        &cid,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    if !is_benign_docker_error(&e) {
+                        error!(container_id = %cid, %e, "failed to remove container");
+                    }
+                }
+                cid
+            }));
+        }
+
+        for handle in handles {
+            match handle.await {
+                Ok(cid) => {
+                    // Deregister from tracking
+                    self.containers.write().await.remove(&cid);
+                    info!(container_id = %cid, function = %function_name, "container stopped and removed (init error)");
+                    removed.push(cid);
+                }
+                Err(e) => {
+                    error!(%e, "container cleanup task panicked");
+                }
+            }
+        }
+
+        removed
+    }
+
     /// Stop and remove all tracked containers.
     ///
     /// Each container is given `timeout` to stop gracefully; after that Docker
