@@ -192,16 +192,26 @@ fn function_configuration_json(
     config
 }
 
+/// Build the standard headers for an invoke response.
+fn invoke_base_headers(request_id: Uuid) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert("X-Amz-Request-Id", request_id.to_string().parse().unwrap());
+    h.insert("X-Amz-Executed-Version", "$LATEST".parse().unwrap());
+    h
+}
+
 /// Invoke a Lambda function by name.
 ///
 /// POST /2015-03-31/functions/{name}/invocations
 ///
 /// Supports the following AWS headers:
-/// - `X-Amz-Invocation-Type`: only `RequestResponse` (default) is supported
+/// - `X-Amz-Invocation-Type`: `RequestResponse` (default) or `Event` (async)
 /// - `X-Amz-Log-Type`: passed through to the runtime (not acted on)
 /// - `X-Amz-Client-Context`: passed through to the runtime
 ///
 /// Returns the function response body on success, or an AWS-format error.
+/// For `Event` invocation type, returns 202 Accepted immediately and executes
+/// the function in the background.
 async fn invoke_function(
     State(state): State<AppState>,
     Path(function_name): Path<String>,
@@ -223,18 +233,11 @@ async fn invoke_function_inner(
     body: Bytes,
     request_id: Uuid,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
-    // Build base headers included in every invoke response.
-    let base_headers = || -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("X-Amz-Request-Id", request_id.to_string().parse().unwrap());
-        h.insert("X-Amz-Executed-Version", "$LATEST".parse().unwrap());
-        h
-    };
 
     // Validate function name from the URL path.
     if let Err(e) = validate_function_name(&function_name) {
         let err = ServiceError::InvalidRequestContent(e.to_string());
-        return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
+        return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
     }
 
     // Log payload at DEBUG level only — never at INFO or above.
@@ -249,18 +252,30 @@ async fn invoke_function_inner(
         let err = ServiceError::ServiceException(
             "Service is shutting down, not accepting new invocations".into(),
         );
-        return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
+        return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
     }
 
-    // Check X-Amz-Invocation-Type — only RequestResponse is supported.
-    if let Some(invocation_type) = headers.get("X-Amz-Invocation-Type").and_then(|v| v.to_str().ok()) {
-        if invocation_type != "RequestResponse" {
+    // Check X-Amz-Invocation-Type — RequestResponse (default) and Event are supported.
+    let is_event_invocation = match headers.get("X-Amz-Invocation-Type").and_then(|v| v.to_str().ok()) {
+        Some("RequestResponse") | None => false,
+        Some("Event") => true,
+        Some(other) => {
             let err = ServiceError::InvalidRequestContent(format!(
-                "Unsupported invocation type '{}'. Only 'RequestResponse' is supported.",
-                invocation_type
+                "Unsupported invocation type '{}'. Supported types: RequestResponse, Event.",
+                other
             ));
-            return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
+            return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
         }
+    };
+
+    // For Event invocations, return 202 Accepted immediately and execute in the background.
+    if is_event_invocation {
+        let span = info_span!("async_invocation", %request_id, function = %function_name);
+        tokio::spawn(
+            invoke_async_background(state, function_name, headers, body, request_id)
+                .instrument(span),
+        );
+        return (StatusCode::ACCEPTED, invoke_base_headers(request_id), Vec::new());
     }
 
     // Look up the function in the configuration.
@@ -268,7 +283,7 @@ async fn invoke_function_inner(
         Some(config) => config,
         None => {
             let err = ServiceError::ResourceNotFound(function_name);
-            return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
+            return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
         }
     };
 
@@ -298,7 +313,7 @@ async fn invoke_function_inner(
                 let err = ServiceError::TooManyRequests(
                     "Rate exceeded: max concurrent containers reached".into(),
                 );
-                return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
+                return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
             }
 
             debug!("no warm container available, cold starting");
@@ -310,7 +325,7 @@ async fn invoke_function_inner(
                     let err = ServiceError::ServiceException(e.to_string());
                     return (
                         err.status_code(),
-                        base_headers(),
+                        invoke_base_headers(request_id),
                         err.to_aws_response().to_json_bytes(),
                     );
                 }
@@ -358,12 +373,12 @@ async fn invoke_function_inner(
                 BootstrapOutcome::Ready => cold_id,
                 BootstrapOutcome::Exited(exit_code) => {
                     return bootstrap_failure_response(
-                        &state, &cold_id, &function_name, false, exit_code, base_headers(),
+                        &state, &cold_id, &function_name, false, exit_code, invoke_base_headers(request_id),
                     ).await;
                 }
                 BootstrapOutcome::Timeout => {
                     return bootstrap_failure_response(
-                        &state, &cold_id, &function_name, true, None, base_headers(),
+                        &state, &cold_id, &function_name, true, None, invoke_base_headers(request_id),
                     ).await;
                 }
             }
@@ -390,7 +405,7 @@ async fn invoke_function_inner(
             let err = ServiceError::ServiceException(e.to_string());
             return (
                 StatusCode::BAD_GATEWAY,
-                base_headers(),
+                invoke_base_headers(request_id),
                 err.to_aws_response().to_json_bytes(),
             );
         }
@@ -411,7 +426,7 @@ async fn invoke_function_inner(
                         limit = SYNC_RESPONSE_MAX_BYTES,
                         "response payload size exceeded limit"
                     );
-                    let mut resp_headers = base_headers();
+                    let mut resp_headers = invoke_base_headers(request_id);
                     resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
                     let error_body = serde_json::json!({
                         "errorType": "ResponseSizeTooLarge",
@@ -428,7 +443,7 @@ async fn invoke_function_inner(
                     );
                 }
                 info!("invocation succeeded");
-                (StatusCode::OK, base_headers(), body_bytes)
+                (StatusCode::OK, invoke_base_headers(request_id), body_bytes)
             }
             crate::types::InvocationResult::Error {
                 error_type,
@@ -439,7 +454,7 @@ async fn invoke_function_inner(
                     error_message = %error_message,
                     "function returned error"
                 );
-                let mut resp_headers = base_headers();
+                let mut resp_headers = invoke_base_headers(request_id);
                 resp_headers.insert("X-Amz-Function-Error", "Handled".parse().unwrap());
                 let error_body = serde_json::json!({
                     "errorType": error_type,
@@ -453,7 +468,7 @@ async fn invoke_function_inner(
                 // tokio::time::timeout Err(_) branch below which fires when
                 // the invoke handler's own deadline expires).
                 warn!("function reported timeout via runtime bridge");
-                let mut resp_headers = base_headers();
+                let mut resp_headers = invoke_base_headers(request_id);
                 resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
                 let error_body = serde_json::json!({
                     "errorMessage": format!("Task timed out after {} seconds", timeout_secs),
@@ -479,7 +494,7 @@ async fn invoke_function_inner(
             );
             (
                 StatusCode::BAD_GATEWAY,
-                base_headers(),
+                invoke_base_headers(request_id),
                 err.to_aws_response().to_json_bytes(),
             )
         }
@@ -501,7 +516,7 @@ async fn invoke_function_inner(
                 let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
             });
 
-            let mut resp_headers = base_headers();
+            let mut resp_headers = invoke_base_headers(request_id);
             resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
             let error_body = serde_json::json!({
                 "errorMessage": format!("Task timed out after {} seconds", timeout_secs),
@@ -509,6 +524,34 @@ async fn invoke_function_inner(
             (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
         }
     }
+}
+
+/// Execute an invocation in the background for Event-type invocations.
+///
+/// Runs the full synchronous invocation path; errors are logged but not
+/// returned to any caller. Timeout enforcement and container cleanup still
+/// apply through the normal invoke path.
+fn invoke_async_background(
+    state: AppState,
+    function_name: String,
+    mut headers: HeaderMap,
+    body: Bytes,
+    request_id: Uuid,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        // Swap the invocation type so the inner handler runs the synchronous path.
+        headers.insert("X-Amz-Invocation-Type", "RequestResponse".parse().unwrap());
+        let (status, _headers, _body) =
+            invoke_function_inner(state, function_name, headers, body, request_id).await;
+        match status {
+            StatusCode::OK => {
+                info!("async invocation completed successfully");
+            }
+            status => {
+                warn!(%status, "async invocation completed with error");
+            }
+        }
+    })
 }
 
 /// Build an error response for a bootstrap failure (container exited before
@@ -2164,7 +2207,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::post("/2015-03-31/functions/my-func/invocations")
-                    .header("X-Amz-Invocation-Type", "Event")
+                    .header("X-Amz-Invocation-Type", "DryRun")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -2177,6 +2220,64 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["Type"], "InvalidRequestContentException");
+    }
+
+    #[tokio::test]
+    async fn invoke_event_type_returns_202_immediately() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        // Spawn a background handler to process the async invocation so it
+        // doesn't hang after the test completes.
+        tokio::spawn(async move {
+            if let Some(inv) = runtime_bridge.next_invocation("my-func").await {
+                runtime_bridge
+                    .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                    .await;
+                let _ = runtime_bridge
+                    .complete_invocation(inv.request_id, "ok".into())
+                    .await;
+            }
+        });
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "Event")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invoke_event_type_errors_are_logged_not_returned() {
+        // Event invocation for a non-existent function should still return 202
+        // immediately — the error is only logged in the background.
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/nonexistent/invocations")
+                    .header("X-Amz-Invocation-Type", "Event")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 202 even though the function doesn't exist — the error
+        // is handled asynchronously.
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
