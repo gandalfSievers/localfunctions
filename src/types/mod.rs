@@ -87,6 +87,7 @@ pub enum ContainerState {
     Idle,
     Busy,
     Stopping,
+    Failed,
 }
 
 /// A running container that can serve invocations.
@@ -288,6 +289,7 @@ mod tests {
             (ContainerState::Idle, "\"idle\""),
             (ContainerState::Busy, "\"busy\""),
             (ContainerState::Stopping, "\"stopping\""),
+            (ContainerState::Failed, "\"failed\""),
         ] {
             let json = serde_json::to_string(&state).unwrap();
             assert_eq!(json, expected);

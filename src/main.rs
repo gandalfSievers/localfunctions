@@ -16,7 +16,7 @@ use bollard::Docker;
 use futures_util::TryStreamExt;
 use tracing::{error, info, warn};
 
-use container::{ContainerManager, ContainerRegistry, DockerNetwork};
+use container::{ContainerManager, ContainerRegistry, DockerNetwork, monitor_container_events};
 use runtime::RuntimeBridge;
 use server::AppState;
 
@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let reaper_shutdown_rx = shutdown_rx.clone();
+    let event_monitor_shutdown_rx = shutdown_rx.clone();
     let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_senders, invocation_receivers, shutdown_rx));
 
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout);
@@ -140,6 +141,25 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        });
+    }
+
+    // Spawn Docker event monitor for container crash detection.
+    {
+        let event_docker = state.docker.clone();
+        let event_manager = container_manager.clone();
+        let event_registry = container_registry.clone();
+        let event_bridge = state.runtime_bridge.clone();
+        let event_shutdown_rx = event_monitor_shutdown_rx;
+        tokio::spawn(async move {
+            monitor_container_events(
+                event_docker,
+                event_manager,
+                event_registry,
+                event_bridge,
+                event_shutdown_rx,
+            )
+            .await;
         });
     }
 

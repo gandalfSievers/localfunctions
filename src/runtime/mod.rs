@@ -265,6 +265,37 @@ impl RuntimeBridge {
         }
     }
 
+    /// Fail all pending invocations assigned to a specific container.
+    ///
+    /// Used when a container crashes (detected via Docker event stream). Only
+    /// affects invocations that were dispatched to this container (i.e. already
+    /// sent via `/next` and sitting in `pending_invocations`).
+    ///
+    /// Returns the number of invocations that were failed.
+    pub async fn fail_container_invocations(&self, container_id: &str) -> usize {
+        let crash_error = InvocationResult::Error {
+            error_type: "ServiceException".into(),
+            error_message: format!("Container {} crashed unexpectedly", container_id),
+        };
+
+        let mut pending = self.pending_invocations.lock().await;
+        let matching_ids: Vec<Uuid> = pending
+            .iter()
+            .filter(|(_, p)| p.container_id.as_deref() == Some(container_id))
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut count = 0;
+        for id in matching_ids {
+            if let Some(p) = pending.remove(&id) {
+                let _ = p.response_tx.send(crash_error.clone());
+                count += 1;
+            }
+        }
+
+        count
+    }
+
     /// Fail all pending invocations for a given function with an init error.
     /// Used when the runtime fails to initialize.
     ///
@@ -723,5 +754,83 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "signal should not fire without mark_ready");
+    }
+
+    // -- fail_container_invocations ------------------------------------------
+
+    #[tokio::test]
+    async fn fail_container_invocations_fails_matching() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        bridge
+            .store_pending(id1, "test-func".into(), Some("ctr-crash".into()), tx1)
+            .await;
+        bridge
+            .store_pending(id2, "test-func".into(), Some("ctr-crash".into()), tx2)
+            .await;
+
+        let count = bridge.fail_container_invocations("ctr-crash").await;
+        assert_eq!(count, 2);
+
+        let r1 = rx1.await.unwrap();
+        let r2 = rx2.await.unwrap();
+        assert!(matches!(r1, InvocationResult::Error { ref error_type, .. } if error_type == "ServiceException"));
+        assert!(matches!(r2, InvocationResult::Error { ref error_type, .. } if error_type == "ServiceException"));
+    }
+
+    #[tokio::test]
+    async fn fail_container_invocations_does_not_affect_other_containers() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, mut rx2) = oneshot::channel();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        bridge
+            .store_pending(id1, "test-func".into(), Some("ctr-crash".into()), tx1)
+            .await;
+        bridge
+            .store_pending(id2, "test-func".into(), Some("ctr-healthy".into()), tx2)
+            .await;
+
+        let count = bridge.fail_container_invocations("ctr-crash").await;
+        assert_eq!(count, 1);
+
+        // The healthy container's invocation should still be pending
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn fail_container_invocations_returns_zero_for_unknown() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let count = bridge.fail_container_invocations("nonexistent").await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn fail_container_invocations_skips_invocations_without_container_id() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx, mut rx) = oneshot::channel();
+        let id = Uuid::new_v4();
+        // Store pending without container_id
+        bridge
+            .store_pending(id, "test-func".into(), None, tx)
+            .await;
+
+        let count = bridge.fail_container_invocations("ctr-crash").await;
+        assert_eq!(count, 0);
+
+        // Invocation should still be pending
+        assert!(rx.try_recv().is_err());
     }
 }

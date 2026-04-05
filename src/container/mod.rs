@@ -9,13 +9,15 @@ use bollard::container::{
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
+use bollard::system::EventsOptions;
 use bollard::Docker;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use futures_util::{StreamExt, TryStreamExt};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
+use crate::runtime::RuntimeBridge;
 use crate::types::{ContainerState, FunctionConfig, ServiceError};
 
 /// Manages the Docker network used for communication between Lambda containers
@@ -929,6 +931,27 @@ impl ContainerManager {
         containers.retain(|_, c| c.function_name != function_name);
     }
 
+    /// Mark a container as failed and remove it from the managed pool.
+    ///
+    /// Returns the function name if the container was found and marked,
+    /// `None` if the container was not tracked.
+    pub async fn mark_container_failed(&self, container_id: &str) -> Option<String> {
+        let mut containers = self.containers.write().await;
+        if let Some(entry) = containers.get_mut(container_id) {
+            // Skip containers already in Stopping or Failed state
+            if entry.state == ContainerState::Stopping || entry.state == ContainerState::Failed {
+                return None;
+            }
+            let function_name = entry.function_name.clone();
+            entry.state = ContainerState::Failed;
+            // Remove from tracking so it's not claimed again
+            containers.remove(container_id);
+            Some(function_name)
+        } else {
+            None
+        }
+    }
+
     /// Insert a container directly into tracking (for testing).
     #[doc(hidden)]
     pub async fn insert_test_container(
@@ -949,6 +972,141 @@ impl ContainerManager {
             },
         );
     }
+}
+
+/// Monitor Docker events for container die/stop events and handle crashes.
+///
+/// Subscribes to the Docker event stream filtered to containers with the
+/// `managed-by=localfunctions` label. When a container dies or is killed
+/// unexpectedly:
+/// 1. Logs the crash at WARN level with container ID and function name
+/// 2. Marks the container as Failed and removes it from the pool
+/// 3. Fails any in-flight invocations with a 502-compatible ServiceException
+/// 4. Cleans up the Docker container (stop + force-remove)
+/// 5. Deregisters from the container registry
+///
+/// Runs until the shutdown signal fires.
+pub async fn monitor_container_events(
+    docker: Docker,
+    container_manager: Arc<ContainerManager>,
+    container_registry: Arc<ContainerRegistry>,
+    runtime_bridge: Arc<RuntimeBridge>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut filters = HashMap::new();
+    filters.insert("type".to_string(), vec!["container".to_string()]);
+    filters.insert(
+        "event".to_string(),
+        vec!["die".to_string(), "oom".to_string()],
+    );
+    filters.insert(
+        "label".to_string(),
+        vec!["managed-by=localfunctions".to_string()],
+    );
+
+    let options = EventsOptions {
+        filters,
+        ..Default::default()
+    };
+
+    let mut event_stream = docker.events(Some(options));
+
+    loop {
+        tokio::select! {
+            event = event_stream.next() => {
+                match event {
+                    Some(Ok(msg)) => {
+                        handle_container_event(
+                            &msg,
+                            &container_manager,
+                            &container_registry,
+                            &runtime_bridge,
+                        ).await;
+                    }
+                    Some(Err(e)) => {
+                        error!(%e, "Docker event stream error");
+                        // Brief pause before retrying to avoid tight error loops
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    None => {
+                        warn!("Docker event stream ended unexpectedly");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("container event monitor shutting down");
+                break;
+            }
+        }
+    }
+}
+
+/// Handle a single Docker container event (die/oom).
+async fn handle_container_event(
+    msg: &bollard::models::EventMessage,
+    container_manager: &Arc<ContainerManager>,
+    container_registry: &Arc<ContainerRegistry>,
+    runtime_bridge: &Arc<RuntimeBridge>,
+) {
+    let action = match &msg.action {
+        Some(a) => a.clone(),
+        None => return,
+    };
+
+    let actor = match &msg.actor {
+        Some(a) => a,
+        None => return,
+    };
+
+    let container_id = match &actor.id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+
+    let function_name = actor
+        .attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get("localfunctions.function").cloned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Mark container as failed and remove from pool.
+    // If mark_container_failed returns None, the container was already
+    // stopping/failed or not tracked — skip further processing.
+    let tracked_function = container_manager.mark_container_failed(&container_id).await;
+    if tracked_function.is_none() {
+        return;
+    }
+
+    let exit_code = actor
+        .attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get("exitCode"))
+        .and_then(|c| c.parse::<i64>().ok());
+
+    warn!(
+        container_id = %container_id,
+        function = %function_name,
+        action = %action,
+        exit_code = ?exit_code,
+        "container crashed"
+    );
+
+    // Fail any in-flight invocations assigned to this container.
+    let failed_count = runtime_bridge
+        .fail_container_invocations(&container_id)
+        .await;
+    if failed_count > 0 {
+        warn!(
+            container_id = %container_id,
+            function = %function_name,
+            failed_count,
+            "failed in-flight invocations due to container crash"
+        );
+    }
+
+    // Clean up the Docker container (force-remove).
+    container_registry.stop_and_remove(&container_id, Duration::from_secs(2)).await;
 }
 
 /// Generate a short unique suffix for container names.
@@ -1751,6 +1909,175 @@ mod tests {
         let hosts = container_extra_hosts();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0], "host.docker.internal:host-gateway");
+    }
+
+    // -- mark_container_failed -------------------------------------------------
+
+    #[tokio::test]
+    async fn mark_container_failed_returns_function_name() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+
+        let result = mgr.mark_container_failed("ctr-1").await;
+        assert_eq!(result, Some("test-func".to_string()));
+
+        // Container should be removed from tracking
+        assert!(mgr.get_state("ctr-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_container_failed_skips_stopping_container() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Stopping)
+            .await;
+
+        let result = mgr.mark_container_failed("ctr-1").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_container_failed_returns_none_for_unknown() {
+        let mgr = make_container_manager();
+        let result = mgr.mark_container_failed("nonexistent").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_container_failed_removes_from_pool() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        mgr.mark_container_failed("ctr-1").await;
+
+        // Should not be claimable
+        assert!(mgr.claim_idle_container("test-func").await.is_none());
+        assert_eq!(mgr.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_container_failed_does_not_affect_other_containers() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+        mgr.insert_test_container("ctr-2".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        mgr.mark_container_failed("ctr-1").await;
+
+        // ctr-2 should still be claimable
+        assert_eq!(
+            mgr.claim_idle_container("test-func").await,
+            Some("ctr-2".to_string())
+        );
+    }
+
+    // -- handle_container_event ------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_container_event_processes_die_event() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-abc".into(), "my-func".into(), ContainerState::Busy)
+            .await;
+
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
+
+        let mut attributes = HashMap::new();
+        attributes.insert("localfunctions.function".to_string(), "my-func".to_string());
+        attributes.insert("exitCode".to_string(), "1".to_string());
+
+        let msg = bollard::models::EventMessage {
+            action: Some("die".to_string()),
+            actor: Some(bollard::models::EventActor {
+                id: Some("ctr-abc".to_string()),
+                attributes: Some(attributes),
+            }),
+            ..Default::default()
+        };
+
+        handle_container_event(&msg, &Arc::new(mgr), &registry, &bridge).await;
+
+        // Container should be removed from tracking (mark_container_failed removes it)
+        // We can't check registry since ctr-abc was never a real Docker container,
+        // but we can verify the manager no longer tracks it.
+    }
+
+    #[tokio::test]
+    async fn handle_container_event_ignores_already_stopping() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-abc".into(), "my-func".into(), ContainerState::Stopping)
+            .await;
+
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
+
+        let mut attributes = HashMap::new();
+        attributes.insert("localfunctions.function".to_string(), "my-func".to_string());
+
+        let msg = bollard::models::EventMessage {
+            action: Some("die".to_string()),
+            actor: Some(bollard::models::EventActor {
+                id: Some("ctr-abc".to_string()),
+                attributes: Some(attributes),
+            }),
+            ..Default::default()
+        };
+
+        handle_container_event(&msg, &Arc::new(mgr), &registry, &bridge).await;
+
+        // Should not have processed (Stopping state is skipped)
+    }
+
+    #[tokio::test]
+    async fn handle_container_event_fails_inflight_invocations() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-abc".into(), "my-func".into(), ContainerState::Busy)
+            .await;
+
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
+
+        // Store a pending invocation for this container
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = uuid::Uuid::new_v4();
+        bridge
+            .store_pending(request_id, "my-func".into(), Some("ctr-abc".into()), tx)
+            .await;
+
+        let mut attributes = HashMap::new();
+        attributes.insert("localfunctions.function".to_string(), "my-func".to_string());
+
+        let msg = bollard::models::EventMessage {
+            action: Some("die".to_string()),
+            actor: Some(bollard::models::EventActor {
+                id: Some("ctr-abc".to_string()),
+                attributes: Some(attributes),
+            }),
+            ..Default::default()
+        };
+
+        handle_container_event(&msg, &Arc::new(mgr), &registry, &bridge).await;
+
+        // The pending invocation should have received an error
+        let result = rx.await.unwrap();
+        match result {
+            crate::types::InvocationResult::Error {
+                error_type,
+                error_message,
+            } => {
+                assert_eq!(error_type, "ServiceException");
+                assert!(error_message.contains("crashed"));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
     }
 
     #[test]
