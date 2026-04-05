@@ -135,4 +135,35 @@ mod tests {
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_HOST");
     }
+
+    #[test]
+    #[serial]
+    fn test_invalid_value_error_is_descriptive() {
+        std::env::set_var("LOCAL_LAMBDA_PORT", "abc");
+        let err = Config::from_env().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LOCAL_LAMBDA_PORT"), "error should name the variable");
+        assert!(msg.contains("abc") || msg.contains("invalid"), "error should describe the problem");
+        std::env::remove_var("LOCAL_LAMBDA_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_overrides_dotenv() {
+        // dotenvy merges .env into the environment without overwriting existing vars.
+        // Verify that a pre-set env var is preserved after from_env().
+        std::env::set_var("LOCAL_LAMBDA_PORT", "7777");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.port, 7777);
+        std::env::remove_var("LOCAL_LAMBDA_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_invalid_shutdown_timeout() {
+        std::env::set_var("LOCAL_LAMBDA_SHUTDOWN_TIMEOUT", "-5");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_SHUTDOWN_TIMEOUT");
+    }
 }
