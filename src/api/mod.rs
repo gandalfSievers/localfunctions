@@ -3,6 +3,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -91,6 +92,39 @@ fn validate_qualifier(qualifier: &Option<String>, function_name: &str) -> Result
         ))),
     }
 }
+
+/// Maximum size of the decoded client context in bytes (AWS limit).
+const CLIENT_CONTEXT_MAX_BYTES: usize = 3_583;
+
+/// Validate the `X-Amz-Client-Context` header value.
+///
+/// The value must be valid base64, decode to valid JSON, and the decoded
+/// payload must not exceed 3,583 bytes (AWS limit).
+fn validate_client_context(value: &str) -> Result<(), ServiceError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|e| {
+            ServiceError::InvalidRequestContent(format!(
+                "Could not base64 decode client context: {e}"
+            ))
+        })?;
+
+    if decoded.len() > CLIENT_CONTEXT_MAX_BYTES {
+        return Err(ServiceError::InvalidRequestContent(format!(
+            "Client context must be no more than {CLIENT_CONTEXT_MAX_BYTES} bytes when decoded, got {} bytes",
+            decoded.len()
+        )));
+    }
+
+    serde_json::from_slice::<serde_json::Value>(&decoded).map_err(|e| {
+        ServiceError::InvalidRequestContent(format!(
+            "Client context must be valid JSON when decoded: {e}"
+        ))
+    })?;
+
+    Ok(())
+}
+
 use crate::types::{ContainerState, ServiceError};
 
 #[derive(Debug, Serialize)]
@@ -398,6 +432,10 @@ async fn invoke_function_inner(
             return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
         }
 
+        // Strip client context — it is not forwarded for Event invocations.
+        let mut headers = headers;
+        headers.remove("X-Amz-Client-Context");
+
         let span = info_span!("async_invocation", %request_id, function = %function_name);
         tokio::spawn(
             invoke_async_background(state, function_name, headers, body, request_id)
@@ -445,11 +483,22 @@ async fn invoke_function_inner(
 
     let timeout_secs = function_config.timeout;
 
-    // Extract pass-through headers.
-    let client_context = headers
-        .get("X-Amz-Client-Context")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    // Extract and validate the client context header.
+    // Client context is only forwarded for synchronous (RequestResponse) invocations.
+    let client_context = if is_event_invocation {
+        None
+    } else if let Some(raw) = headers.get("X-Amz-Client-Context").and_then(|v| v.to_str().ok()) {
+        if let Err(err) = validate_client_context(raw) {
+            return (
+                err.status_code(),
+                invoke_base_headers(request_id),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+        Some(raw.to_string())
+    } else {
+        None
+    };
 
     // Propagate an incoming trace header, or generate a fresh one.
     let trace_id = headers
@@ -2694,6 +2743,114 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let ctx = handle.await.unwrap();
         assert_eq!(ctx, Some("eyJ0ZXN0IjogdHJ1ZX0=".to_string()));
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_invalid_base64_client_context() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Client-Context", "not-valid-base64!!!")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(body["Message"].as_str().unwrap().contains("base64"));
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_non_json_client_context() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+
+        // Base64-encode "not json" → valid base64 but invalid JSON
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"not json");
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Client-Context", &encoded)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(body["Message"].as_str().unwrap().contains("valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_oversized_client_context() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+
+        // Create a JSON payload that exceeds 3,583 bytes when decoded.
+        let big_json = format!("{{\"data\":\"{}\"}}", "x".repeat(3_584));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(big_json.as_bytes());
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Client-Context", &encoded)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(body["Message"].as_str().unwrap().contains("3583"));
+    }
+
+    #[tokio::test]
+    async fn invoke_event_type_ignores_client_context() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let bridge = runtime_bridge.clone();
+        let handle = tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            let ctx = inv.client_context.clone();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), None, inv.response_tx)
+                .await;
+            bridge
+                .complete_invocation(inv.request_id, "ok".into())
+                .await;
+            ctx
+        });
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "Event")
+                    .header("X-Amz-Client-Context", "eyJ0ZXN0IjogdHJ1ZX0=")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Event invocations return 202 immediately.
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // The client context should be None for event invocations.
+        let ctx = handle.await.unwrap();
+        assert_eq!(ctx, None);
     }
 
     #[tokio::test]
