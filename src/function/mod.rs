@@ -74,6 +74,9 @@ pub enum FunctionConfigError {
     #[error("function '{name}': environment variables total size {actual_size} bytes exceeds the 4096-byte limit")]
     EnvironmentTooLarge { name: String, actual_size: usize },
 
+    #[error("function '{name}': invalid architecture '{value}' — must be 'x86_64' or 'arm64'")]
+    InvalidArchitecture { name: String, value: String },
+
     #[error("configuration validation failed with {count} error(s):\n{details}")]
     ValidationErrors { count: usize, details: String },
 }
@@ -102,6 +105,7 @@ struct RawFunctionEntry {
     image: Option<String>,
     image_uri: Option<String>,
     reserved_concurrent_executions: Option<u64>,
+    architecture: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +287,12 @@ pub fn parse_functions_config(
             }
         }
 
+        // Validate architecture
+        let architecture = entry.architecture.clone().unwrap_or_else(|| "x86_64".to_string());
+        if let Err(e) = validate_architecture(name, &architecture) {
+            errors.push(e);
+        }
+
         // Validate environment variable keys
         for key in entry.environment.keys() {
             if let Err(e) = validate_env_key(name, key) {
@@ -309,6 +319,7 @@ pub fn parse_functions_config(
             image: entry.image.clone(),
             image_uri: entry.image_uri.clone(),
             reserved_concurrent_executions: entry.reserved_concurrent_executions,
+            architecture,
         };
 
         functions.insert(name.clone(), config);
@@ -606,6 +617,19 @@ fn validate_memory_size(name: &str, memory_size: u64) -> Result<(), FunctionConf
         return Err(FunctionConfigError::InvalidMemorySize {
             name: name.to_string(),
             value: memory_size,
+        });
+    }
+    Ok(())
+}
+
+/// Valid architecture values for Lambda functions.
+const VALID_ARCHITECTURES: &[&str] = &["x86_64", "arm64"];
+
+fn validate_architecture(name: &str, architecture: &str) -> Result<(), FunctionConfigError> {
+    if !VALID_ARCHITECTURES.contains(&architecture) {
+        return Err(FunctionConfigError::InvalidArchitecture {
+            name: name.to_string(),
+            value: architecture.to_string(),
         });
     }
     Ok(())
@@ -1852,5 +1876,94 @@ mod tests {
             let result = parse_functions_config(&json, dir.path());
             assert!(result.is_ok(), "runtime '{}' should be accepted, got: {:?}", rt, result.err());
         }
+    }
+
+    // -- architecture --------------------------------------------------------
+
+    #[test]
+    fn architecture_defaults_to_x86_64() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].architecture, "x86_64");
+    }
+
+    #[test]
+    fn architecture_arm64_accepted() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "architecture": "arm64"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].architecture, "arm64");
+    }
+
+    #[test]
+    fn architecture_x86_64_accepted() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "architecture": "x86_64"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].architecture, "x86_64");
+    }
+
+    #[test]
+    fn architecture_invalid_rejected() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "architecture": "mips"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid architecture"), "error: {msg}");
+        assert!(msg.contains("mips"), "error: {msg}");
+    }
+
+    #[test]
+    fn architecture_empty_string_rejected() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "architecture": ""
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid architecture"), "error: {msg}");
     }
 }

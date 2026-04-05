@@ -1246,6 +1246,7 @@ mod tests {
                 image: None,
                 image_uri: None,
                 reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
             },
         );
         functions_map.insert(
@@ -1262,6 +1263,7 @@ mod tests {
                 image: None,
                 image_uri: Some("my-image:latest".into()),
                 reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
             },
         );
         let functions = FunctionsConfig {
@@ -2103,6 +2105,7 @@ mod tests {
                 image: None,
                 image_uri: None,
                 reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
             },
         );
         let functions = FunctionsConfig {
@@ -2799,6 +2802,7 @@ mod tests {
                 image: None,
                 image_uri: None,
                 reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
             },
         );
         let functions = FunctionsConfig {

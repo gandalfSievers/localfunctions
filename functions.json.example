@@ -19,6 +19,15 @@
       "memory_size": 128,
       "environment": {}
     },
+    "my-arm64-func": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./functions/my-arm64-func",
+      "timeout": 30,
+      "memory_size": 128,
+      "architecture": "arm64",
+      "environment": {}
+    },
     "my-func-with-local-services": {
       "runtime": "python3.12",
       "handler": "main.handler",

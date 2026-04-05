@@ -41,6 +41,10 @@ pub struct FunctionConfig {
     /// global `max_containers` limit applies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved_concurrent_executions: Option<u64>,
+    /// Target CPU architecture for the function container.
+    /// Valid values: `x86_64` (default) or `arm64`.
+    #[serde(default = "default_architecture")]
+    pub architecture: String,
 }
 
 #[allow(dead_code)]
@@ -56,6 +60,11 @@ fn default_memory_size() -> u64 {
 #[allow(dead_code)]
 fn default_ephemeral_storage_mb() -> u64 {
     512
+}
+
+#[allow(dead_code)]
+fn default_architecture() -> String {
+    "x86_64".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +233,7 @@ mod tests {
             image: Some("custom:latest".into()),
             image_uri: None,
             reserved_concurrent_executions: None,
+            architecture: "arm64".into(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -239,6 +249,7 @@ mod tests {
         assert_eq!(deserialized.environment.get("KEY").unwrap(), "value");
         assert_eq!(deserialized.image, Some("custom:latest".into()));
         assert_eq!(deserialized.image_uri, None);
+        assert_eq!(deserialized.architecture, "arm64");
     }
 
     #[test]
@@ -258,6 +269,7 @@ mod tests {
         assert!(config.image.is_none());
         assert!(config.image_uri.is_none());
         assert!(config.reserved_concurrent_executions.is_none());
+        assert_eq!(config.architecture, "x86_64");
     }
 
     #[test]
@@ -274,6 +286,7 @@ mod tests {
             image: None,
             image_uri: None,
             reserved_concurrent_executions: None,
+            architecture: "x86_64".into(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -296,6 +309,7 @@ mod tests {
             image: None,
             image_uri: Some("my-lambda:latest".into()),
             reserved_concurrent_executions: None,
+            architecture: "x86_64".into(),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("image_uri"));

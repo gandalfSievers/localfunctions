@@ -67,6 +67,7 @@ async fn build_e2e_state(
                 image: None,
                 image_uri: None,
                 reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
             },
         );
         let (tx, rx) = tokio::sync::mpsc::channel(10);

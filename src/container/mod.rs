@@ -597,7 +597,9 @@ impl ContainerManager {
     /// Pull a Docker image if it is not already present locally.
     ///
     /// This is a lazy pull: if the image already exists, this is a no-op.
-    pub async fn ensure_image(&self, image: &str) -> Result<(), ServiceError> {
+    /// When `platform` is provided (e.g. `"linux/arm64"`), the pull request
+    /// includes it so the correct architecture variant is fetched.
+    pub async fn ensure_image(&self, image: &str, platform: Option<&str>) -> Result<(), ServiceError> {
         // Check if image exists locally
         match self.docker.inspect_image(image).await {
             Ok(_) => {
@@ -621,6 +623,7 @@ impl ContainerManager {
 
         let opts = CreateImageOptions {
             from_image: image,
+            platform: platform.unwrap_or_default(),
             ..Default::default()
         };
 
@@ -653,8 +656,14 @@ impl ContainerManager {
     ) -> Result<String, ServiceError> {
         let image = self.resolve_image(function)?;
 
-        // Lazy pull
-        self.ensure_image(&image).await?;
+        // Resolve target platform from the function's architecture setting
+        let platform = match function.architecture.as_str() {
+            "arm64" => "linux/arm64",
+            _ => "linux/amd64",
+        };
+
+        // Lazy pull (with platform for multi-arch manifests)
+        self.ensure_image(&image, Some(platform)).await?;
 
         // Build environment variables (with optional host credential forwarding)
         let env = lambda_env_vars(
@@ -744,7 +753,7 @@ impl ContainerManager {
 
         let create_opts = CreateContainerOptions {
             name: container_name.as_str(),
-            platform: None,
+            platform: Some(platform),
         };
 
         let response = self
@@ -1451,6 +1460,7 @@ mod tests {
             image: None,
             image_uri: None,
             reserved_concurrent_executions: None,
+            architecture: "x86_64".into(),
         }
     }
 
@@ -2732,6 +2742,7 @@ mod integration_tests {
             image: None,
             image_uri: None,
             reserved_concurrent_executions: None,
+            architecture: "x86_64".into(),
         };
 
         // Create and start
@@ -2819,7 +2830,7 @@ mod integration_tests {
 
         // Use a small, commonly available image
         // This test verifies that ensure_image does not fail for a valid image
-        mgr.ensure_image("public.ecr.aws/lambda/python:3.12")
+        mgr.ensure_image("public.ecr.aws/lambda/python:3.12", None)
             .await
             .unwrap();
     }
