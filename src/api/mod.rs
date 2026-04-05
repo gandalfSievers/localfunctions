@@ -66,16 +66,26 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(response))
 }
 
-/// Invoke a Lambda function by name (stub — will be wired to ContainerManager).
+/// Invoke a Lambda function by name.
+///
+/// POST /2015-03-31/functions/{name}/invocations
+///
+/// Supports the following AWS headers:
+/// - `X-Amz-Invocation-Type`: only `RequestResponse` (default) is supported
+/// - `X-Amz-Log-Type`: passed through to the runtime (not acted on)
+/// - `X-Amz-Client-Context`: passed through to the runtime
+///
+/// Returns the function response body on success, or an AWS-format error.
 async fn invoke_function(
     State(state): State<AppState>,
     Path(function_name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     // Validate function name from the URL path.
     if let Err(e) = validate_function_name(&function_name) {
         let err = ServiceError::InvalidRequestContent(e.to_string());
-        return (err.status_code(), Json(err.to_aws_response()));
+        return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
     }
 
     // Log payload at DEBUG level only — never at INFO or above.
@@ -91,14 +101,130 @@ async fn invoke_function(
         let err = ServiceError::ServiceException(
             "Service is shutting down, not accepting new invocations".into(),
         );
-        return (err.status_code(), Json(err.to_aws_response()));
+        return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
     }
 
-    let err = ServiceError::ServiceException(format!(
-        "Function invocation not yet implemented for '{}'",
-        function_name
-    ));
-    (err.status_code(), Json(err.to_aws_response()))
+    // Check X-Amz-Invocation-Type — only RequestResponse is supported.
+    if let Some(invocation_type) = headers.get("X-Amz-Invocation-Type").and_then(|v| v.to_str().ok()) {
+        if invocation_type != "RequestResponse" {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Unsupported invocation type '{}'. Only 'RequestResponse' is supported.",
+                invocation_type
+            ));
+            return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+        }
+    }
+
+    // Look up the function in the configuration.
+    let function_config = match state.functions.functions.get(&function_name) {
+        Some(config) => config,
+        None => {
+            let err = ServiceError::ResourceNotFound(function_name);
+            return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
+        }
+    };
+
+    let timeout_secs = function_config.timeout;
+
+    // Extract pass-through headers.
+    let client_context = headers
+        .get("X-Amz-Client-Context")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    // Compute the deadline from the function's configured timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    info!(
+        function = %function_name,
+        payload_size = body.len(),
+        timeout_secs,
+        "invoking function"
+    );
+
+    // Submit the invocation to the runtime bridge.
+    let (request_id, response_rx) = match state
+        .runtime_bridge
+        .submit_invocation(&function_name, body, deadline, None, client_context)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // If submit fails (e.g. channel closed), return 502.
+            let err = ServiceError::ServiceException(e.to_string());
+            return (
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+    };
+
+    // Wait for the response with the configured timeout.
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), response_rx).await;
+
+    match result {
+        Ok(Ok(invocation_result)) => match invocation_result {
+            crate::types::InvocationResult::Success { body } => {
+                info!(function = %function_name, request_id = %request_id, "invocation succeeded");
+                (StatusCode::OK, HeaderMap::new(), body.into_bytes())
+            }
+            crate::types::InvocationResult::Error {
+                error_type,
+                error_message,
+            } => {
+                warn!(
+                    function = %function_name,
+                    request_id = %request_id,
+                    error_type = %error_type,
+                    error_message = %error_message,
+                    "function returned error"
+                );
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
+                let error_body = serde_json::json!({
+                    "errorType": error_type,
+                    "errorMessage": error_message,
+                });
+                (StatusCode::OK, resp_headers, serde_json::to_vec(&error_body).unwrap())
+            }
+            crate::types::InvocationResult::Timeout => {
+                warn!(function = %function_name, request_id = %request_id, "function timed out");
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
+                let error_body = serde_json::json!({
+                    "errorMessage": format!("Task timed out after {} seconds", timeout_secs),
+                });
+                (StatusCode::REQUEST_TIMEOUT, resp_headers, serde_json::to_vec(&error_body).unwrap())
+            }
+        },
+        Ok(Err(_)) => {
+            // The response channel was dropped — container likely crashed.
+            let err = ServiceError::ServiceException(
+                "Container exited without responding".into(),
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            )
+        }
+        Err(_) => {
+            // Timeout waiting for response.
+            warn!(
+                function = %function_name,
+                request_id = %request_id,
+                timeout_secs,
+                "invocation timed out"
+            );
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
+            let error_body = serde_json::json!({
+                "errorMessage": format!("Task timed out after {} seconds", timeout_secs),
+            });
+            (StatusCode::REQUEST_TIMEOUT, resp_headers, serde_json::to_vec(&error_body).unwrap())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +313,7 @@ async fn next_invocation(
             let payload = invocation.payload;
             let deadline = invocation.deadline;
             let trace_id = invocation.trace_id;
+            let client_context = invocation.client_context;
             let response_tx = invocation.response_tx;
 
             // Store the response channel so /response and /error can forward
@@ -232,6 +359,13 @@ async fn next_invocation(
                 response_headers.insert(
                     "Lambda-Runtime-Trace-Id",
                     trace_id.parse().unwrap(),
+                );
+            }
+
+            if let Some(ref client_context) = client_context {
+                response_headers.insert(
+                    "Lambda-Runtime-Client-Context",
+                    client_context.parse().unwrap(),
                 );
             }
 
@@ -510,7 +644,7 @@ mod tests {
             runtime_images: HashMap::new(),
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
         AppState {
             config: Arc::new(config),
             container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
@@ -539,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_function_returns_service_exception() {
+    async fn invoke_function_not_found_returns_404() {
         let app = invoke_routes().with_state(test_state());
         let resp = app
             .oneshot(
@@ -549,7 +683,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "ResourceNotFoundException");
     }
 
     #[tokio::test]
@@ -617,7 +756,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -631,6 +770,7 @@ mod tests {
             payload: bytes::Bytes::from(r#"{"hello":"world"}"#),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
+            client_context: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -689,7 +829,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -702,6 +842,7 @@ mod tests {
             payload: bytes::Bytes::from("{}"),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: Some(trace_id.to_string()),
+            client_context: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -737,7 +878,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -807,7 +948,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -821,6 +962,7 @@ mod tests {
             payload: bytes::Bytes::from(r#"{"input":"data"}"#),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
+            client_context: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -887,7 +1029,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -900,6 +1042,7 @@ mod tests {
             payload: bytes::Bytes::from("{}"),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
+            client_context: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -956,7 +1099,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -969,6 +1112,7 @@ mod tests {
             payload: bytes::Bytes::from("{}"),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
+            client_context: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -1035,7 +1179,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -1071,7 +1215,7 @@ mod tests {
         receivers.insert("my-func".to_string(), rx);
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let mut state = test_state();
         state.runtime_bridge = runtime_bridge;
@@ -1084,6 +1228,7 @@ mod tests {
             payload: bytes::Bytes::from("{}"),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
+            client_context: None,
             response_tx: resp_tx,
         };
         tx.send(inv).await.unwrap();
@@ -1176,8 +1321,275 @@ mod tests {
             )
             .await
             .unwrap();
-        // Should not be a 400 — the stub returns 500 ServiceException for valid names
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Valid name but function doesn't exist → 404, not 400
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Create a test state with a real function configured and invocation
+    /// channels wired through the RuntimeBridge.
+    fn test_state_with_function(
+        function_name: &str,
+        timeout: u64,
+    ) -> (AppState, tokio::sync::watch::Sender<bool>) {
+        use crate::types::FunctionConfig;
+        use std::path::PathBuf;
+
+        let config = Config {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 9600,
+            runtime_port: 9601,
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            functions_file: "./functions.json".into(),
+            log_level: "info".into(),
+            shutdown_timeout: 30,
+            container_idle_timeout: 300,
+            max_containers: 20,
+            docker_network: "localfunctions".into(),
+            max_body_size: 6 * 1024 * 1024,
+        };
+        let docker = bollard::Docker::connect_with_local_defaults().unwrap();
+
+        let mut functions_map = HashMap::new();
+        functions_map.insert(
+            function_name.to_string(),
+            FunctionConfig {
+                name: function_name.to_string(),
+                runtime: "python3.12".into(),
+                handler: "main.handler".into(),
+                code_path: PathBuf::from("/tmp/code"),
+                timeout,
+                memory_size: 128,
+                environment: HashMap::new(),
+                image: None,
+            },
+        );
+        let functions = FunctionsConfig {
+            functions: functions_map,
+            runtime_images: HashMap::new(),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        let mut senders = HashMap::new();
+        senders.insert(function_name.to_string(), tx);
+
+        let mut receivers = HashMap::new();
+        receivers.insert(function_name.to_string(), rx);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(senders, receivers, shutdown_rx));
+
+        let state = AppState {
+            config: Arc::new(config),
+            container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
+            docker,
+            functions: Arc::new(functions),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime_bridge,
+        };
+
+        (state, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn invoke_success_returns_200_with_body() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let app = invoke_routes().with_state(state);
+
+        // Spawn a task that acts as the container runtime:
+        // picks up the invocation from /next and posts a response.
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .await;
+            bridge
+                .complete_invocation(inv.request_id, r#"{"result":"ok"}"#.into())
+                .await;
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from(r#"{"input":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("X-Amz-Function-Error").is_none());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), br#"{"result":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn invoke_function_error_returns_200_with_error_header() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let app = invoke_routes().with_state(state);
+
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .await;
+            bridge
+                .fail_invocation(
+                    inv.request_id,
+                    "RuntimeError".into(),
+                    "something broke".into(),
+                )
+                .await;
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("X-Amz-Function-Error").unwrap().to_str().unwrap(),
+            "Unhandled"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errorType"], "RuntimeError");
+        assert_eq!(json["errorMessage"], "something broke");
+    }
+
+    #[tokio::test]
+    async fn invoke_timeout_returns_408() {
+        // Use a very short timeout (1 second) and never respond.
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            resp.headers().get("X-Amz-Function-Error").unwrap().to_str().unwrap(),
+            "Unhandled"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("Task timed out after 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn invoke_unsupported_invocation_type_returns_400() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "Event")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "InvalidRequestContentException");
+    }
+
+    #[tokio::test]
+    async fn invoke_request_response_type_accepted() {
+        // RequestResponse is the default and should work.
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .await;
+            bridge
+                .complete_invocation(inv.request_id, "ok".into())
+                .await;
+        });
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Invocation-Type", "RequestResponse")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invoke_passes_client_context_to_runtime() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let bridge = runtime_bridge.clone();
+        let handle = tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            let ctx = inv.client_context.clone();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .await;
+            bridge
+                .complete_invocation(inv.request_id, "done".into())
+                .await;
+            ctx
+        });
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Client-Context", "eyJ0ZXN0IjogdHJ1ZX0=")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ctx = handle.await.unwrap();
+        assert_eq!(ctx, Some("eyJ0ZXN0IjogdHJ1ZX0=".to_string()));
     }
 
     #[tokio::test]

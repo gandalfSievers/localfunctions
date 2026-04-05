@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_receivers, shutdown_rx));
+    let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_senders, invocation_receivers, shutdown_rx));
 
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout);
     let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));

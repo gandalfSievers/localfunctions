@@ -5,7 +5,9 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::types::{Invocation, InvocationResult};
+use bytes::Bytes;
+
+use crate::types::{Invocation, InvocationResult, ServiceError};
 
 /// A dispatched invocation waiting for a response from the container runtime.
 struct PendingInvocation {
@@ -17,6 +19,10 @@ struct PendingInvocation {
 /// containers long-poll for work). Holds per-function invocation receivers and
 /// tracks which containers have signalled readiness.
 pub struct RuntimeBridge {
+    /// Per-function invocation senders. Used by the Invoke API to submit new
+    /// invocations.
+    senders: HashMap<String, mpsc::Sender<Invocation>>,
+
     /// Per-function invocation receivers. Multiple containers for the same
     /// function share one receiver (behind a Mutex), which naturally
     /// load-balances work.
@@ -40,6 +46,7 @@ impl RuntimeBridge {
     /// The `shutdown_rx` watch channel should receive `true` when the service
     /// begins shutting down.
     pub fn new(
+        senders: HashMap<String, mpsc::Sender<Invocation>>,
         receivers: HashMap<String, mpsc::Receiver<Invocation>>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
@@ -49,6 +56,7 @@ impl RuntimeBridge {
             .collect();
 
         Self {
+            senders,
             queues,
             shutdown_rx,
             ready_containers: Mutex::new(HashMap::new()),
@@ -100,6 +108,47 @@ impl RuntimeBridge {
     #[allow(dead_code)]
     pub fn has_function(&self, function_name: &str) -> bool {
         self.queues.contains_key(function_name)
+    }
+
+    /// Submit an invocation for a function. Creates the invocation, sends it
+    /// to the function's queue, and returns the request ID and a receiver for
+    /// the result.
+    ///
+    /// Returns `ServiceError::ResourceNotFound` if the function has no sender.
+    pub async fn submit_invocation(
+        &self,
+        function_name: &str,
+        payload: Bytes,
+        deadline: tokio::time::Instant,
+        trace_id: Option<String>,
+        client_context: Option<String>,
+    ) -> Result<(Uuid, oneshot::Receiver<InvocationResult>), ServiceError> {
+        let sender = self
+            .senders
+            .get(function_name)
+            .ok_or_else(|| ServiceError::ResourceNotFound(function_name.to_string()))?;
+
+        let request_id = Uuid::new_v4();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let invocation = Invocation {
+            request_id,
+            function_name: function_name.to_string(),
+            payload,
+            deadline,
+            trace_id,
+            client_context,
+            response_tx,
+        };
+
+        sender.send(invocation).await.map_err(|_| {
+            ServiceError::ServiceException(format!(
+                "Failed to enqueue invocation for function '{}'",
+                function_name
+            ))
+        })?;
+
+        Ok((request_id, response_rx))
     }
 
     /// Store the response channel for a dispatched invocation so that the
@@ -231,6 +280,7 @@ mod tests {
             payload: Bytes::from(r#"{"key":"value"}"#),
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             trace_id: None,
+            client_context: None,
             response_tx: tx,
         };
         (inv, rx)
@@ -247,7 +297,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("test-func".to_string(), rx);
 
-        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx);
 
         let (inv, _rx) = make_invocation("test-func");
         let request_id = inv.request_id;
@@ -261,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn next_invocation_unknown_function_returns_none() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         let result = bridge.next_invocation("nonexistent").await;
         assert!(result.is_none());
@@ -274,7 +324,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("test-func".to_string(), rx);
 
-        let bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
 
         let bridge_clone = bridge.clone();
         let handle = tokio::spawn(async move {
@@ -299,7 +349,7 @@ mod tests {
         // Trigger shutdown before creating bridge
         shutdown_tx.send(true).unwrap();
 
-        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx);
         let result = bridge.next_invocation("test-func").await;
         assert!(result.is_none());
     }
@@ -311,7 +361,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("test-func".to_string(), rx);
 
-        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx);
 
         drop(tx);
 
@@ -322,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn mark_ready_tracks_container() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         assert!(!bridge.is_ready("container-1").await);
         bridge.mark_ready("container-1").await;
@@ -332,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn mark_ready_idempotent() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         bridge.mark_ready("container-1").await;
         bridge.mark_ready("container-1").await;
@@ -346,7 +396,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("my-func".to_string(), rx);
 
-        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx);
 
         assert!(bridge.has_function("my-func"));
         assert!(!bridge.has_function("other-func"));
@@ -355,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_complete_invocation() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4();
@@ -373,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn complete_unknown_request_id_returns_false() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         assert!(!bridge.complete_invocation(Uuid::new_v4(), "x".into()).await);
     }
@@ -381,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_fail_invocation() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4();
@@ -402,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn fail_unknown_request_id_returns_false() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         assert!(!bridge
             .fail_invocation(Uuid::new_v4(), "X".into(), "Y".into())
@@ -416,7 +466,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("test-func".to_string(), rx);
 
-        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx);
 
         // Queue two invocations
         let (inv1, rx1) = make_invocation("test-func");
@@ -441,7 +491,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("test-func".to_string(), rx);
 
-        let bridge = RuntimeBridge::new(receivers, shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx);
 
         // Simulate two invocations that were already dispatched via /next
         // and are sitting in pending_invocations.
@@ -473,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn fail_init_unknown_function_returns_zero() {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-        let bridge = RuntimeBridge::new(HashMap::new(), shutdown_rx);
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         assert_eq!(bridge.fail_init("nonexistent").await, 0);
     }
@@ -485,7 +535,7 @@ mod tests {
         let mut receivers = HashMap::new();
         receivers.insert("test-func".to_string(), rx);
 
-        let bridge = Arc::new(RuntimeBridge::new(receivers, shutdown_rx));
+        let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), receivers, shutdown_rx));
         let bridge_clone = bridge.clone();
 
         let handle = tokio::spawn(async move {

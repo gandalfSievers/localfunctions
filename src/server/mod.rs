@@ -148,7 +148,7 @@ mod tests {
             runtime_images: HashMap::new(),
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), shutdown_rx));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
         AppState {
             config: Arc::new(config),
             container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
