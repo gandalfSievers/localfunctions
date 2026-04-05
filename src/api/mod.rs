@@ -637,6 +637,7 @@ mod tests {
             max_containers: 20,
             docker_network: "localfunctions".into(),
             max_body_size: 6 * 1024 * 1024,
+            log_format: crate::config::LogFormat::Text,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -1347,6 +1348,7 @@ mod tests {
             max_containers: 20,
             docker_network: "localfunctions".into(),
             max_body_size: 6 * 1024 * 1024,
+            log_format: crate::config::LogFormat::Text,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 

@@ -18,6 +18,36 @@ pub struct Config {
     pub docker_network: String,
     /// Maximum request body size in bytes for the Invoke API (default 6 MB).
     pub max_body_size: usize,
+    /// Log output format: "json" for structured JSON, "text" for human-readable.
+    pub log_format: LogFormat,
+}
+
+/// Controls the format of log output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogFormat {
+    Json,
+    Text,
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "json" => Ok(LogFormat::Json),
+            "text" | "plain" => Ok(LogFormat::Text),
+            other => Err(format!("unknown log format '{}', expected 'json' or 'text'", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogFormat::Json => write!(f, "json"),
+            LogFormat::Text => write!(f, "text"),
+        }
+    }
 }
 
 impl Config {
@@ -29,7 +59,8 @@ impl Config {
         let account_id = parse_env::<String>("LOCAL_LAMBDA_ACCOUNT_ID", "000000000000")?;
         let functions_file =
             parse_env::<PathBuf>("LOCAL_LAMBDA_FUNCTIONS_FILE", "./functions.json")?;
-        let log_level = parse_env::<String>("LOCAL_LAMBDA_LOG_LEVEL", "info")?;
+        let log_level = parse_env_with_alias::<String>("LOCAL_LAMBDA_LOG_LEVEL", "LOG_LEVEL", "info")?;
+        let log_format = parse_env_with_alias::<LogFormat>("LOCAL_LAMBDA_LOG_FORMAT", "LOG_FORMAT", "json")?;
         let shutdown_timeout = parse_env("LOCAL_LAMBDA_SHUTDOWN_TIMEOUT", "30")?;
         let container_idle_timeout = parse_env("LOCAL_LAMBDA_CONTAINER_IDLE_TIMEOUT", "300")?;
         let max_containers = parse_env("LOCAL_LAMBDA_MAX_CONTAINERS", "20")?;
@@ -49,8 +80,23 @@ impl Config {
             max_containers,
             docker_network,
             max_body_size,
+            log_format,
         })
     }
+}
+
+/// Like `parse_env`, but checks a short alias first (e.g. `LOG_LEVEL` before
+/// `LOCAL_LAMBDA_LOG_LEVEL`). The primary key takes precedence over the alias.
+fn parse_env_with_alias<T>(primary: &str, alias: &str, default: &str) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = std::env::var(primary)
+        .or_else(|_| std::env::var(alias))
+        .unwrap_or_else(|_| default.to_string());
+    raw.parse::<T>()
+        .map_err(|e| ConfigError::InvalidValue(primary.to_string(), e.to_string()))
 }
 
 fn parse_env<T>(key: &str, default: &str) -> Result<T, ConfigError>
@@ -86,6 +132,9 @@ mod tests {
             "LOCAL_LAMBDA_ACCOUNT_ID",
             "LOCAL_LAMBDA_FUNCTIONS_FILE",
             "LOCAL_LAMBDA_LOG_LEVEL",
+            "LOG_LEVEL",
+            "LOCAL_LAMBDA_LOG_FORMAT",
+            "LOG_FORMAT",
             "LOCAL_LAMBDA_SHUTDOWN_TIMEOUT",
             "LOCAL_LAMBDA_CONTAINER_IDLE_TIMEOUT",
             "LOCAL_LAMBDA_MAX_CONTAINERS",
@@ -108,6 +157,7 @@ mod tests {
         assert_eq!(config.max_containers, 20);
         assert_eq!(config.docker_network, "localfunctions");
         assert_eq!(config.max_body_size, 6 * 1024 * 1024);
+        assert_eq!(config.log_format, LogFormat::Json);
     }
 
     #[test]
@@ -171,5 +221,82 @@ mod tests {
         let result = Config::from_env();
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_SHUTDOWN_TIMEOUT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_log_format_json_default() {
+        std::env::remove_var("LOCAL_LAMBDA_LOG_FORMAT");
+        std::env::remove_var("LOG_FORMAT");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    #[serial]
+    fn test_log_format_text() {
+        std::env::set_var("LOG_FORMAT", "text");
+        std::env::remove_var("LOCAL_LAMBDA_LOG_FORMAT");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.log_format, LogFormat::Text);
+        std::env::remove_var("LOG_FORMAT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_log_format_primary_overrides_alias() {
+        std::env::set_var("LOCAL_LAMBDA_LOG_FORMAT", "json");
+        std::env::set_var("LOG_FORMAT", "text");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.log_format, LogFormat::Json);
+        std::env::remove_var("LOCAL_LAMBDA_LOG_FORMAT");
+        std::env::remove_var("LOG_FORMAT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_log_format_invalid() {
+        std::env::set_var("LOG_FORMAT", "xml");
+        std::env::remove_var("LOCAL_LAMBDA_LOG_FORMAT");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOG_FORMAT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_log_level_alias() {
+        std::env::set_var("LOG_LEVEL", "debug");
+        std::env::remove_var("LOCAL_LAMBDA_LOG_LEVEL");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.log_level, "debug");
+        std::env::remove_var("LOG_LEVEL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_log_level_primary_overrides_alias() {
+        std::env::set_var("LOCAL_LAMBDA_LOG_LEVEL", "warn");
+        std::env::set_var("LOG_LEVEL", "debug");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.log_level, "warn");
+        std::env::remove_var("LOCAL_LAMBDA_LOG_LEVEL");
+        std::env::remove_var("LOG_LEVEL");
+    }
+
+    #[test]
+    fn test_log_format_parse() {
+        assert_eq!("json".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("JSON".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("text".parse::<LogFormat>().unwrap(), LogFormat::Text);
+        assert_eq!("TEXT".parse::<LogFormat>().unwrap(), LogFormat::Text);
+        assert_eq!("plain".parse::<LogFormat>().unwrap(), LogFormat::Text);
+        assert!("xml".parse::<LogFormat>().is_err());
+    }
+
+    #[test]
+    fn test_log_format_display() {
+        assert_eq!(LogFormat::Json.to_string(), "json");
+        assert_eq!(LogFormat::Text.to_string(), "text");
     }
 }

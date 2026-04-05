@@ -24,12 +24,23 @@ async fn main() -> Result<()> {
 
     let config = config::Config::from_env()?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| config.log_level.clone().into()),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| config.log_level.clone().into());
+
+    match config.log_format {
+        config::LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(env_filter)
+                .with_target(true)
+                .init();
+        }
+        config::LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+        }
+    }
 
     info!(
         host = %config.host,
