@@ -44,6 +44,7 @@ async fn build_state(
         log_format: LogFormat::Text,
         pull_images: false,
         init_timeout: 10,
+        container_acquire_timeout: 10,
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
@@ -85,6 +86,7 @@ async fn build_state(
         9601,
         "us-east-1".into(),
         container_registry.clone(),
+        20,
     ));
     // Pre-populate an idle container so the invoke handler doesn't attempt
     // real Docker operations in tests.

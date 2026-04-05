@@ -145,6 +145,7 @@ mod tests {
             log_format: crate::config::LogFormat::Text,
             pull_images: false,
             init_timeout: 10,
+            container_acquire_timeout: 10,
         };
         let docker = Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -161,6 +162,7 @@ mod tests {
             9601,
             "us-east-1".into(),
             container_registry.clone(),
+            20,
         ));
         AppState {
             config: Arc::new(config),

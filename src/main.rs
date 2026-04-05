@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         config.runtime_port,
         config.region.clone(),
         container_registry.clone(),
+        config.max_containers,
     ));
 
     let state = AppState {

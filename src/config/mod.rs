@@ -25,6 +25,10 @@ pub struct Config {
     /// Maximum time in seconds to wait for a container's bootstrap process to
     /// call the Runtime API `/next` endpoint (default 10s).
     pub init_timeout: u64,
+    /// Maximum time in seconds to wait for a container slot when all
+    /// `max_containers` are in use (default 10s). If no slot becomes available
+    /// within this period, the invocation is rejected with 429.
+    pub container_acquire_timeout: u64,
 }
 
 /// Controls the format of log output.
@@ -77,6 +81,7 @@ impl Config {
             "false",
         )?;
         let init_timeout = parse_env("LOCAL_LAMBDA_INIT_TIMEOUT", "10")?;
+        let container_acquire_timeout = parse_env("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT", "10")?;
 
         Ok(Config {
             host,
@@ -94,6 +99,7 @@ impl Config {
             log_format,
             pull_images,
             init_timeout,
+            container_acquire_timeout,
         })
     }
 }
@@ -156,6 +162,7 @@ mod tests {
             "LOCAL_LAMBDA_PULL_IMAGES",
             "LOCALFUNCTIONS_PULL_IMAGES",
             "LOCAL_LAMBDA_INIT_TIMEOUT",
+            "LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT",
         ] {
             std::env::remove_var(key);
         }
@@ -176,6 +183,7 @@ mod tests {
         assert_eq!(config.log_format, LogFormat::Json);
         assert!(!config.pull_images);
         assert_eq!(config.init_timeout, 10);
+        assert_eq!(config.container_acquire_timeout, 10);
     }
 
     #[test]
@@ -391,5 +399,31 @@ mod tests {
         let result = Config::from_env();
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_INIT_TIMEOUT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_container_acquire_timeout_default() {
+        std::env::remove_var("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.container_acquire_timeout, 10);
+    }
+
+    #[test]
+    #[serial]
+    fn test_container_acquire_timeout_custom() {
+        std::env::set_var("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT", "30");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.container_acquire_timeout, 30);
+        std::env::remove_var("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_container_acquire_timeout_invalid() {
+        std::env::set_var("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT", "abc");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        std::env::remove_var("LOCAL_LAMBDA_CONTAINER_ACQUIRE_TIMEOUT");
     }
 }

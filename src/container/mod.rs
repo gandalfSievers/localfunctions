@@ -13,7 +13,7 @@ use bollard::system::EventsOptions;
 use bollard::Docker;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use futures_util::{StreamExt, TryStreamExt};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -460,6 +460,10 @@ pub struct ContainerManager {
     registry: Arc<ContainerRegistry>,
     /// Tracks state of containers managed by this instance.
     containers: RwLock<HashMap<String, ManagedContainer>>,
+    /// Limits the total number of active containers. Each container holds one
+    /// permit; when all permits are taken, new container creation blocks until
+    /// a permit is released (container removed).
+    container_semaphore: Arc<Semaphore>,
 }
 
 #[allow(dead_code)]
@@ -477,6 +481,7 @@ impl ContainerManager {
         runtime_port: u16,
         region: String,
         registry: Arc<ContainerRegistry>,
+        max_containers: usize,
     ) -> Self {
         Self {
             docker,
@@ -486,7 +491,43 @@ impl ContainerManager {
             region,
             registry,
             containers: RwLock::new(HashMap::new()),
+            container_semaphore: Arc::new(Semaphore::new(max_containers)),
         }
+    }
+
+    /// Try to acquire a container slot within the given timeout.
+    ///
+    /// Returns `true` if a slot was acquired, `false` if the timeout expired
+    /// (all `max_containers` slots are in use). The caller must ensure a
+    /// corresponding `release_container_slot()` call when the container is
+    /// eventually removed.
+    pub async fn acquire_container_slot(&self, timeout: Duration) -> bool {
+        match tokio::time::timeout(
+            timeout,
+            self.container_semaphore.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => {
+                // Deliberately forget the permit so it is not auto-released
+                // when dropped. We manage release manually via
+                // release_container_slot().
+                permit.forget();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release a container slot back to the pool, allowing a new container to
+    /// be created.
+    pub fn release_container_slot(&self) {
+        self.container_semaphore.add_permits(1);
+    }
+
+    /// Return the number of available container slots.
+    pub fn available_container_slots(&self) -> usize {
+        self.container_semaphore.available_permits()
     }
 
     /// Resolve the Docker image for a function.
@@ -780,6 +821,9 @@ impl ContainerManager {
         self.containers.write().await.remove(container_id);
         self.registry.deregister(container_id).await;
 
+        // Release the container slot so new containers can be created.
+        self.release_container_slot();
+
         info!(container_id = %container_id, "container stopped and removed");
         Ok(())
     }
@@ -928,7 +972,13 @@ impl ContainerManager {
     /// Used after init errors where containers are killed via the registry.
     pub async fn deregister_by_function(&self, function_name: &str) {
         let mut containers = self.containers.write().await;
+        let before = containers.len();
         containers.retain(|_, c| c.function_name != function_name);
+        let removed = before - containers.len();
+        // Release container slots for each removed container.
+        for _ in 0..removed {
+            self.release_container_slot();
+        }
     }
 
     /// Mark a container as failed and remove it from the managed pool.
@@ -945,6 +995,8 @@ impl ContainerManager {
             let function_name = entry.function_name.clone();
             // Remove from tracking so it's not claimed again
             containers.remove(container_id);
+            // Release the container slot so new containers can be created.
+            self.release_container_slot();
             Some(function_name)
         } else {
             None
@@ -952,6 +1004,8 @@ impl ContainerManager {
     }
 
     /// Insert a container directly into tracking (for testing).
+    ///
+    /// Also consumes a container slot to keep the semaphore consistent.
     #[doc(hidden)]
     pub async fn insert_test_container(
         &self,
@@ -959,6 +1013,10 @@ impl ContainerManager {
         function_name: String,
         state: ContainerState,
     ) {
+        // Consume a semaphore permit to keep slot accounting consistent.
+        let permit = self.container_semaphore.clone().acquire_owned().await.unwrap();
+        permit.forget();
+
         let mut containers = self.containers.write().await;
         containers.insert(
             container_id.clone(),
@@ -1462,6 +1520,7 @@ mod tests {
             9601,
             "us-east-1".to_string(),
             registry,
+            20,
         )
     }
 
@@ -1522,6 +1581,7 @@ mod tests {
             9601,
             "us-east-1".into(),
             registry,
+            20,
         );
         let func = make_test_function();
         let err = mgr.resolve_image(&func).unwrap_err();
@@ -2089,6 +2149,97 @@ mod tests {
             &"AWS_ENDPOINT_URL_SECRETS_MANAGER=http://host.docker.internal:9091".to_string()
         ));
     }
+
+    // -- Container slot / semaphore tests -----------------------------------
+
+    #[tokio::test]
+    async fn container_slots_default_available() {
+        let mgr = make_container_manager();
+        assert_eq!(mgr.available_container_slots(), 20);
+    }
+
+    #[tokio::test]
+    async fn acquire_container_slot_succeeds_when_available() {
+        let mgr = make_container_manager();
+        assert!(mgr.acquire_container_slot(Duration::from_millis(10)).await);
+        assert_eq!(mgr.available_container_slots(), 19);
+    }
+
+    #[tokio::test]
+    async fn release_container_slot_restores_permit() {
+        let mgr = make_container_manager();
+        assert!(mgr.acquire_container_slot(Duration::from_millis(10)).await);
+        assert_eq!(mgr.available_container_slots(), 19);
+        mgr.release_container_slot();
+        assert_eq!(mgr.available_container_slots(), 20);
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_times_out_when_all_taken() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let mgr = ContainerManager::new(
+            docker,
+            HashMap::new(),
+            "test".into(),
+            9601,
+            "us-east-1".into(),
+            registry,
+            2, // only 2 slots
+        );
+
+        // Take both slots
+        assert!(mgr.acquire_container_slot(Duration::from_millis(10)).await);
+        assert!(mgr.acquire_container_slot(Duration::from_millis(10)).await);
+        assert_eq!(mgr.available_container_slots(), 0);
+
+        // Third should timeout
+        assert!(!mgr.acquire_container_slot(Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn insert_test_container_consumes_slot() {
+        let mgr = make_container_manager();
+        let initial = mgr.available_container_slots();
+        mgr.insert_test_container(
+            "c1".into(),
+            "func-a".into(),
+            ContainerState::Idle,
+        )
+        .await;
+        assert_eq!(mgr.available_container_slots(), initial - 1);
+    }
+
+    #[tokio::test]
+    async fn mark_container_failed_releases_slot() {
+        let mgr = make_container_manager();
+        let initial = mgr.available_container_slots();
+        mgr.insert_test_container(
+            "c1".into(),
+            "func-a".into(),
+            ContainerState::Busy,
+        )
+        .await;
+        assert_eq!(mgr.available_container_slots(), initial - 1);
+
+        mgr.mark_container_failed("c1").await;
+        assert_eq!(mgr.available_container_slots(), initial);
+    }
+
+    #[tokio::test]
+    async fn deregister_by_function_releases_slots() {
+        let mgr = make_container_manager();
+        let initial = mgr.available_container_slots();
+        mgr.insert_test_container("c1".into(), "func-a".into(), ContainerState::Idle).await;
+        mgr.insert_test_container("c2".into(), "func-a".into(), ContainerState::Busy).await;
+        mgr.insert_test_container("c3".into(), "func-b".into(), ContainerState::Idle).await;
+        assert_eq!(mgr.available_container_slots(), initial - 3);
+
+        // Deregister func-a (2 containers)
+        mgr.deregister_by_function("func-a").await;
+        assert_eq!(mgr.available_container_slots(), initial - 1);
+        assert_eq!(mgr.count().await, 1);
+    }
 }
 
 #[cfg(test)]
@@ -2159,6 +2310,7 @@ mod integration_tests {
             9601,
             "us-east-1".to_string(),
             registry.clone(),
+            20,
         );
 
         // Create a temp directory for code
@@ -2249,6 +2401,7 @@ mod integration_tests {
             9601,
             "us-east-1".into(),
             registry,
+            20,
         );
 
         // Use a small, commonly available image
@@ -2369,6 +2522,7 @@ mod integration_tests {
             9601,
             "us-east-1".into(),
             registry,
+            20,
         );
 
         // Stopping a nonexistent container should succeed (benign errors are swallowed)

@@ -158,17 +158,29 @@ async fn invoke_function_inner(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     // Ensure a container is available for this function. Try to claim a warm
-    // idle container first; if none are available, cold-start a new one.
+    // idle container first; if none are available, acquire a container slot
+    // and cold-start a new one. If all container slots are taken, wait up to
+    // container_acquire_timeout before rejecting with 429.
     let container_id = match state.container_manager.claim_idle_container(&function_name).await {
         Some(id) => {
             debug!(container_id = %id, "warm container claimed");
             id
         }
         None => {
+            let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
+            if !state.container_manager.acquire_container_slot(acquire_timeout).await {
+                let err = ServiceError::TooManyRequests(
+                    "Rate exceeded: max concurrent containers reached".into(),
+                );
+                return (err.status_code(), base_headers(), err.to_aws_response().to_json_bytes());
+            }
+
             debug!("no warm container available, cold starting");
             let cold_id = match state.container_manager.create_and_start(function_config).await {
                 Ok(id) => id,
                 Err(e) => {
+                    // Release the container slot since no container was created.
+                    state.container_manager.release_container_slot();
                     let err = ServiceError::ServiceException(e.to_string());
                     return (
                         err.status_code(),
@@ -863,6 +875,7 @@ mod tests {
             log_format: crate::config::LogFormat::Text,
             pull_images: false,
             init_timeout: 10,
+            container_acquire_timeout: 10,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -879,6 +892,7 @@ mod tests {
             9601,
             "us-east-1".into(),
             container_registry.clone(),
+            20,
         ));
         AppState {
             config: Arc::new(config),
@@ -1593,6 +1607,7 @@ mod tests {
             log_format: crate::config::LogFormat::Text,
             pull_images: false,
             init_timeout: 10,
+            container_acquire_timeout: 10,
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -1634,6 +1649,7 @@ mod tests {
             9601,
             "us-east-1".into(),
             container_registry.clone(),
+            20,
         ));
 
         // Pre-populate an idle container so the invoke handler doesn't attempt
@@ -2103,5 +2119,104 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("shutting down"));
+    }
+
+    #[tokio::test]
+    async fn invoke_returns_429_when_max_containers_reached() {
+        use crate::types::FunctionConfig;
+        use std::path::PathBuf;
+
+        let config = Config {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 9600,
+            runtime_port: 9601,
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            functions_file: "./functions.json".into(),
+            log_level: "info".into(),
+            shutdown_timeout: 30,
+            container_idle_timeout: 300,
+            max_containers: 1, // only 1 container allowed
+            docker_network: "localfunctions".into(),
+            max_body_size: 6 * 1024 * 1024,
+            log_format: crate::config::LogFormat::Text,
+            pull_images: false,
+            init_timeout: 10,
+            container_acquire_timeout: 0, // no wait — reject immediately
+        };
+        let docker = bollard::Docker::connect_with_local_defaults().unwrap();
+
+        let mut functions_map = HashMap::new();
+        functions_map.insert(
+            "my-func".to_string(),
+            FunctionConfig {
+                name: "my-func".into(),
+                runtime: "python3.12".into(),
+                handler: "main.handler".into(),
+                code_path: PathBuf::from("/tmp/code"),
+                timeout: 30,
+                memory_size: 128,
+                environment: HashMap::new(),
+                image: None,
+            },
+        );
+        let functions = FunctionsConfig {
+            functions: functions_map,
+            runtime_images: HashMap::new(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let mut senders = HashMap::new();
+        senders.insert("my-func".to_string(), tx);
+        let mut receivers = HashMap::new();
+        receivers.insert("my-func".to_string(), rx);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime_bridge = Arc::new(RuntimeBridge::new(senders, receivers, shutdown_rx));
+        let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let container_manager = Arc::new(ContainerManager::new(
+            docker.clone(),
+            HashMap::new(),
+            "localfunctions".into(),
+            9601,
+            "us-east-1".into(),
+            container_registry.clone(),
+            1, // 1 slot
+        ));
+
+        // Fill the only slot with a Busy container so no idle container is
+        // available and the cold-start path triggers the semaphore check.
+        container_manager
+            .insert_test_container(
+                "busy-container".into(),
+                "my-func".into(),
+                crate::types::ContainerState::Busy,
+            )
+            .await;
+
+        let state = AppState {
+            config: Arc::new(config),
+            container_registry,
+            container_manager,
+            docker,
+            functions: Arc::new(functions),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime_bridge,
+        };
+
+        let app = crate::server::invoke_router(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"].as_str().unwrap(), "TooManyRequestsException");
     }
 }
