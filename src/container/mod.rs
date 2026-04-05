@@ -1,6 +1,11 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use bollard::container::{RemoveContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
-use tracing::{debug, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 use crate::types::ServiceError;
 
@@ -93,6 +98,145 @@ impl DockerNetwork {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ContainerRegistry
+// ---------------------------------------------------------------------------
+
+/// Metadata for a tracked container.
+#[derive(Debug, Clone)]
+struct RegisteredContainer {
+    container_id: String,
+    function_name: String,
+}
+
+/// Thread-safe registry of all running function containers.
+///
+/// Used during shutdown to stop and remove every container that was started by
+/// this process.
+#[allow(dead_code)]
+pub struct ContainerRegistry {
+    docker: Docker,
+    containers: RwLock<HashMap<String, RegisteredContainer>>,
+}
+
+#[allow(dead_code)]
+impl ContainerRegistry {
+    /// Create a new, empty registry.
+    pub fn new(docker: Docker) -> Self {
+        Self {
+            docker,
+            containers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a running container so it will be cleaned up on shutdown.
+    pub async fn register(&self, container_id: String, function_name: String) {
+        let mut map = self.containers.write().await;
+        debug!(container_id = %container_id, function = %function_name, "registered container");
+        map.insert(
+            container_id.clone(),
+            RegisteredContainer {
+                container_id,
+                function_name,
+            },
+        );
+    }
+
+    /// Remove a container from the registry (e.g. after it exits normally).
+    pub async fn deregister(&self, container_id: &str) {
+        let mut map = self.containers.write().await;
+        if map.remove(container_id).is_some() {
+            debug!(container_id = %container_id, "deregistered container");
+        }
+    }
+
+    /// Return the number of tracked containers.
+    pub async fn count(&self) -> usize {
+        self.containers.read().await.len()
+    }
+
+    /// Stop and remove all tracked containers.
+    ///
+    /// Each container is given `timeout` to stop gracefully; after that Docker
+    /// sends SIGKILL. Containers are stopped concurrently.
+    pub async fn shutdown_all(&self, timeout: Duration) {
+        let map = self.containers.write().await;
+        let count = map.len();
+        if count == 0 {
+            info!("no containers to clean up");
+            return;
+        }
+
+        info!(count, "stopping all containers");
+
+        let timeout_secs = timeout.as_secs().try_into().unwrap_or(i64::MAX);
+        let mut handles = Vec::with_capacity(count);
+
+        for entry in map.values() {
+            let docker = self.docker.clone();
+            let id = entry.container_id.clone();
+            let name = entry.function_name.clone();
+
+            handles.push(tokio::spawn(async move {
+                debug!(container_id = %id, function = %name, "stopping container");
+
+                // Stop — sends SIGTERM, waits `timeout`, then SIGKILL
+                if let Err(e) = docker
+                    .stop_container(
+                        &id,
+                        Some(StopContainerOptions { t: timeout_secs }),
+                    )
+                    .await
+                {
+                    // 304 = container already stopped, 404 = already removed
+                    if !is_benign_docker_error(&e) {
+                        error!(container_id = %id, %e, "failed to stop container");
+                    }
+                }
+
+                // Remove — force flag ensures removal even if stop failed
+                if let Err(e) = docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    if !is_benign_docker_error(&e) {
+                        error!(container_id = %id, %e, "failed to remove container");
+                    }
+                }
+
+                info!(container_id = %id, function = %name, "container cleaned up");
+            }));
+        }
+
+        // Wait for all stop+remove tasks to finish
+        for handle in handles {
+            if let Err(e) = handle.await {
+                error!(%e, "container cleanup task panicked");
+            }
+        }
+
+        info!(count, "all containers cleaned up");
+    }
+}
+
+/// Returns true for Docker errors that indicate the container is already
+/// stopped or removed (304 Not Modified, 404 Not Found).
+fn is_benign_docker_error(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 304 | 404,
+            ..
+        }
+    )
+}
+
 /// Build the `AWS_LAMBDA_RUNTIME_API` endpoint value that containers should
 /// use to reach the Runtime API.
 ///
@@ -138,6 +282,80 @@ mod tests {
         let docker = Docker::connect_with_local_defaults().unwrap();
         let network = DockerNetwork::new(docker, "localfunctions".to_string());
         assert_eq!(network.name(), "localfunctions");
+    }
+
+    #[tokio::test]
+    async fn container_registry_starts_empty() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = ContainerRegistry::new(docker);
+        assert_eq!(registry.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn container_registry_register_and_deregister() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = ContainerRegistry::new(docker);
+
+        registry
+            .register("abc123".into(), "my-func".into())
+            .await;
+        assert_eq!(registry.count().await, 1);
+
+        registry
+            .register("def456".into(), "other-func".into())
+            .await;
+        assert_eq!(registry.count().await, 2);
+
+        registry.deregister("abc123").await;
+        assert_eq!(registry.count().await, 1);
+
+        registry.deregister("def456").await;
+        assert_eq!(registry.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn container_registry_deregister_nonexistent_is_noop() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = ContainerRegistry::new(docker);
+        registry.deregister("nonexistent").await;
+        assert_eq!(registry.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn container_registry_shutdown_all_empty_is_noop() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let registry = ContainerRegistry::new(docker);
+        // Should complete without error even with no containers
+        registry
+            .shutdown_all(Duration::from_secs(5))
+            .await;
+    }
+
+    #[test]
+    fn is_benign_docker_error_matches_404() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "not found".into(),
+        };
+        assert!(is_benign_docker_error(&err));
+    }
+
+    #[test]
+    fn is_benign_docker_error_matches_304() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 304,
+            message: "not modified".into(),
+        };
+        assert!(is_benign_docker_error(&err));
+    }
+
+    #[test]
+    fn is_benign_docker_error_rejects_500() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "internal error".into(),
+        };
+        assert!(!is_benign_docker_error(&err));
     }
 }
 

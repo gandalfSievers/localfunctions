@@ -64,11 +64,20 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Invoke a Lambda function by name (stub — will be wired to ContainerManager).
 async fn invoke_function(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(function_name): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
     let _ = body;
+
+    // Reject immediately if the service is shutting down.
+    if state.is_shutting_down() {
+        let err = ServiceError::ServiceException(
+            "Service is shutting down, not accepting new invocations".into(),
+        );
+        return (err.status_code(), Json(err.to_aws_response()));
+    }
+
     let err = ServiceError::ServiceException(format!(
         "Function invocation not yet implemented for '{}'",
         function_name
@@ -148,6 +157,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
+    use crate::container::ContainerRegistry;
     use crate::function::FunctionsConfig;
 
     fn test_state() -> AppState {
@@ -171,8 +181,10 @@ mod tests {
         };
         AppState {
             config: Arc::new(config),
+            container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
             docker,
             functions: Arc::new(functions),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -277,5 +289,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_during_shutdown() {
+        let state = test_state();
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["Message"]
+            .as_str()
+            .unwrap()
+            .contains("shutting down"));
     }
 }

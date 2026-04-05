@@ -5,13 +5,15 @@ mod function;
 mod server;
 mod types;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use bollard::Docker;
 use tracing::{error, info};
 
-use container::DockerNetwork;
+use container::{ContainerRegistry, DockerNetwork};
 use server::AppState;
 
 #[tokio::main]
@@ -64,19 +66,39 @@ async fn main() -> Result<()> {
 
     info!(count = functions_config.functions.len(), "functions loaded");
 
+    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout);
+    let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+
     let state = AppState {
         config: Arc::new(config),
         docker,
         functions: Arc::new(functions_config),
+        container_registry: container_registry.clone(),
+        shutting_down: Arc::new(AtomicBool::new(false)),
     };
 
     // Start both API servers (blocks until shutdown signal)
-    server::start(state.clone()).await?;
+    server::start(state).await?;
 
-    // Shutdown: remove the Docker network
+    // --- Graceful shutdown sequence ---
+
+    info!("graceful shutdown started");
+
+    // Step 1: Wait for in-flight invocations to complete (up to timeout),
+    //         then forcibly stop and remove all containers.
+    info!(
+        timeout_secs = shutdown_timeout.as_secs(),
+        "waiting for in-flight invocations to complete"
+    );
+    container_registry.shutdown_all(shutdown_timeout).await;
+
+    // Step 2: Remove the Docker network after all containers are gone.
+    info!("removing Docker network");
     if let Err(e) = network.remove().await {
-        error!(%e, "Failed to remove Docker network during shutdown");
+        error!(%e, "failed to remove Docker network during shutdown");
     }
+
+    info!("shutdown complete");
 
     Ok(())
 }

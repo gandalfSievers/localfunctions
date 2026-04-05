@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
@@ -8,6 +9,7 @@ use tracing::info;
 
 use crate::api;
 use crate::config::Config;
+use crate::container::ContainerRegistry;
 use crate::function::FunctionsConfig;
 
 /// Shared application state accessible by all route handlers.
@@ -17,6 +19,16 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub docker: Docker,
     pub functions: Arc<FunctionsConfig>,
+    pub container_registry: Arc<ContainerRegistry>,
+    pub shutting_down: Arc<AtomicBool>,
+}
+
+impl AppState {
+    /// Returns true if the service is shutting down and should reject new
+    /// invocations.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
 }
 
 /// Create the external Invoke API router with a 6 MB request body limit.
@@ -34,13 +46,14 @@ pub fn runtime_router(state: AppState) -> Router {
 /// Start both the Invoke API and Runtime API servers.
 ///
 /// Runs until a `SIGINT` or `SIGTERM` signal is received, then performs
-/// graceful shutdown.
+/// graceful shutdown. Sets the `shutting_down` flag on the shared state so
+/// handlers can reject new invocations immediately.
 pub async fn start(state: AppState) -> anyhow::Result<()> {
     let invoke_addr = SocketAddr::new(state.config.host, state.config.port);
     let runtime_addr = SocketAddr::new(state.config.host, state.config.runtime_port);
 
     let invoke_app = invoke_router(state.clone());
-    let runtime_app = runtime_router(state);
+    let runtime_app = runtime_router(state.clone());
 
     let invoke_listener = TcpListener::bind(invoke_addr).await?;
     let runtime_listener = TcpListener::bind(runtime_addr).await?;
@@ -48,10 +61,31 @@ pub async fn start(state: AppState) -> anyhow::Result<()> {
     info!(%invoke_addr, "Invoke API listening");
     info!(%runtime_addr, "Runtime API listening");
 
-    let invoke_server =
-        axum::serve(invoke_listener, invoke_app).with_graceful_shutdown(shutdown_signal());
-    let runtime_server =
-        axum::serve(runtime_listener, runtime_app).with_graceful_shutdown(shutdown_signal());
+    // Use a shared notify so both servers shut down from the same signal.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
+    let shutdown_trigger = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_trigger.notify_waiters();
+    });
+
+    let shutdown_a = shutdown.clone();
+    let shutdown_b = shutdown.clone();
+    let shutting_down = state.shutting_down.clone();
+
+    let invoke_server = axum::serve(invoke_listener, invoke_app)
+        .with_graceful_shutdown(async move { shutdown_a.notified().await });
+    let runtime_server = axum::serve(runtime_listener, runtime_app)
+        .with_graceful_shutdown(async move { shutdown_b.notified().await });
+
+    // Wait for shutdown signal, then mark as shutting down.
+    let shutdown_watcher = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_watcher.notified().await;
+        shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("stopping new invocations");
+    });
 
     tokio::try_join!(
         async { invoke_server.await.map_err(anyhow::Error::from) },
@@ -87,6 +121,7 @@ mod tests {
     use axum::body::Body;
     use http::Request;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -110,8 +145,10 @@ mod tests {
         };
         AppState {
             config: Arc::new(config),
+            container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
             docker,
             functions: Arc::new(functions),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -196,5 +233,15 @@ mod tests {
     async fn app_state_is_clone() {
         let state = test_state();
         let _cloned = state.clone();
+    }
+
+    #[test]
+    fn app_state_shutting_down_flag() {
+        let state = test_state();
+        assert!(!state.is_shutting_down());
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(state.is_shutting_down());
     }
 }
