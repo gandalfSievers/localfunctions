@@ -1000,6 +1000,46 @@ impl ContainerManager {
         }
     }
 
+    /// Retrieve the combined stdout and stderr output from a container.
+    ///
+    /// Returns at most the last `max_bytes` bytes of output. Used to collect
+    /// logs for the `X-Amz-Log-Result` response header (LogType: Tail).
+    /// Returns an empty string if logs cannot be retrieved.
+    pub async fn get_container_logs(&self, container_id: &str, max_bytes: usize) -> String {
+        let opts = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            tail: "all".to_string(),
+            ..Default::default()
+        };
+
+        let mut stream = self.docker.logs(container_id, Some(opts));
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(log) => {
+                    let line = match log {
+                        LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
+                            String::from_utf8_lossy(&message).into_owned()
+                        }
+                        _ => continue,
+                    };
+                    output.push_str(&line);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Keep only the last max_bytes bytes.
+        if output.len() > max_bytes {
+            // Find a valid char boundary at or after the cut point.
+            let start = output.len() - max_bytes;
+            let start = output.ceil_char_boundary(start);
+            output = output[start..].to_string();
+        }
+        output
+    }
+
     /// Retrieve the stderr output from a container (last `tail` lines).
     ///
     /// Returns an empty string if logs cannot be retrieved (e.g. container

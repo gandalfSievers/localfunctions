@@ -341,7 +341,7 @@ fn invoke_base_headers(request_id: Uuid) -> HeaderMap {
 ///
 /// Supports the following AWS headers:
 /// - `X-Amz-Invocation-Type`: `RequestResponse` (default) or `Event` (async)
-/// - `X-Amz-Log-Type`: passed through to the runtime (not acted on)
+/// - `X-Amz-Log-Type`: `None` (default) or `Tail` — returns last 4KB of logs base64-encoded in `X-Amz-Log-Result`
 /// - `X-Amz-Client-Context`: passed through to the runtime
 ///
 /// Returns the function response body on success, or an AWS-format error.
@@ -406,6 +406,19 @@ async fn invoke_function_inner(
         );
         return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
     }
+
+    // Check X-Amz-Log-Type — Tail returns the last 4KB of logs base64-encoded.
+    let log_type_tail = match headers.get("X-Amz-Log-Type").and_then(|v| v.to_str().ok()) {
+        Some("Tail") => true,
+        Some("None") | None => false,
+        Some(other) => {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Unsupported log type '{}'. Supported types: None, Tail.",
+                other
+            ));
+            return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
+        }
+    };
 
     // Check X-Amz-Invocation-Type — RequestResponse (default) and Event are supported.
     let is_event_invocation = match headers.get("X-Amz-Invocation-Type").and_then(|v| v.to_str().ok()) {
@@ -635,7 +648,7 @@ async fn invoke_function_inner(
     // Wait for the response with the configured timeout.
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), response_rx).await;
 
-    let response = match result {
+    let mut response = match result {
         Ok(Ok(invocation_result)) => match invocation_result {
             crate::types::InvocationResult::Success { body } => {
                 // AWS enforces a 6,291,556 byte limit on synchronous invocation responses.
@@ -705,7 +718,7 @@ async fn invoke_function_inner(
                 .runtime_bridge
                 .timeout_invocation(request_id)
                 .await;
-            let cid = crashed_container.unwrap_or(container_id);
+            let cid = crashed_container.unwrap_or_else(|| container_id.clone());
             let mgr = state.container_manager.clone();
             tokio::spawn(async move {
                 let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
@@ -732,7 +745,7 @@ async fn invoke_function_inner(
                 .await;
 
             // Kill the container in the background with a short grace period.
-            let cid = timed_out_container.unwrap_or(container_id);
+            let cid = timed_out_container.unwrap_or_else(|| container_id.clone());
             let mgr = state.container_manager.clone();
             tokio::spawn(async move {
                 let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
@@ -749,6 +762,22 @@ async fn invoke_function_inner(
 
     // Stop streaming container logs now that the invocation is complete.
     log_handle.abort();
+
+    // If LogType is Tail, collect the last 4KB of logs and add as a base64-encoded
+    // response header. Only applies to synchronous (RequestResponse) invocations.
+    if log_type_tail {
+        const LOG_TAIL_MAX_BYTES: usize = 4096;
+        let logs = state
+            .container_manager
+            .get_container_logs(&container_id, LOG_TAIL_MAX_BYTES)
+            .await;
+        if !logs.is_empty() {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(logs.as_bytes());
+            if let Ok(value) = encoded.parse() {
+                response.1.insert("X-Amz-Log-Result", value);
+            }
+        }
+    }
 
     // Record invocation metrics.
     let is_error = matches!(
@@ -3440,5 +3469,67 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    // -- X-Amz-Log-Type validation -----------------------------------------
+
+    #[tokio::test]
+    async fn invoke_unsupported_log_type_returns_400() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Log-Type", "Invalid")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["Type"], "InvalidRequestContentException");
+        assert!(json["Message"].as_str().unwrap().contains("log type"));
+    }
+
+    #[tokio::test]
+    async fn invoke_log_type_none_does_not_include_log_result_header() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .header("X-Amz-Log-Type", "None")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Function not found, but the header validation passed
+        assert!(resp.headers().get("X-Amz-Log-Result").is_none());
+    }
+
+    #[tokio::test]
+    async fn invoke_no_log_type_header_does_not_include_log_result() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
+        let app = invoke_routes().with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("X-Amz-Log-Result").is_none());
     }
 }
