@@ -1305,6 +1305,15 @@ pub fn lambda_env_vars(
         "localfunctions/latest".into(),
     );
 
+    // Set an initial _X_AMZN_TRACE_ID so the variable exists from container
+    // start.  Per-invocation trace IDs are delivered via the
+    // Lambda-Runtime-Trace-Id header on /next, and the Lambda runtime client
+    // updates this env var automatically for each invocation.
+    vars.insert(
+        "_X_AMZN_TRACE_ID".into(),
+        "Root=1-00000000-000000000000000000000000;Parent=0000000000000000;Sampled=0".into(),
+    );
+
     // Merge user-configured environment variables without overriding system vars.
     // User vars are inserted before host credentials so they take precedence
     // over forwarded credentials.
@@ -1532,7 +1541,8 @@ mod tests {
     #[test]
     #[serial]
     fn lambda_env_vars_count() {
-        // 9 system vars with no user vars (and no host credentials)
+        // 10 system vars with no user vars (and no host credentials)
+        // (includes _X_AMZN_TRACE_ID placeholder)
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_SESSION_TOKEN");
@@ -1542,7 +1552,19 @@ mod tests {
             mount_aws_dir: false,
         };
         let vars = lambda_env_vars(&func, 9601, "us-east-1", &no_creds);
-        assert_eq!(vars.len(), 9);
+        assert_eq!(vars.len(), 10);
+    }
+
+    #[test]
+    fn lambda_env_vars_contains_trace_id_placeholder() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let trace_var = vars.iter().find(|v| v.starts_with("_X_AMZN_TRACE_ID="));
+        assert!(trace_var.is_some(), "expected _X_AMZN_TRACE_ID env var");
+        let value = trace_var.unwrap().strip_prefix("_X_AMZN_TRACE_ID=").unwrap();
+        assert!(value.starts_with("Root=1-"), "trace placeholder: {}", value);
+        assert!(value.contains(";Parent="), "trace placeholder: {}", value);
+        assert!(value.contains(";Sampled="), "trace placeholder: {}", value);
     }
 
     #[test]

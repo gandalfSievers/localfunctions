@@ -5,9 +5,46 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, info_span, warn, Instrument};
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// X-Ray Trace ID generation
+// ---------------------------------------------------------------------------
+
+/// Generate an AWS X-Ray trace header in the format:
+/// `Root=1-{hex-timestamp}-{96-bit-hex-id};Parent={64-bit-hex-id};Sampled=1`
+fn generate_xray_trace_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Use two UUIDs to get enough random bytes for the 96-bit and 64-bit IDs.
+    let root_rand = Uuid::new_v4();
+    let parent_rand = Uuid::new_v4();
+
+    let root_bytes = root_rand.as_bytes();
+    let parent_bytes = parent_rand.as_bytes();
+
+    // 96-bit (12 bytes) hex ID for Root
+    let root_id: String = root_bytes[..12]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
+    // 64-bit (8 bytes) hex ID for Parent
+    let parent_id: String = parent_bytes[..8]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
+    format!(
+        "Root=1-{:08x}-{};Parent={};Sampled=1",
+        timestamp, root_id, parent_id
+    )
+}
 
 use crate::function::validate_function_name;
 use crate::server::AppState;
@@ -333,6 +370,15 @@ async fn invoke_function_inner(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    // Propagate an incoming trace header, or generate a fresh one.
+    let trace_id = headers
+        .get("X-Amzn-Trace-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(generate_xray_trace_id);
+
+    info!(trace_id = %trace_id, "trace context");
+
     // Compute the deadline from the function's configured timeout.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
@@ -433,7 +479,7 @@ async fn invoke_function_inner(
     // Submit the invocation to the runtime bridge.
     let response_rx = match state
         .runtime_bridge
-        .submit_invocation(&function_name, request_id, body, deadline, None, client_context)
+        .submit_invocation(&function_name, request_id, body, deadline, Some(trace_id), client_context)
         .await
     {
         Ok(rx) => rx,
@@ -2814,5 +2860,48 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["Type"].as_str().unwrap(), "TooManyRequestsException");
+    }
+
+    #[test]
+    fn generate_xray_trace_id_has_correct_format() {
+        let trace_id = generate_xray_trace_id();
+
+        // Must start with "Root=1-"
+        assert!(trace_id.starts_with("Root=1-"), "trace_id: {}", trace_id);
+        // Must contain ";Parent=" and ";Sampled=1"
+        assert!(trace_id.contains(";Parent="), "trace_id: {}", trace_id);
+        assert!(trace_id.ends_with(";Sampled=1"), "trace_id: {}", trace_id);
+
+        // Parse out the components
+        let root_part = trace_id.split(";Parent=").next().unwrap();
+        let root_value = root_part.strip_prefix("Root=1-").unwrap();
+        let parts: Vec<&str> = root_value.split('-').collect();
+        assert_eq!(parts.len(), 2, "Root should have timestamp-id: {}", root_value);
+
+        // Timestamp: 8 hex chars
+        assert_eq!(parts[0].len(), 8, "timestamp hex: {}", parts[0]);
+        assert!(u32::from_str_radix(parts[0], 16).is_ok());
+
+        // Root ID: 24 hex chars (96 bits)
+        assert_eq!(parts[1].len(), 24, "root id hex: {}", parts[1]);
+        assert!(u128::from_str_radix(parts[1], 16).is_ok());
+
+        // Parent ID: 16 hex chars (64 bits)
+        let parent_part = trace_id
+            .split(";Parent=")
+            .nth(1)
+            .unwrap()
+            .split(";Sampled=")
+            .next()
+            .unwrap();
+        assert_eq!(parent_part.len(), 16, "parent id hex: {}", parent_part);
+        assert!(u64::from_str_radix(parent_part, 16).is_ok());
+    }
+
+    #[test]
+    fn generate_xray_trace_id_is_unique() {
+        let id1 = generate_xray_trace_id();
+        let id2 = generate_xray_trace_id();
+        assert_ne!(id1, id2);
     }
 }
