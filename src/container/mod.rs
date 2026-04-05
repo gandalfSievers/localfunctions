@@ -17,8 +17,6 @@ use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
-use uuid::Uuid;
-
 use crate::runtime::RuntimeBridge;
 use crate::types::{ContainerState, FunctionConfig, ServiceError};
 
@@ -1039,7 +1037,7 @@ impl ContainerManager {
         &self,
         container_id: &str,
         function_name: &str,
-        request_id: Uuid,
+        request_id: &str,
     ) -> tokio::task::JoinHandle<()> {
         let opts = LogsOptions::<String> {
             follow: true,
@@ -1047,11 +1045,13 @@ impl ContainerManager {
             stderr: true,
             since: 0,
             timestamps: false,
+            tail: "0".to_string(),
             ..Default::default()
         };
 
         let mut stream = self.docker.logs(container_id, Some(opts));
         let function_name = function_name.to_string();
+        let request_id = request_id.to_string();
 
         tokio::spawn(async move {
             while let Some(item) = stream.next().await {
@@ -3045,10 +3045,11 @@ mod integration_tests {
         );
 
         // Streaming from a nonexistent container should complete quickly without panicking.
+        let request_id = uuid::Uuid::new_v4().to_string();
         let handle = mgr.stream_container_logs(
             "nonexistent-container-id",
             "test-func",
-            Uuid::new_v4(),
+            &request_id,
         );
 
         // The task should finish on its own (stream error → break).
@@ -3076,10 +3077,11 @@ mod integration_tests {
             CredentialForwardingConfig::default(),
         );
 
+        let request_id = uuid::Uuid::new_v4().to_string();
         let handle = mgr.stream_container_logs(
             "nonexistent-container-id",
             "test-func",
-            Uuid::new_v4(),
+            &request_id,
         );
 
         // Aborting should not panic.

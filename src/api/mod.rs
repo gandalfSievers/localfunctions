@@ -479,7 +479,7 @@ async fn invoke_function_inner(
     // Start streaming container stdout/stderr in the background.
     let log_handle = state
         .container_manager
-        .stream_container_logs(&container_id, &function_name, request_id);
+        .stream_container_logs(&container_id, &function_name, &request_id.to_string());
 
     // Submit the invocation to the runtime bridge.
     let response_rx = match state
