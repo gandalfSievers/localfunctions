@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::types::{FunctionConfig, Invocation, ServiceError};
 
@@ -69,6 +70,9 @@ pub enum FunctionConfigError {
 
     #[error("function '{name}': invalid reserved_concurrent_executions {value} — must be between 1 and 1000")]
     InvalidReservedConcurrency { name: String, value: u64 },
+
+    #[error("function '{name}': environment variables total size {actual_size} bytes exceeds the 4096-byte limit")]
+    EnvironmentTooLarge { name: String, actual_size: usize },
 
     #[error("configuration validation failed with {count} error(s):\n{details}")]
     ValidationErrors { count: usize, details: String },
@@ -286,6 +290,11 @@ pub fn parse_functions_config(
             }
         }
 
+        // Validate total environment variable size (4KB limit)
+        if let Err(e) = validate_env_total_size(name, &entry.environment, &handler, memory_size, is_image_uri) {
+            errors.push(e);
+        }
+
         // Only build the config if there are no errors for this function
         // (we still continue to validate other functions)
         let config = FunctionConfig {
@@ -474,6 +483,81 @@ fn validate_env_key(name: &str, key: &str) -> Result<(), FunctionConfigError> {
             name: name.to_string(),
             key: key.to_string(),
         });
+    }
+    Ok(())
+}
+
+/// Maximum total size of environment variables per function (4KB, matching AWS Lambda).
+const ENV_VARS_MAX_SIZE: usize = 4096;
+
+/// Warning threshold for environment variable total size (3.5KB).
+const ENV_VARS_WARN_SIZE: usize = 3584;
+
+/// Calculate the total serialized size of environment variables.
+///
+/// The size is computed as the sum of (key.len() + value.len()) for each entry,
+/// which matches how AWS Lambda measures the limit.
+fn calculate_env_size(vars: &HashMap<String, String>) -> usize {
+    vars.iter().map(|(k, v)| k.len() + v.len()).sum()
+}
+
+/// Build the set of system-injected environment variables that AWS Lambda
+/// injects into every function, so we can include them in the size calculation.
+fn system_env_vars(name: &str, handler: &str, memory_size: u64, is_image_uri: bool) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    vars.insert("AWS_LAMBDA_FUNCTION_NAME".into(), name.to_string());
+    if !is_image_uri || !handler.is_empty() {
+        vars.insert("_HANDLER".into(), handler.to_string());
+    }
+    vars.insert(
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE".into(),
+        memory_size.to_string(),
+    );
+    // Use a representative value for the runtime API endpoint
+    vars.insert("AWS_LAMBDA_RUNTIME_API".into(), "host.docker.internal:9601".into());
+    vars.insert("AWS_REGION".into(), "us-east-1".into());
+    vars.insert("AWS_DEFAULT_REGION".into(), "us-east-1".into());
+    vars.insert("AWS_LAMBDA_FUNCTION_VERSION".into(), "$LATEST".into());
+    vars.insert(
+        "AWS_LAMBDA_LOG_GROUP_NAME".into(),
+        format!("/aws/lambda/{}", name),
+    );
+    vars.insert("AWS_LAMBDA_LOG_STREAM_NAME".into(), "localfunctions/latest".into());
+    vars
+}
+
+/// Validate total environment variable size (keys + values) including system-injected vars.
+///
+/// AWS Lambda enforces a 4KB limit. This validation catches the error locally.
+/// A warning is emitted at 3.5KB to alert developers approaching the limit.
+fn validate_env_total_size(
+    name: &str,
+    user_env: &HashMap<String, String>,
+    handler: &str,
+    memory_size: u64,
+    is_image_uri: bool,
+) -> Result<(), FunctionConfigError> {
+    let mut combined = system_env_vars(name, handler, memory_size, is_image_uri);
+    // User vars that don't collide with system vars
+    for (k, v) in user_env {
+        combined.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+
+    let total_size = calculate_env_size(&combined);
+
+    if total_size > ENV_VARS_MAX_SIZE {
+        return Err(FunctionConfigError::EnvironmentTooLarge {
+            name: name.to_string(),
+            actual_size: total_size,
+        });
+    }
+    if total_size > ENV_VARS_WARN_SIZE {
+        warn!(
+            function = name,
+            size = total_size,
+            limit = ENV_VARS_MAX_SIZE,
+            "environment variables approaching 4KB limit ({total_size}/{ENV_VARS_MAX_SIZE} bytes)"
+        );
     }
     Ok(())
 }
@@ -1339,6 +1423,82 @@ mod tests {
         }"#;
         let config = parse_functions_config(json, dir.path()).unwrap();
         assert_eq!(config.functions["f1"].environment.len(), 3);
+    }
+
+    // -- Environment variable total size validation --------------------------
+
+    #[test]
+    fn error_env_vars_exceed_4kb() {
+        let dir = setup_dirs(&["code"]);
+        // Create a large value that will push total over 4096 bytes
+        // (system vars take up some space, so we need to fill the rest)
+        let big_value = "x".repeat(4000);
+        let json = format!(
+            r#"{{
+            "functions": {{
+                "f1": {{
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "environment": {{
+                        "BIG_VAR": "{big_value}"
+                    }}
+                }}
+            }}
+        }}"#
+        );
+        let err = parse_functions_config(&json, dir.path()).unwrap_err();
+        assert_validation_error_contains(&err, "environment variables total size");
+        assert_validation_error_contains(&err, "exceeds the 4096-byte limit");
+    }
+
+    #[test]
+    fn env_vars_within_limit_succeeds() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "environment": {
+                        "SMALL_VAR": "hello"
+                    }
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].environment["SMALL_VAR"], "hello");
+    }
+
+    #[test]
+    fn env_size_includes_system_vars() {
+        // System vars should be counted toward the limit.
+        // Even with no user vars, system vars exist and are counted.
+        let sys = system_env_vars("test-func", "m.h", 128, false);
+        let size = calculate_env_size(&sys);
+        assert!(size > 0, "system env vars should have non-zero size");
+        // Verify the size is reasonable (system vars should be a few hundred bytes)
+        assert!(size < 1000, "system env vars alone should be under 1KB, got {size}");
+    }
+
+    #[test]
+    fn env_size_calculation_correct() {
+        let mut vars = HashMap::new();
+        vars.insert("KEY".to_string(), "VAL".to_string());
+        // KEY=3 + VAL=3 = 6
+        assert_eq!(calculate_env_size(&vars), 6);
+
+        vars.insert("ANOTHER".to_string(), "VALUE".to_string());
+        // 6 + ANOTHER=7 + VALUE=5 = 18
+        assert_eq!(calculate_env_size(&vars), 18);
+    }
+
+    #[test]
+    fn env_vars_warning_threshold() {
+        // Verify constants are correct
+        assert_eq!(ENV_VARS_MAX_SIZE, 4096);
+        assert_eq!(ENV_VARS_WARN_SIZE, 3584); // 3.5 * 1024
     }
 
     // -- Multiple errors collected -------------------------------------------
