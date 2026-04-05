@@ -47,6 +47,9 @@ tokio-stream = "0.1"
 # CRC for AWS event stream encoding
 crc32c = "0.6"
 
+# URL parsing
+form_urlencoded = "1"
+
 # Utilities
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }

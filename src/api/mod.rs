@@ -165,13 +165,13 @@ pub fn invoke_routes() -> Router<AppState> {
             "/2021-11-15/functions/:function_name/response-streaming-invocations",
             post(invoke_function_streaming),
         )
-        // Function URL endpoints
+        // Function URL endpoints — placed last so static routes take priority.
         .route(
-            "/url/:function_name",
+            "/:function_name",
             axum::routing::any(function_url::function_url_handler),
         )
         .route(
-            "/url/:function_name/*path",
+            "/:function_name/*path",
             axum::routing::any(function_url::function_url_handler),
         )
 }
@@ -4937,7 +4937,7 @@ mod tests {
         let app = invoke_routes().with_state(test_state());
         let resp = app
             .oneshot(
-                Request::get("/url/nonexistent")
+                Request::get("/nonexistent")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4951,7 +4951,7 @@ mod tests {
         let app = invoke_routes().with_state(test_state_with_url_function());
         let resp = app
             .oneshot(
-                Request::get("/url/no-url-func")
+                Request::get("/no-url-func")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4972,7 +4972,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method(*method)
-                        .uri("/url/url-func")
+                        .uri("/url-func")
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -4990,7 +4990,7 @@ mod tests {
         let app = invoke_routes().with_state(state);
         let resp = app
             .oneshot(
-                Request::get("/url/url-func/some/path")
+                Request::get("/url-func/some/path")
                     .body(Body::empty())
                     .unwrap(),
             )

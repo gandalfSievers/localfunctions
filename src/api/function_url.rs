@@ -3,13 +3,18 @@
 //! Transforms incoming HTTP requests into the Lambda Function URL event format
 //! (payload version 2.0) and translates function responses back to HTTP
 //! responses, matching the behavior of real AWS Lambda Function URLs.
+//!
+//! Supports both buffered and streaming response modes. When the function
+//! responds via the streaming Runtime API with a metadata prelude (JSON +
+//! null-byte separator), the body is streamed back to the HTTP client using
+//! chunked transfer encoding.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use base64::Engine;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,6 +22,7 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::server::AppState;
+use crate::types::StreamChunk;
 
 // ---------------------------------------------------------------------------
 // Function URL event format (payload version 2.0)
@@ -90,7 +96,10 @@ fn default_status_code() -> u16 {
 
 /// Handle an incoming Function URL request for the given function.
 ///
-/// Route: `/url/{function_name}` or `/url/{function_name}/*path` — any HTTP method.
+/// Route: `/{function_name}` or `/{function_name}/*path` — any HTTP method.
+///
+/// Uses streaming invocation internally so that functions using the streaming
+/// Runtime API can have their responses forwarded as chunked HTTP.
 pub async fn function_url_handler(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
@@ -114,14 +123,16 @@ pub async fn function_url_handler(
                     StatusCode::NOT_FOUND,
                     HeaderMap::new(),
                     Body::from("Not Found"),
-                );
+                )
+                    .into_response();
             }
             None => {
                 return (
                     StatusCode::NOT_FOUND,
                     HeaderMap::new(),
                     Body::from("Not Found"),
-                );
+                )
+                    .into_response();
             }
         };
 
@@ -145,7 +156,8 @@ pub async fn function_url_handler(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     HeaderMap::new(),
                     Body::from("Internal Server Error"),
-                );
+                )
+                    .into_response();
             }
         };
 
@@ -156,12 +168,13 @@ pub async fn function_url_handler(
         let timeout_secs = function_config.timeout;
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let invoke_start = std::time::Instant::now();
 
         // Ensure a container is available.
         let container_id =
             match crate::api::acquire_container(&state, function_config, &request_id).await {
                 Ok(id) => id,
-                Err(resp) => return resp,
+                Err(resp) => return resp.into_response(),
             };
 
         info!(
@@ -178,16 +191,23 @@ pub async fn function_url_handler(
             &request_id.to_string(),
         );
 
-        // Submit the invocation.
+        // Submit the invocation as streaming so we can support chunked responses.
         let trace_id = headers
             .get("X-Amzn-Trace-Id")
             .and_then(|v| v.to_str().ok())
             .map(String::from)
             .unwrap_or_else(super::generate_xray_trace_id);
 
-        let response_rx = match state
+        let mut stream_rx = match state
             .runtime_bridge
-            .submit_invocation(&function_name, request_id, payload, deadline, Some(trace_id), None)
+            .submit_streaming_invocation(
+                &function_name,
+                request_id,
+                payload,
+                deadline,
+                Some(trace_id),
+                None,
+            )
             .await
         {
             Ok(rx) => rx,
@@ -199,59 +219,194 @@ pub async fn function_url_handler(
                     StatusCode::BAD_GATEWAY,
                     HeaderMap::new(),
                     Body::from("Bad Gateway"),
-                );
+                )
+                    .into_response();
             }
         };
 
-        // Wait for the response.
-        let result =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), response_rx).await;
+        // Read chunks from the stream. We buffer initial data to determine
+        // whether the function used a streaming metadata prelude (JSON + \0 +
+        // body) or a traditional buffered JSON response.
+        let mut initial_buf = BytesMut::new();
+        let mut had_error = false;
+        let mut error_type = String::new();
+        let mut error_message = String::new();
+        let mut timed_out = false;
+        let mut remaining_chunks: Vec<Bytes> = Vec::new();
+        let mut found_prelude = false;
 
-        // Release container after invocation completes.
+        loop {
+            match tokio::time::timeout_at(deadline, stream_rx.recv()).await {
+                Ok(Some(StreamChunk::Data(data))) => {
+                    if !found_prelude {
+                        initial_buf.extend_from_slice(&data);
+                        // Check for null byte separator (streaming metadata prelude).
+                        if let Some(pos) = initial_buf.iter().position(|&b| b == 0) {
+                            found_prelude = true;
+                            // Everything after the null byte is body data.
+                            let after_null = initial_buf.split_off(pos + 1);
+                            // Remove the null byte from initial_buf.
+                            initial_buf.truncate(pos);
+                            if !after_null.is_empty() {
+                                remaining_chunks.push(after_null.freeze());
+                            }
+                        }
+                    } else {
+                        remaining_chunks.push(data);
+                    }
+                }
+                Ok(Some(StreamChunk::Error {
+                    error_type: et,
+                    error_message: em,
+                })) => {
+                    had_error = true;
+                    error_type = et;
+                    error_message = em;
+                    break;
+                }
+                Ok(Some(StreamChunk::Complete)) => break,
+                Ok(None) => {
+                    // Channel closed — container may have crashed.
+                    had_error = true;
+                    error_type = "ServiceException".into();
+                    error_message = "Container exited without completing".into();
+                    break;
+                }
+                Err(_) => {
+                    // Timeout.
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+
         log_handle.abort();
         state.container_manager.release_container(&container_id).await;
 
-        // Record metrics (duration is approximate since we don't track the start).
-        state.metrics.record_invocation(&function_name, Duration::from_millis(0), false, false);
+        // Record metrics with actual duration and error/timeout status.
+        state.metrics.record_invocation(
+            &function_name,
+            invoke_start.elapsed(),
+            had_error,
+            timed_out,
+        );
 
-        match result {
-            Ok(Ok(crate::types::InvocationResult::Success { body })) => {
-                translate_function_response(&body)
+        if timed_out {
+            warn!("function timed out");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                HeaderMap::new(),
+                Body::from(format!(
+                    "{{\"errorMessage\":\"Task timed out after {} seconds\"}}",
+                    timeout_secs
+                )),
+            )
+                .into_response();
+        }
+
+        if had_error {
+            warn!(error_type = %error_type, error_message = %error_message, "function error");
+            let error_body = serde_json::json!({
+                "errorType": error_type,
+                "errorMessage": error_message,
+            });
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
+                Body::from(serde_json::to_string(&error_body).unwrap_or_default()),
+            )
+                .into_response();
+        }
+
+        if found_prelude {
+            // Streaming response with metadata prelude.
+            // Parse the metadata JSON from the prelude.
+            let metadata_str = String::from_utf8_lossy(&initial_buf);
+            let metadata: FunctionUrlResponse =
+                match serde_json::from_str(&metadata_str) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(error = %e, "failed to parse streaming metadata prelude");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            HeaderMap::new(),
+                            Body::from("Internal Server Error"),
+                        )
+                            .into_response();
+                    }
+                };
+
+            let status =
+                StatusCode::from_u16(metadata.status_code).unwrap_or(StatusCode::OK);
+
+            let mut resp_headers = HeaderMap::new();
+            for (key, value) in &metadata.headers {
+                if let (Ok(k), Ok(v)) = (
+                    key.parse::<http::header::HeaderName>(),
+                    value.parse(),
+                ) {
+                    resp_headers.insert(k, v);
+                }
             }
-            Ok(Ok(crate::types::InvocationResult::Error {
-                error_type,
-                error_message,
-            })) => {
-                warn!(error_type = %error_type, error_message = %error_message, "function error");
-                let error_body = serde_json::json!({
-                    "errorType": error_type,
-                    "errorMessage": error_message,
-                });
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    HeaderMap::new(),
-                    Body::from(serde_json::to_string(&error_body).unwrap_or_default()),
-                )
+            for cookie in &metadata.cookies {
+                if let Ok(v) = cookie.parse() {
+                    resp_headers.append(http::header::SET_COOKIE, v);
+                }
             }
-            Ok(Ok(crate::types::InvocationResult::Timeout)) | Err(_) => {
-                warn!("function timed out");
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    HeaderMap::new(),
-                    Body::from(format!(
-                        "{{\"errorMessage\":\"Task timed out after {} seconds\"}}",
-                        timeout_secs
-                    )),
-                )
+
+            // If there are buffered body chunks but the stream is complete,
+            // return them directly.
+            if remaining_chunks.is_empty() {
+                let mut response = axum::response::Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap();
+                *response.headers_mut() = resp_headers;
+                return response;
             }
-            Ok(Err(_)) => {
-                warn!("function container crashed");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    HeaderMap::new(),
-                    Body::from("{\"errorMessage\":\"Container crashed\"}"),
-                )
-            }
+
+            // Stream any remaining body chunks plus whatever comes from the
+            // receiver (in case the loop broke on Complete before draining).
+            let (body_tx, body_rx) =
+                tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+            // Send buffered chunks and then continue draining the receiver.
+            tokio::spawn(async move {
+                for chunk in remaining_chunks {
+                    if body_tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                // Drain any remaining stream chunks (in case Complete hasn't
+                // been received yet — though typically it has by this point).
+                while let Some(chunk) = stream_rx.recv().await {
+                    match chunk {
+                        StreamChunk::Data(data) => {
+                            if body_tx.send(Ok(data)).await.is_err() {
+                                return;
+                            }
+                        }
+                        StreamChunk::Complete | StreamChunk::Error { .. } => break,
+                    }
+                }
+            });
+
+            let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+            let response_body = Body::from_stream(stream);
+
+            let mut response = axum::response::Response::builder()
+                .status(status)
+                .body(response_body)
+                .unwrap();
+            *response.headers_mut() = resp_headers;
+            response
+        } else {
+            // Buffered response — treat initial_buf as the complete JSON
+            // response body (same as before).
+            let body_str = String::from_utf8_lossy(&initial_buf);
+            let (status, resp_headers, resp_body) =
+                translate_function_response(&body_str);
+            (status, resp_headers, resp_body).into_response()
         }
     }
     .instrument(span)
@@ -292,9 +447,9 @@ fn build_function_url_event(
         }
     }
 
-    // Parse query string parameters.
+    // Parse query string parameters. AWS joins duplicate keys with commas.
     let raw_query = uri.query().unwrap_or("").to_string();
-    let query_params: HashMap<String, String> = url_decode_query(&raw_query);
+    let query_params = parse_query_params(&raw_query);
 
     // Determine the raw path relative to the function.
     let raw_path = if let Some(p) = sub_path {
@@ -325,7 +480,7 @@ fn build_function_url_event(
         .unwrap_or_default();
 
     // Generate a synthetic API ID from the function name.
-    let api_id = format!("{:.12}", format!("{:x}", md5_simple(function_name)));
+    let api_id = format!("{:.12}", format!("{:x}", fnv_hash(function_name)));
     let domain_name = format!(
         "{}.lambda-url.{}.on.aws",
         api_id, state.config.region
@@ -412,50 +567,23 @@ fn translate_function_response(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Simple query string parser.
-fn url_decode_query(query: &str) -> HashMap<String, String> {
+/// Parse query string parameters, joining duplicate keys with commas per the
+/// AWS Lambda Function URL v2.0 payload specification.
+fn parse_query_params(query: &str) -> HashMap<String, String> {
     if query.is_empty() {
         return HashMap::new();
     }
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?;
-            let value = parts.next().unwrap_or("");
-            Some((
-                percent_decode(key),
-                percent_decode(value),
-            ))
-        })
-        .collect()
-}
-
-/// Minimal percent decoding for query parameters.
-fn percent_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next();
-            let lo = chars.next();
-            if let (Some(h), Some(l)) = (hi, lo) {
-                let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(byte) = u8::from_str_radix(s, 16) {
-                        result.push(byte as char);
-                        continue;
-                    }
-                }
-            }
-            result.push('%');
-        } else if b == b'+' {
-            result.push(' ');
-        } else {
-            result.push(b as char);
-        }
+    let mut params: HashMap<String, String> = HashMap::new();
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        params
+            .entry(key.into_owned())
+            .and_modify(|existing| {
+                existing.push(',');
+                existing.push_str(&value);
+            })
+            .or_insert_with(|| value.into_owned());
     }
-    result
+    params
 }
 
 /// Check if the content type indicates binary data.
@@ -470,8 +598,8 @@ fn is_binary_content_type(content_type: &str) -> bool {
         || ct.starts_with("multipart/form-data")
 }
 
-/// Simple non-cryptographic hash to generate a stable synthetic API ID.
-fn md5_simple(input: &str) -> u64 {
+/// FNV-1a hash to generate a stable synthetic API ID from a function name.
+fn fnv_hash(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.bytes() {
         hash ^= byte as u64;
@@ -533,36 +661,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_url_decode_query_simple() {
-        let result = url_decode_query("foo=bar&baz=qux");
+    fn test_parse_query_params_simple() {
+        let result = parse_query_params("foo=bar&baz=qux");
         assert_eq!(result.get("foo").unwrap(), "bar");
         assert_eq!(result.get("baz").unwrap(), "qux");
     }
 
     #[test]
-    fn test_url_decode_query_empty() {
-        let result = url_decode_query("");
+    fn test_parse_query_params_empty() {
+        let result = parse_query_params("");
         assert!(result.is_empty());
     }
 
     #[test]
-    fn test_url_decode_query_encoded() {
-        let result = url_decode_query("key=hello%20world&other=a%2Bb");
+    fn test_parse_query_params_encoded() {
+        let result = parse_query_params("key=hello%20world&other=a%2Bb");
         assert_eq!(result.get("key").unwrap(), "hello world");
         assert_eq!(result.get("other").unwrap(), "a+b");
     }
 
     #[test]
-    fn test_url_decode_query_plus_as_space() {
-        let result = url_decode_query("key=hello+world");
+    fn test_parse_query_params_plus_as_space() {
+        let result = parse_query_params("key=hello+world");
         assert_eq!(result.get("key").unwrap(), "hello world");
     }
 
     #[test]
-    fn test_percent_decode_basic() {
-        assert_eq!(percent_decode("hello%20world"), "hello world");
-        assert_eq!(percent_decode("no+encoding"), "no encoding");
-        assert_eq!(percent_decode("plain"), "plain");
+    fn test_parse_query_params_duplicate_keys() {
+        let result = parse_query_params("color=red&color=blue");
+        assert_eq!(result.get("color").unwrap(), "red,blue");
+    }
+
+    #[test]
+    fn test_parse_query_params_triple_duplicate() {
+        let result = parse_query_params("x=1&x=2&x=3");
+        assert_eq!(result.get("x").unwrap(), "1,2,3");
+    }
+
+    #[test]
+    fn test_parse_query_params_multibyte_utf8() {
+        // Percent-encoded multi-byte UTF-8: "日本" = %E6%97%A5%E6%9C%AC
+        let result = parse_query_params("lang=%E6%97%A5%E6%9C%AC");
+        assert_eq!(result.get("lang").unwrap(), "日本");
     }
 
     #[test]
@@ -639,11 +779,11 @@ mod tests {
     }
 
     #[test]
-    fn test_md5_simple_deterministic() {
-        let a = md5_simple("my-function");
-        let b = md5_simple("my-function");
+    fn test_fnv_hash_deterministic() {
+        let a = fnv_hash("my-function");
+        let b = fnv_hash("my-function");
         assert_eq!(a, b);
-        assert_ne!(md5_simple("func-a"), md5_simple("func-b"));
+        assert_ne!(fnv_hash("func-a"), fnv_hash("func-b"));
     }
 
     #[test]
