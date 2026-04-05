@@ -114,6 +114,8 @@ struct RawFunctionEntry {
     architecture: Option<String>,
     #[serde(default)]
     layers: Vec<String>,
+    #[serde(default)]
+    function_url_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +350,7 @@ pub fn parse_functions_config(
             reserved_concurrent_executions: entry.reserved_concurrent_executions,
             architecture,
             layers,
+            function_url_enabled: entry.function_url_enabled,
         };
 
         functions.insert(name.clone(), config);

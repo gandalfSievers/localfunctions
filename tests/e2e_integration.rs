@@ -69,6 +69,7 @@ async fn build_e2e_state(
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
                 layers: vec![],
+            function_url_enabled: false,
             },
         );
         let (tx, rx) = tokio::sync::mpsc::channel(10);

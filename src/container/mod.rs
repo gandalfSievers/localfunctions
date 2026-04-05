@@ -1694,6 +1694,7 @@ mod tests {
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
             layers: vec![],
+            function_url_enabled: false,
         }
     }
 
@@ -2987,6 +2988,7 @@ mod integration_tests {
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
             layers: vec![],
+            function_url_enabled: false,
         };
 
         // Create and start

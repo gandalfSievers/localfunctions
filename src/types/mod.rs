@@ -49,6 +49,9 @@ pub struct FunctionConfig {
     /// Multiple layers are merged in order, with later layers taking precedence.
     #[serde(default)]
     pub layers: Vec<PathBuf>,
+    /// When true, this function gets a Function URL endpoint at `/{name}/`.
+    #[serde(default)]
+    pub function_url_enabled: bool,
 }
 
 #[allow(dead_code)]
@@ -262,6 +265,7 @@ mod tests {
             reserved_concurrent_executions: None,
             architecture: "arm64".into(),
             layers: vec![],
+            function_url_enabled: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -316,6 +320,7 @@ mod tests {
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
             layers: vec![],
+            function_url_enabled: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -340,6 +345,7 @@ mod tests {
             reserved_concurrent_executions: None,
             architecture: "x86_64".into(),
             layers: vec![],
+            function_url_enabled: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("image_uri"));

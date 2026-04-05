@@ -1,4 +1,5 @@
 mod eventstream;
+pub(crate) mod function_url;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -163,6 +164,15 @@ pub fn invoke_routes() -> Router<AppState> {
         .route(
             "/2021-11-15/functions/:function_name/response-streaming-invocations",
             post(invoke_function_streaming),
+        )
+        // Function URL endpoints
+        .route(
+            "/url/:function_name",
+            axum::routing::any(function_url::function_url_handler),
+        )
+        .route(
+            "/url/:function_name/*path",
+            axum::routing::any(function_url::function_url_handler),
         )
 }
 
@@ -1299,6 +1309,100 @@ async fn bootstrap_failure_response(
 }
 
 // ---------------------------------------------------------------------------
+// Shared container acquisition (used by Invoke API and Function URL)
+// ---------------------------------------------------------------------------
+
+/// Acquire a container for the given function, reusing a warm one or cold-
+/// starting a new one.  Returns the container ID on success or an HTTP error
+/// tuple that the caller can return directly.
+pub(crate) async fn acquire_container(
+    state: &AppState,
+    function_config: &crate::types::FunctionConfig,
+    request_id: &Uuid,
+) -> Result<String, (StatusCode, HeaderMap, axum::body::Body)> {
+    use axum::body::Body;
+
+    let function_name = &function_config.name;
+
+    if let Some(id) = state.container_manager.claim_idle_container(function_name).await {
+        debug!(container_id = %id, "warm container claimed");
+        return Ok(id);
+    }
+
+    let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
+    if !state.container_manager.acquire_container_slot(acquire_timeout).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            Body::from("Rate exceeded: max concurrent containers reached"),
+        ));
+    }
+
+    debug!("no warm container available, cold starting");
+    let cold_id = match state.container_manager.create_and_start(function_config).await {
+        Ok(id) => id,
+        Err(e) => {
+            state.container_manager.release_container_slot();
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
+                Body::from(format!("Failed to start container: {e}")),
+            ));
+        }
+    };
+
+    state
+        .container_manager
+        .set_state(&cold_id, ContainerState::Busy)
+        .await;
+
+    let ready_signal = state
+        .runtime_bridge
+        .register_ready_signal(&cold_id)
+        .await;
+
+    let init_timeout = Duration::from_secs(state.config.init_timeout);
+    let mgr = state.container_manager.clone();
+    let wait_id = cold_id.clone();
+
+    enum BootstrapOutcome {
+        Ready,
+        Exited(Option<i64>),
+        Timeout,
+    }
+
+    let outcome = tokio::select! {
+        _ = ready_signal.notified() => BootstrapOutcome::Ready,
+        exit_code = async { mgr.wait_for_exit(&wait_id).await } => {
+            BootstrapOutcome::Exited(exit_code)
+        }
+        _ = tokio::time::sleep(init_timeout) => {
+            if state.runtime_bridge.is_ready(&cold_id).await {
+                BootstrapOutcome::Ready
+            } else {
+                BootstrapOutcome::Timeout
+            }
+        }
+    };
+
+    match outcome {
+        BootstrapOutcome::Ready => Ok(cold_id),
+        BootstrapOutcome::Exited(exit_code) => {
+            let (status, _, body) = bootstrap_failure_response(
+                state, &cold_id, function_name, false, exit_code, invoke_base_headers(*request_id),
+            ).await;
+            Err((status, HeaderMap::new(), Body::from(body)))
+        }
+        BootstrapOutcome::Timeout => {
+            let (status, _, body) = bootstrap_failure_response(
+                state, &cold_id, function_name, true, None, invoke_base_headers(*request_id),
+            ).await;
+            Err((status, HeaderMap::new(), Body::from(body)))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runtime API routes (internal, port 9601 by default)
 // ---------------------------------------------------------------------------
 
@@ -2250,6 +2354,7 @@ mod tests {
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
                 layers: vec![],
+                function_url_enabled: false,
             },
         );
         functions_map.insert(
@@ -2268,6 +2373,7 @@ mod tests {
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
                 layers: vec![],
+                function_url_enabled: false,
             },
         );
         let functions = FunctionsConfig {
@@ -3121,6 +3227,7 @@ mod tests {
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
                 layers: vec![],
+                function_url_enabled: false,
             },
         );
         let functions = FunctionsConfig {
@@ -3976,6 +4083,7 @@ mod tests {
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
                 layers: vec![],
+                function_url_enabled: false,
             },
         );
         let functions = FunctionsConfig {
@@ -4769,5 +4877,126 @@ mod tests {
             }
             _ => panic!("expected INVOKE event"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Function URL routing tests
+    // -----------------------------------------------------------------------
+
+    fn test_state_with_url_function() -> AppState {
+        let mut state = test_state();
+        let mut functions_map = HashMap::new();
+        functions_map.insert(
+            "url-func".to_string(),
+            crate::types::FunctionConfig {
+                name: "url-func".into(),
+                runtime: "python3.12".into(),
+                handler: "main.handler".into(),
+                code_path: std::path::PathBuf::from("/tmp/code"),
+                timeout: 30,
+                memory_size: 128,
+                ephemeral_storage_mb: 512,
+                environment: HashMap::new(),
+                image: None,
+                image_uri: None,
+                reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
+                layers: vec![],
+                function_url_enabled: true,
+            },
+        );
+        functions_map.insert(
+            "no-url-func".to_string(),
+            crate::types::FunctionConfig {
+                name: "no-url-func".into(),
+                runtime: "python3.12".into(),
+                handler: "main.handler".into(),
+                code_path: std::path::PathBuf::from("/tmp/code"),
+                timeout: 30,
+                memory_size: 128,
+                ephemeral_storage_mb: 512,
+                environment: HashMap::new(),
+                image: None,
+                image_uri: None,
+                reserved_concurrent_executions: None,
+                architecture: "x86_64".into(),
+                layers: vec![],
+                function_url_enabled: false,
+            },
+        );
+        let functions = FunctionsConfig {
+            functions: functions_map,
+            runtime_images: HashMap::new(),
+        };
+        Arc::get_mut(&mut state.functions).map(|f| *f = functions);
+        state
+    }
+
+    #[tokio::test]
+    async fn function_url_returns_404_for_unknown_function() {
+        let app = invoke_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/url/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn function_url_returns_404_for_disabled_function() {
+        let app = invoke_routes().with_state(test_state_with_url_function());
+        let resp = app
+            .oneshot(
+                Request::get("/url/no-url-func")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn function_url_accepts_any_http_method() {
+        // For an enabled function, the route should match any method.
+        // We can't test full invocation without Docker, but we can verify the
+        // route matches (it will fail at container acquisition, not 404/405).
+        let state = test_state_with_url_function();
+        for method in &["GET", "POST", "PUT", "DELETE", "PATCH"] {
+            let app = invoke_routes().with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(*method)
+                        .uri("/url/url-func")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Should not be 404 or 405 — the route matched.
+            assert_ne!(resp.status(), StatusCode::NOT_FOUND, "method {} returned 404", method);
+            assert_ne!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "method {} returned 405", method);
+        }
+    }
+
+    #[tokio::test]
+    async fn function_url_with_subpath_matches() {
+        let state = test_state_with_url_function();
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::get("/url/url-func/some/path")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should not be 404 — the route with wildcard path matched.
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
