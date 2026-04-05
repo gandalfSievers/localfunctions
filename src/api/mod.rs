@@ -4,9 +4,23 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
+use serde::Serialize;
 
 use crate::server::AppState;
 use crate::types::{AwsErrorResponse, ServiceError};
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    docker: DockerStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct DockerStatus {
+    connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Invoke API routes (external, port 9600 by default)
@@ -21,9 +35,31 @@ pub fn invoke_routes() -> Router<AppState> {
         )
 }
 
-/// Health check endpoint.
-async fn health() -> StatusCode {
-    StatusCode::OK
+/// Health check endpoint — pings Docker daemon and reports connectivity.
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let docker_status = match state.docker.ping().await {
+        Ok(_) => DockerStatus {
+            connected: true,
+            error: None,
+        },
+        Err(e) => DockerStatus {
+            connected: false,
+            error: Some(e.to_string()),
+        },
+    };
+
+    let status = if docker_status.connected {
+        "healthy"
+    } else {
+        "degraded"
+    };
+
+    let response = HealthResponse {
+        status,
+        docker: docker_status,
+    };
+
+    (StatusCode::OK, Json(response))
 }
 
 /// Invoke a Lambda function by name (stub — will be wired to ContainerManager).
@@ -141,13 +177,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_health_returns_ok() {
+    async fn invoke_health_returns_ok_with_json() {
         let app = invoke_routes().with_state(test_state());
         let resp = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("status").is_some());
+        assert!(json.get("docker").is_some());
+        assert!(json["docker"].get("connected").is_some());
     }
 
     #[tokio::test]
@@ -165,13 +208,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_health_returns_ok() {
+    async fn runtime_health_returns_ok_with_json() {
         let app = runtime_routes().with_state(test_state());
         let resp = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("status").is_some());
+        assert!(json.get("docker").is_some());
     }
 
     #[tokio::test]
