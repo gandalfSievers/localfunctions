@@ -49,6 +49,7 @@ fn generate_xray_trace_id() -> String {
     )
 }
 
+use crate::extensions::ExtensionEventType;
 use crate::function::validate_function_name;
 use crate::server::AppState;
 
@@ -1320,6 +1321,15 @@ pub fn runtime_routes() -> Router<AppState> {
             "/2018-06-01/runtime/init/error",
             post(init_error),
         )
+        // Extensions API
+        .route(
+            "/2020-01-01/extension/register",
+            post(extension_register),
+        )
+        .route(
+            "/2020-01-01/extension/event/next",
+            get(extension_event_next),
+        )
 }
 
 /// Header sent by containers to identify which function they serve.
@@ -1463,6 +1473,20 @@ async fn next_invocation(
                 request_id = %request_id,
                 "dispatching invocation to container"
             );
+
+            // Notify registered extensions of the INVOKE event.
+            let arn_for_ext = format!(
+                "arn:aws:lambda:{}:{}:function:{}",
+                state.config.region, state.config.account_id, function_name
+            );
+            let trace_for_ext = trace_id.as_deref().unwrap_or("");
+            state.extension_registry.notify_invoke(
+                &function_name,
+                &request_id.to_string(),
+                &arn_for_ext,
+                deadline_ms.parse().unwrap_or(0),
+                trace_for_ext,
+            ).await;
 
             (StatusCode::OK, response_headers, payload.to_vec())
         }
@@ -1799,6 +1823,225 @@ async fn init_error(
     (StatusCode::BAD_GATEWAY, Json(err_response))
 }
 
+// ---------------------------------------------------------------------------
+// Extensions API
+// ---------------------------------------------------------------------------
+
+/// Header used by extensions to identify themselves after registration.
+const HEADER_EXTENSION_ID: &str = "Lambda-Extension-Identifier";
+/// Header sent by extensions during registration to provide their name.
+const HEADER_EXTENSION_NAME: &str = "Lambda-Extension-Name";
+
+/// Request body for extension registration.
+#[derive(Debug, Deserialize)]
+struct ExtensionRegisterRequest {
+    events: Vec<ExtensionEventType>,
+}
+
+/// POST /2020-01-01/extension/register
+///
+/// Called by Lambda extensions during the INIT phase to register with the
+/// Extensions API. The extension specifies which lifecycle events it wants
+/// to receive (INVOKE, SHUTDOWN).
+///
+/// Required headers:
+/// - `Lambda-Extension-Name`: Human-readable extension name
+/// - `Lambda-Runtime-Function-Name`: Function this extension belongs to
+///
+/// Returns the extension identifier in the `Lambda-Extension-Identifier`
+/// response header.
+async fn extension_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    // Extract extension name from header.
+    let extension_name = match headers
+        .get(HEADER_EXTENSION_NAME)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(name) => name.to_string(),
+        None => {
+            warn!(
+                "extension /register called without {} header",
+                HEADER_EXTENSION_NAME
+            );
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Missing required header: {}",
+                HEADER_EXTENSION_NAME
+            ));
+            return (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+    };
+
+    // Extract function name from header.
+    let function_name = match headers
+        .get(HEADER_FUNCTION_NAME)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(name) => name.to_string(),
+        None => {
+            warn!(
+                "extension /register called without {} header",
+                HEADER_FUNCTION_NAME
+            );
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Missing required header: {}",
+                HEADER_FUNCTION_NAME
+            ));
+            return (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+    };
+
+    // Parse the request body for event subscriptions.
+    let register_req: ExtensionRegisterRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Invalid registration body: {}",
+                e
+            ));
+            return (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+    };
+
+    if register_req.events.is_empty() {
+        let err =
+            ServiceError::InvalidRequestContent("events array must not be empty".into());
+        return (
+            err.status_code(),
+            HeaderMap::new(),
+            err.to_aws_response().to_json_bytes(),
+        );
+    }
+
+    // Register the extension.
+    let extension_id: Uuid = state
+        .extension_registry
+        .register(&extension_name, &function_name, register_req.events)
+        .await;
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HEADER_EXTENSION_ID,
+        extension_id.to_string().parse().unwrap(),
+    );
+
+    let response_body = serde_json::json!({
+        "functionName": function_name,
+        "functionVersion": "$LATEST",
+        "handler": "",
+    });
+
+    (
+        StatusCode::OK,
+        response_headers,
+        serde_json::to_vec(&response_body).unwrap_or_default(),
+    )
+}
+
+/// GET /2020-01-01/extension/event/next
+///
+/// Called by registered Lambda extensions to long-poll for the next lifecycle
+/// event. The extension identifies itself via the `Lambda-Extension-Identifier`
+/// header.
+///
+/// Returns INVOKE events before each function invocation and a SHUTDOWN event
+/// when the execution environment is shutting down.
+async fn extension_event_next(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Extract extension identifier from header.
+    let extension_id_str = match headers
+        .get(HEADER_EXTENSION_ID)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(id) => id.to_string(),
+        None => {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Missing required header: {}",
+                HEADER_EXTENSION_ID
+            ));
+            return (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+    };
+
+    let extension_id = match Uuid::parse_str(&extension_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            let err = ServiceError::InvalidRequestContent(format!(
+                "Invalid extension identifier: {}",
+                extension_id_str
+            ));
+            return (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            );
+        }
+    };
+
+    // Verify the extension is registered.
+    if !state.extension_registry.is_registered(extension_id).await {
+        let err = ServiceError::InvalidRequestContent(format!(
+            "Extension not registered: {}",
+            extension_id
+        ));
+        return (
+            err.status_code(),
+            HeaderMap::new(),
+            err.to_aws_response().to_json_bytes(),
+        );
+    }
+
+    debug!(
+        extension_id = %extension_id,
+        "extension long-polling for next event"
+    );
+
+    // Long-poll for the next event.
+    match state.extension_registry.next_event(extension_id).await {
+        Some(event) => {
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(
+                HEADER_EXTENSION_ID,
+                extension_id.to_string().parse().unwrap(),
+            );
+
+            let body = serde_json::to_vec(&event).unwrap_or_default();
+            (StatusCode::OK, response_headers, body)
+        }
+        None => {
+            // Extension was deregistered or channel closed.
+            let err = ServiceError::ServiceException(
+                "Extension event channel closed".into(),
+            );
+            (
+                err.status_code(),
+                HeaderMap::new(),
+                err.to_aws_response().to_json_bytes(),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1862,6 +2105,9 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
             metrics: Arc::new(crate::metrics::MetricsCollector::new()),
+            extension_registry: Arc::new(crate::extensions::ExtensionRegistry::new(
+                tokio::sync::watch::channel(false).1,
+            )),
         }
     }
 
@@ -2051,6 +2297,9 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
             metrics: Arc::new(crate::metrics::MetricsCollector::new()),
+            extension_registry: Arc::new(crate::extensions::ExtensionRegistry::new(
+                tokio::sync::watch::channel(false).1,
+            )),
         }
     }
 
@@ -2921,6 +3170,9 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
             metrics: Arc::new(crate::metrics::MetricsCollector::new()),
+            extension_registry: Arc::new(crate::extensions::ExtensionRegistry::new(
+                tokio::sync::watch::channel(false).1,
+            )),
         };
 
         (state, shutdown_tx)
@@ -3768,6 +4020,9 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
             metrics: Arc::new(crate::metrics::MetricsCollector::new()),
+            extension_registry: Arc::new(crate::extensions::ExtensionRegistry::new(
+                tokio::sync::watch::channel(false).1,
+            )),
         };
 
         let app = crate::server::invoke_router(state);
@@ -4144,7 +4399,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_invoke_rejects_during_shutdown() {
-        let mut state = test_state();
+        let state = test_state();
         state
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4229,5 +4484,290 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["Type"], "ResourceNotFoundException");
+    }
+
+    // -- Extensions API tests ------------------------------------------------
+
+    #[tokio::test]
+    async fn extension_register_returns_200_with_identifier() {
+        let app = runtime_routes().with_state(test_state());
+        let body = serde_json::json!({"events": ["INVOKE", "SHUTDOWN"]});
+        let resp = app
+            .oneshot(
+                Request::post("/2020-01-01/extension/register")
+                    .header("Lambda-Extension-Name", "my-ext")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("Lambda-Extension-Identifier")
+            .is_some());
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["functionVersion"], "$LATEST");
+    }
+
+    #[tokio::test]
+    async fn extension_register_missing_name_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let body = serde_json::json!({"events": ["INVOKE"]});
+        let resp = app
+            .oneshot(
+                Request::post("/2020-01-01/extension/register")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_register_missing_function_name_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let body = serde_json::json!({"events": ["INVOKE"]});
+        let resp = app
+            .oneshot(
+                Request::post("/2020-01-01/extension/register")
+                    .header("Lambda-Extension-Name", "my-ext")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_register_empty_events_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let body = serde_json::json!({"events": []});
+        let resp = app
+            .oneshot(
+                Request::post("/2020-01-01/extension/register")
+                    .header("Lambda-Extension-Name", "my-ext")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_register_invalid_body_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/2020-01-01/extension/register")
+                    .header("Lambda-Extension-Name", "my-ext")
+                    .header("Lambda-Runtime-Function-Name", "my-func")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_event_next_missing_identifier_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/2020-01-01/extension/event/next")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_event_next_invalid_uuid_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/2020-01-01/extension/event/next")
+                    .header("Lambda-Extension-Identifier", "not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_event_next_unregistered_returns_400() {
+        let app = runtime_routes().with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/2020-01-01/extension/event/next")
+                    .header(
+                        "Lambda-Extension-Identifier",
+                        "550e8400-e29b-41d4-a716-446655440000",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_event_next_returns_shutdown_on_shutdown_signal() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let ext_registry = Arc::new(crate::extensions::ExtensionRegistry::new(
+            shutdown_rx.clone(),
+        ));
+        let runtime_bridge = Arc::new(RuntimeBridge::new(
+            HashMap::new(),
+            HashMap::new(),
+            shutdown_rx,
+        ));
+        let docker = bollard::Docker::connect_with_local_defaults().unwrap();
+        let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let container_manager = Arc::new(ContainerManager::new(
+            docker.clone(),
+            HashMap::new(),
+            "localfunctions".into(),
+            9601,
+            "us-east-1".into(),
+            container_registry.clone(),
+            20,
+            CredentialForwardingConfig::default(),
+        ));
+        let config = Config {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 9600,
+            runtime_port: 9601,
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            functions_file: "./functions.json".into(),
+            log_level: "info".into(),
+            shutdown_timeout: 30,
+            container_idle_timeout: 300,
+            max_containers: 20,
+            docker_network: "localfunctions".into(),
+            max_body_size: 6 * 1024 * 1024,
+            log_format: crate::config::LogFormat::Text,
+            pull_images: false,
+            init_timeout: 10,
+            container_acquire_timeout: 10,
+            forward_aws_credentials: true,
+            mount_aws_credentials: false,
+            max_async_body_size: 256 * 1024,
+        };
+        let functions = FunctionsConfig {
+            functions: HashMap::new(),
+            runtime_images: HashMap::new(),
+        };
+
+        // Register an extension
+        let ext_id = ext_registry
+            .register("test-ext", "my-func", vec![
+                crate::extensions::ExtensionEventType::Invoke,
+                crate::extensions::ExtensionEventType::Shutdown,
+            ])
+            .await;
+
+        let state = AppState {
+            config: Arc::new(config),
+            container_registry,
+            container_manager,
+            docker,
+            functions: Arc::new(functions),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime_bridge,
+            metrics: Arc::new(crate::metrics::MetricsCollector::new()),
+            extension_registry: ext_registry.clone(),
+        };
+
+        // Send shutdown signal so the long-poll resolves immediately.
+        _shutdown_tx.send(true).unwrap();
+
+        let app = runtime_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::get("/2020-01-01/extension/event/next")
+                    .header("Lambda-Extension-Identifier", ext_id.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["eventType"], "SHUTDOWN");
+        assert_eq!(json["shutdownReason"], "spindown");
+        assert!(json["deadlineMs"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn extension_lifecycle_invoke_event_delivery() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let ext_registry = Arc::new(crate::extensions::ExtensionRegistry::new(
+            shutdown_rx.clone(),
+        ));
+
+        // Register extension for INVOKE events.
+        let ext_id = ext_registry
+            .register("test-ext", "my-func", vec![
+                crate::extensions::ExtensionEventType::Invoke,
+            ])
+            .await;
+
+        // Deliver an INVOKE event.
+        ext_registry
+            .notify_invoke(
+                "my-func",
+                "req-abc-123",
+                "arn:aws:lambda:us-east-1:000:function:my-func",
+                9999999999,
+                "Root=1-test",
+            )
+            .await;
+
+        // Poll for it via the registry directly.
+        let event = ext_registry.next_event(ext_id).await;
+        assert!(event.is_some());
+        let event = event.unwrap();
+        match event {
+            crate::extensions::ExtensionEvent::Invoke {
+                request_id,
+                deadline_ms,
+                invoked_function_arn,
+                tracing,
+            } => {
+                assert_eq!(request_id, "req-abc-123");
+                assert_eq!(deadline_ms, 9999999999);
+                assert!(invoked_function_arn.contains("my-func"));
+                assert_eq!(tracing.value, "Root=1-test");
+            }
+            _ => panic!("expected INVOKE event"),
+        }
     }
 }

@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::container::{ContainerManager, ContainerRegistry};
 #[cfg(test)]
 use crate::container::CredentialForwardingConfig;
+use crate::extensions::ExtensionRegistry;
 use crate::function::FunctionsConfig;
 use crate::metrics::MetricsCollector;
 use crate::runtime::RuntimeBridge;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub shutting_down: Arc<AtomicBool>,
     pub runtime_bridge: Arc<RuntimeBridge>,
     pub metrics: Arc<MetricsCollector>,
+    pub extension_registry: Arc<ExtensionRegistry>,
 }
 
 impl AppState {
@@ -160,6 +162,7 @@ mod tests {
             runtime_images: HashMap::new(),
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let extension_registry = Arc::new(ExtensionRegistry::new(shutdown_rx.clone()));
         let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
         let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
         let container_manager = Arc::new(ContainerManager::new(
@@ -181,6 +184,7 @@ mod tests {
             shutting_down: Arc::new(AtomicBool::new(false)),
             runtime_bridge,
             metrics: Arc::new(MetricsCollector::new()),
+            extension_registry,
         }
     }
 

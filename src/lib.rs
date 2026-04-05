@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod container;
+pub mod extensions;
 pub mod function;
 pub mod metrics;
 pub mod runtime;

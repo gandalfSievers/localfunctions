@@ -119,6 +119,9 @@ async fn build_concurrent_state(
         shutting_down: Arc::new(AtomicBool::new(false)),
         runtime_bridge,
         metrics: Arc::new(localfunctions::metrics::MetricsCollector::new()),
+        extension_registry: Arc::new(localfunctions::extensions::ExtensionRegistry::new(
+            tokio::sync::watch::channel(false).1,
+        )),
     };
 
     (state, shutdown_tx)

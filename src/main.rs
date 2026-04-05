@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod container;
+mod extensions;
 mod function;
 mod metrics;
 mod runtime;
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let reaper_shutdown_rx = shutdown_rx.clone();
     let event_monitor_shutdown_rx = shutdown_rx.clone();
+    let extension_registry = Arc::new(extensions::ExtensionRegistry::new(shutdown_rx.clone()));
     let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_senders, invocation_receivers, shutdown_rx));
 
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout);
@@ -128,6 +130,7 @@ async fn main() -> Result<()> {
         shutting_down: Arc::new(AtomicBool::new(false)),
         runtime_bridge,
         metrics: Arc::new(metrics::MetricsCollector::new()),
+        extension_registry,
     };
 
     // Spawn background idle container reaper (30-second interval).
