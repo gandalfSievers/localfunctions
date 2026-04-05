@@ -13,6 +13,7 @@ use crate::container::{ContainerManager, ContainerRegistry};
 #[cfg(test)]
 use crate::container::CredentialForwardingConfig;
 use crate::function::FunctionsConfig;
+use crate::metrics::MetricsCollector;
 use crate::runtime::RuntimeBridge;
 
 /// Shared application state accessible by all route handlers.
@@ -26,6 +27,7 @@ pub struct AppState {
     pub container_manager: Arc<ContainerManager>,
     pub shutting_down: Arc<AtomicBool>,
     pub runtime_bridge: Arc<RuntimeBridge>,
+    pub metrics: Arc<MetricsCollector>,
 }
 
 impl AppState {
@@ -178,6 +180,7 @@ mod tests {
             functions: Arc::new(functions),
             shutting_down: Arc::new(AtomicBool::new(false)),
             runtime_bridge,
+            metrics: Arc::new(MetricsCollector::new()),
         }
     }
 

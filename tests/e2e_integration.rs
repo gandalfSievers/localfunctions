@@ -114,6 +114,7 @@ async fn build_e2e_state(
         functions: Arc::new(functions_config),
         shutting_down: Arc::new(AtomicBool::new(false)),
         runtime_bridge,
+        metrics: Arc::new(localfunctions::metrics::MetricsCollector::new()),
     };
 
     (state, shutdown_tx)

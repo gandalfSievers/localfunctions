@@ -70,6 +70,7 @@ struct DockerStatus {
 pub fn invoke_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(get_metrics))
         .route("/2015-03-31/functions", get(list_functions))
         .route(
             "/2015-03-31/functions/:function_name",
@@ -106,6 +107,12 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     (StatusCode::OK, Json(response))
+}
+
+/// GET /metrics — return per-function invocation metrics.
+async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state.metrics.snapshot();
+    (StatusCode::OK, Json(serde_json::json!({ "functions": snapshot })))
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +277,8 @@ async fn invoke_function_inner(
     body: Bytes,
     request_id: Uuid,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let invoke_start = std::time::Instant::now();
+    let mut is_cold_start = false;
 
     // Validate function name from the URL path.
     if let Err(e) = validate_function_name(&function_name) {
@@ -400,6 +409,7 @@ async fn invoke_function_inner(
                 return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
             }
 
+            is_cold_start = true;
             debug!("no warm container available, cold starting");
             let cold_id = match state.container_manager.create_and_start(function_config).await {
                 Ok(id) => id,
@@ -618,6 +628,18 @@ async fn invoke_function_inner(
 
     // Stop streaming container logs now that the invocation is complete.
     log_handle.abort();
+
+    // Record invocation metrics.
+    let is_error = matches!(
+        response.0,
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY
+    ) || response.1.contains_key("X-Amz-Function-Error");
+    state.metrics.record_invocation(
+        &function_name,
+        invoke_start.elapsed(),
+        is_error,
+        is_cold_start,
+    );
 
     response
 }
@@ -1171,6 +1193,7 @@ mod tests {
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
+            metrics: Arc::new(crate::metrics::MetricsCollector::new()),
         }
     }
 
@@ -1189,6 +1212,59 @@ mod tests {
         assert!(json.get("status").is_some());
         assert!(json.get("docker").is_some());
         assert!(json["docker"].get("connected").is_some());
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_empty_on_fresh_start() {
+        let app = invoke_routes().with_state(test_state());
+        let resp = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let functions = json.get("functions").unwrap().as_object().unwrap();
+        assert!(functions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reflects_recorded_invocations() {
+        let state = test_state();
+        // Simulate recording some invocations directly.
+        state.metrics.record_invocation(
+            "test-func",
+            std::time::Duration::from_millis(50),
+            false,
+            true,
+        );
+        state.metrics.record_invocation(
+            "test-func",
+            std::time::Duration::from_millis(150),
+            true,
+            false,
+        );
+
+        let app = invoke_routes().with_state(state);
+        let resp = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let func_metrics = &json["functions"]["test-func"];
+        assert_eq!(func_metrics["invocation_count"], 2);
+        assert_eq!(func_metrics["error_count"], 1);
+        assert_eq!(func_metrics["cold_start_count"], 1);
+        assert!(func_metrics["avg_duration_ms"].as_f64().unwrap() > 0.0);
+        assert!(func_metrics["p50_duration_ms"].as_f64().unwrap() > 0.0);
+        assert!(func_metrics["p95_duration_ms"].as_f64().unwrap() > 0.0);
+        assert!(func_metrics["p99_duration_ms"].as_f64().unwrap() > 0.0);
     }
 
     #[tokio::test]
@@ -1304,6 +1380,7 @@ mod tests {
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
+            metrics: Arc::new(crate::metrics::MetricsCollector::new()),
         }
     }
 
@@ -2166,6 +2243,7 @@ mod tests {
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
+            metrics: Arc::new(crate::metrics::MetricsCollector::new()),
         };
 
         (state, shutdown_tx)
@@ -2858,6 +2936,7 @@ mod tests {
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,
+            metrics: Arc::new(crate::metrics::MetricsCollector::new()),
         };
 
         let app = crate::server::invoke_router(state);

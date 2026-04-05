@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod container;
 mod function;
+mod metrics;
 mod runtime;
 mod server;
 mod types;
@@ -126,6 +127,7 @@ async fn main() -> Result<()> {
         container_manager: container_manager.clone(),
         shutting_down: Arc::new(AtomicBool::new(false)),
         runtime_bridge,
+        metrics: Arc::new(metrics::MetricsCollector::new()),
     };
 
     // Spawn background idle container reaper (30-second interval).
