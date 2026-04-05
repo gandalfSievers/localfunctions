@@ -556,6 +556,18 @@ impl ContainerManager {
         self.container_semaphore.available_permits()
     }
 
+    /// Count the number of active (Starting or Busy) containers for a specific function.
+    pub async fn count_active_by_function(&self, function_name: &str) -> usize {
+        let containers = self.containers.read().await;
+        containers
+            .values()
+            .filter(|c| {
+                c.function_name == function_name
+                    && matches!(c.state, ContainerState::Starting | ContainerState::Busy)
+            })
+            .count()
+    }
+
     /// Resolve the Docker image for a function.
     ///
     /// Priority: `image_uri` > `image` > `runtime_images` map lookup.
@@ -1429,6 +1441,7 @@ mod tests {
             environment: HashMap::new(),
             image: None,
             image_uri: None,
+            reserved_concurrent_executions: None,
         }
     }
 
@@ -1978,6 +1991,40 @@ mod tests {
 
         // Third claim should fail — both are busy
         assert!(mgr.claim_idle_container("test-func").await.is_none());
+    }
+
+    // -- count_active_by_function -------------------------------------------
+
+    #[tokio::test]
+    async fn count_active_by_function_empty() {
+        let mgr = make_container_manager();
+        assert_eq!(mgr.count_active_by_function("test-func").await, 0);
+    }
+
+    #[tokio::test]
+    async fn count_active_by_function_counts_busy_and_starting() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+        mgr.insert_test_container("ctr-2".into(), "test-func".into(), ContainerState::Starting)
+            .await;
+        mgr.insert_test_container("ctr-3".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+        mgr.insert_test_container("ctr-4".into(), "other-func".into(), ContainerState::Busy)
+            .await;
+        assert_eq!(mgr.count_active_by_function("test-func").await, 2);
+    }
+
+    #[tokio::test]
+    async fn count_active_by_function_excludes_stopping_and_failed() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Stopping)
+            .await;
+        mgr.insert_test_container("ctr-2".into(), "test-func".into(), ContainerState::Failed)
+            .await;
+        mgr.insert_test_container("ctr-3".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+        assert_eq!(mgr.count_active_by_function("test-func").await, 1);
     }
 
     #[tokio::test]
@@ -2662,6 +2709,7 @@ mod integration_tests {
             environment: HashMap::from([("MY_VAR".into(), "my_value".into())]),
             image: None,
             image_uri: None,
+            reserved_concurrent_executions: None,
         };
 
         // Create and start

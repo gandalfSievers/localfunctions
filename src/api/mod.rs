@@ -287,6 +287,34 @@ async fn invoke_function_inner(
         }
     };
 
+    // Check per-function concurrency limit before proceeding.
+    if let Some(limit) = function_config.reserved_concurrent_executions {
+        let active = state
+            .container_manager
+            .count_active_by_function(&function_name)
+            .await;
+        if active >= limit as usize {
+            warn!(
+                function = %function_name,
+                active_concurrency = active,
+                limit = limit,
+                "throttled: concurrent invocation limit exceeded"
+            );
+            // AWS returns {"Type": "User", "Message": "Rate Exceeded."} for
+            // throttling — NOT a function error, so X-Amz-Function-Error is
+            // not set.
+            let body = serde_json::json!({
+                "Type": "User",
+                "Message": "Rate Exceeded."
+            });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                invoke_base_headers(request_id),
+                serde_json::to_vec(&body).unwrap(),
+            );
+        }
+    }
+
     let timeout_secs = function_config.timeout;
 
     // Extract pass-through headers.
@@ -1159,6 +1187,7 @@ mod tests {
                 environment: HashMap::from([("ENV_KEY".into(), "env_val".into())]),
                 image: None,
                 image_uri: None,
+                reserved_concurrent_executions: None,
             },
         );
         functions_map.insert(
@@ -1174,6 +1203,7 @@ mod tests {
                 environment: HashMap::new(),
                 image: None,
                 image_uri: Some("my-image:latest".into()),
+                reserved_concurrent_executions: None,
             },
         );
         let functions = FunctionsConfig {
@@ -2013,6 +2043,7 @@ mod tests {
                 environment: HashMap::new(),
                 image: None,
                 image_uri: None,
+                reserved_concurrent_executions: None,
             },
         );
         let functions = FunctionsConfig {
@@ -2611,6 +2642,7 @@ mod tests {
                 environment: HashMap::new(),
                 image: None,
                 image_uri: None,
+                reserved_concurrent_executions: None,
             },
         );
         let functions = FunctionsConfig {

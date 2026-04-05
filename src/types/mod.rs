@@ -35,6 +35,12 @@ pub struct FunctionConfig {
     /// runtime base image. The container's ENTRYPOINT/CMD is respected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_uri: Option<String>,
+    /// Per-function concurrent execution limit. When set, new invocations
+    /// receive HTTP 429 TooManyRequestsException once this many invocations
+    /// are already in flight. `None` means no per-function limit (only the
+    /// global `max_containers` limit applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_concurrent_executions: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -212,6 +218,7 @@ mod tests {
             environment: HashMap::from([("KEY".into(), "value".into())]),
             image: Some("custom:latest".into()),
             image_uri: None,
+            reserved_concurrent_executions: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -245,6 +252,7 @@ mod tests {
         assert!(config.environment.is_empty());
         assert!(config.image.is_none());
         assert!(config.image_uri.is_none());
+        assert!(config.reserved_concurrent_executions.is_none());
     }
 
     #[test]
@@ -260,6 +268,7 @@ mod tests {
             environment: HashMap::new(),
             image: None,
             image_uri: None,
+            reserved_concurrent_executions: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -281,6 +290,7 @@ mod tests {
             environment: HashMap::new(),
             image: None,
             image_uri: Some("my-lambda:latest".into()),
+            reserved_concurrent_executions: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("image_uri"));

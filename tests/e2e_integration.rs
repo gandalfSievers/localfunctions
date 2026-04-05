@@ -65,6 +65,7 @@ async fn build_e2e_state(
                 environment: HashMap::new(),
                 image: None,
                 image_uri: None,
+                reserved_concurrent_executions: None,
             },
         );
         let (tx, rx) = tokio::sync::mpsc::channel(10);

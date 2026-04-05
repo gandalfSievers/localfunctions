@@ -62,6 +62,7 @@ async fn build_state(
             environment: HashMap::new(),
             image: None,
             image_uri: None,
+            reserved_concurrent_executions: None,
         },
     );
 

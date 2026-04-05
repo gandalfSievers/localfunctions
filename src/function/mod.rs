@@ -67,6 +67,9 @@ pub enum FunctionConfigError {
     #[error("function '{name}': must specify either image_uri or both runtime and code_path")]
     MissingRuntimeOrImageUri { name: String },
 
+    #[error("function '{name}': invalid reserved_concurrent_executions {value} — must be between 1 and 1000")]
+    InvalidReservedConcurrency { name: String, value: u64 },
+
     #[error("configuration validation failed with {count} error(s):\n{details}")]
     ValidationErrors { count: usize, details: String },
 }
@@ -94,6 +97,7 @@ struct RawFunctionEntry {
     environment: HashMap<String, String>,
     image: Option<String>,
     image_uri: Option<String>,
+    reserved_concurrent_executions: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +269,16 @@ pub fn parse_functions_config(
             });
         }
 
+        // Validate reserved_concurrent_executions
+        if let Some(rce) = entry.reserved_concurrent_executions {
+            if rce == 0 || rce > 1000 {
+                errors.push(FunctionConfigError::InvalidReservedConcurrency {
+                    name: name.clone(),
+                    value: rce,
+                });
+            }
+        }
+
         // Validate environment variable keys
         for key in entry.environment.keys() {
             if let Err(e) = validate_env_key(name, key) {
@@ -285,6 +299,7 @@ pub fn parse_functions_config(
             environment: entry.environment.clone(),
             image: entry.image.clone(),
             image_uri: entry.image_uri.clone(),
+            reserved_concurrent_executions: entry.reserved_concurrent_executions,
         };
 
         functions.insert(name.clone(), config);
@@ -1573,6 +1588,77 @@ mod tests {
             config.runtime_images["python3.12"],
             "public.ecr.aws/lambda/python:3.12"
         );
+    }
+
+    // -- reserved_concurrent_executions --------------------------------------
+
+    #[test]
+    fn reserved_concurrent_executions_valid() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "reserved_concurrent_executions": 10
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].reserved_concurrent_executions, Some(10));
+    }
+
+    #[test]
+    fn reserved_concurrent_executions_omitted_means_none() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].reserved_concurrent_executions, None);
+    }
+
+    #[test]
+    fn reserved_concurrent_executions_zero_invalid() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "reserved_concurrent_executions": 0
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("reserved_concurrent_executions"), "error: {msg}");
+    }
+
+    #[test]
+    fn reserved_concurrent_executions_over_1000_invalid() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "m.h",
+                    "code_path": "./code",
+                    "reserved_concurrent_executions": 1001
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("reserved_concurrent_executions"), "error: {msg}");
     }
 
     // -- Known runtimes accepted ---------------------------------------------
