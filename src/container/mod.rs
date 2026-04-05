@@ -464,6 +464,9 @@ pub struct ManagedContainer {
     pub state: ContainerState,
     pub image: String,
     pub last_used: Instant,
+    /// Temporary directory created for merged multi-layer mounts.
+    /// Cleaned up when the container is stopped and removed.
+    pub merged_layers_dir: Option<PathBuf>,
 }
 
 /// Creates and manages Docker containers for Lambda function execution.
@@ -696,6 +699,7 @@ impl ContainerManager {
         // When multiple layers are configured, create a merged directory so
         // later layers take precedence for conflicting files, matching AWS
         // Lambda behavior.
+        let mut merged_layers_dir: Option<PathBuf> = None;
         if !function.layers.is_empty() {
             let opt_path = if function.layers.len() == 1 {
                 function.layers[0].to_str().ok_or_else(|| {
@@ -706,12 +710,14 @@ impl ContainerManager {
                 })?.to_string()
             } else {
                 // Merge multiple layers into a temporary directory
-                let merged = merge_layers(&function.name, &function.layers)?;
-                merged.to_str().ok_or_else(|| {
+                let merged = merge_layers_async(&function.name, &function.layers).await?;
+                let path_str = merged.to_str().ok_or_else(|| {
                     ServiceError::ServiceException(
                         "merged layer path contains invalid UTF-8".to_string(),
                     )
-                })?.to_string()
+                })?.to_string();
+                merged_layers_dir = Some(merged);
+                path_str
             };
             binds.push(format!("{}:/opt:ro", opt_path));
         }
@@ -806,6 +812,7 @@ impl ContainerManager {
                     state: ContainerState::Starting,
                     image: image.clone(),
                     last_used: Instant::now(),
+                    merged_layers_dir,
                 },
             );
         }
@@ -828,7 +835,13 @@ impl ContainerManager {
                     }),
                 )
                 .await;
-            self.containers.write().await.remove(&container_id);
+            let removed = self.containers.write().await.remove(&container_id);
+            // Clean up merged layers temp directory if one was created
+            if let Some(mc) = removed {
+                if let Some(ref dir) = mc.merged_layers_dir {
+                    let _ = tokio::fs::remove_dir_all(dir).await;
+                }
+            }
             return Err(ServiceError::ServiceException(format!(
                 "failed to start container for '{}': {}",
                 function.name, e
@@ -924,8 +937,21 @@ impl ContainerManager {
             }
         }
 
-        // Deregister from both local and global tracking
-        self.containers.write().await.remove(container_id);
+        // Deregister from both local and global tracking, and clean up
+        // any merged layers temp directory.
+        let removed = self.containers.write().await.remove(container_id);
+        if let Some(mc) = removed {
+            if let Some(ref dir) = mc.merged_layers_dir {
+                if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+                    warn!(
+                        container_id = %container_id,
+                        dir = %dir.display(),
+                        %e,
+                        "failed to clean up merged layers directory"
+                    );
+                }
+            }
+        }
         self.registry.deregister(container_id).await;
 
         // Release the container slot so new containers can be created.
@@ -1242,6 +1268,7 @@ impl ContainerManager {
                 state,
                 image: "test:latest".into(),
                 last_used: Instant::now(),
+                merged_layers_dir: None,
             },
         );
     }
@@ -1382,12 +1409,25 @@ async fn handle_container_event(
     container_registry.stop_and_remove(&container_id, Duration::from_secs(2)).await;
 }
 
+/// Merge multiple layer directories into a single temporary directory,
+/// running the blocking I/O on a dedicated thread pool.
+///
+/// Files from each layer are copied in order so that later layers take
+/// precedence for conflicting paths, matching AWS Lambda behaviour.
+/// The merged directory is placed under the system temp dir; the caller
+/// is responsible for cleanup (tracked via `ManagedContainer::merged_layers_dir`).
+async fn merge_layers_async(function_name: &str, layers: &[PathBuf]) -> Result<PathBuf, ServiceError> {
+    let name = function_name.to_string();
+    let layers = layers.to_vec();
+    tokio::task::spawn_blocking(move || merge_layers(&name, &layers))
+        .await
+        .map_err(|e| ServiceError::ServiceException(format!("merge_layers task panicked: {e}")))?
+}
+
 /// Merge multiple layer directories into a single temporary directory.
 ///
 /// Files from each layer are copied in order so that later layers take
 /// precedence for conflicting paths, matching AWS Lambda behaviour.
-/// The merged directory is placed under the system temp dir and must be
-/// cleaned up by the caller (or on container removal).
 fn merge_layers(function_name: &str, layers: &[PathBuf]) -> Result<PathBuf, ServiceError> {
     let merged_dir = std::env::temp_dir().join(format!("localfunctions-layers-{}-{}", function_name, &uuid::Uuid::new_v4().to_string()[..8]));
     std::fs::create_dir_all(&merged_dir).map_err(|e| {
@@ -1415,13 +1455,21 @@ fn merge_layers(function_name: &str, layers: &[PathBuf]) -> Result<PathBuf, Serv
 }
 
 /// Recursively copy the contents of `src` into `dst`, overwriting existing files.
+///
+/// Symlinks are skipped to prevent a symlink inside a layer from pointing
+/// outside the layer directory and bypassing the directory traversal check.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        let ft = entry.metadata()?.file_type();
+        if ft.is_symlink() {
+            // Skip symlinks to prevent escaping the layer boundary.
+            continue;
+        }
+        if ft.is_dir() {
             std::fs::create_dir_all(&dst_path)?;
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
@@ -2028,6 +2076,7 @@ mod tests {
                     state: ContainerState::Starting,
                     image: "test:latest".to_string(),
                     last_used: Instant::now(),
+                    merged_layers_dir: None,
                 },
             );
         }
@@ -2078,6 +2127,7 @@ mod tests {
                     state: ContainerState::Idle,
                     image: "img-a:latest".to_string(),
                     last_used: Instant::now(),
+                    merged_layers_dir: None,
                 },
             );
             containers.insert(
@@ -2088,6 +2138,7 @@ mod tests {
                     state: ContainerState::Busy,
                     image: "img-b:latest".to_string(),
                     last_used: Instant::now(),
+                    merged_layers_dir: None,
                 },
             );
         }
@@ -2110,6 +2161,7 @@ mod tests {
             state: ContainerState::Idle,
             image: "img:latest".into(),
             last_used: Instant::now(),
+            merged_layers_dir: None,
         };
         let mc2 = mc.clone();
         assert_eq!(mc2.container_id, "abc");
@@ -2170,6 +2222,7 @@ mod tests {
                     state: ContainerState::Idle,
                     image: "test:latest".into(),
                     last_used: Instant::now() - Duration::from_secs(60),
+                    merged_layers_dir: None,
                 },
             );
             containers.insert(
@@ -2180,6 +2233,7 @@ mod tests {
                     state: ContainerState::Idle,
                     image: "test:latest".into(),
                     last_used: Instant::now(),
+                    merged_layers_dir: None,
                 },
             );
         }
@@ -2269,6 +2323,7 @@ mod tests {
                     state: ContainerState::Busy,
                     image: "test:latest".into(),
                     last_used: old_time,
+                    merged_layers_dir: None,
                 },
             );
         }
@@ -2301,6 +2356,7 @@ mod tests {
                     state: ContainerState::Idle,
                     image: "test:latest".into(),
                     last_used: expired_time,
+                    merged_layers_dir: None,
                 },
             );
             containers.insert(
@@ -2311,6 +2367,7 @@ mod tests {
                     state: ContainerState::Idle,
                     image: "test:latest".into(),
                     last_used: Instant::now(),
+                    merged_layers_dir: None,
                 },
             );
         }
@@ -2340,6 +2397,7 @@ mod tests {
                     state: ContainerState::Busy,
                     image: "test:latest".into(),
                     last_used: expired_time,
+                    merged_layers_dir: None,
                 },
             );
         }
@@ -3250,6 +3308,9 @@ mod integration_tests {
 
     // -- Layer merging --------------------------------------------------------
 
+    // NOTE: The container creation code path mounts a single layer directly
+    // at /opt without calling merge_layers. This test exercises the merge_layers
+    // function itself to verify it handles the single-layer case correctly.
     #[test]
     fn merge_layers_single_layer() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3307,5 +3368,28 @@ mod integration_tests {
 
         assert_eq!(std::fs::read_to_string(dst.join("a/b/file.txt")).unwrap(), "deep");
         assert_eq!(std::fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
+    }
+
+    #[test]
+    fn copy_dir_recursive_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("real.txt"), "real").unwrap();
+
+        // Create a symlink pointing outside the layer directory
+        let outside = tmp.path().join("secret.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, src.join("link.txt")).unwrap();
+
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        // Real file should be copied
+        assert_eq!(std::fs::read_to_string(dst.join("real.txt")).unwrap(), "real");
+        // Symlink should NOT be copied
+        assert!(!dst.join("link.txt").exists());
     }
 }

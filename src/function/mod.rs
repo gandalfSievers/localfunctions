@@ -328,7 +328,6 @@ pub fn parse_functions_config(
                 }
                 Err(e) => {
                     errors.push(e);
-                    layers.push(base_dir.join(raw_layer_path));
                 }
             }
         }

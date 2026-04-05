@@ -329,7 +329,12 @@ fn function_configuration_json(
             .layers
             .iter()
             .enumerate()
-            .map(|(i, p)| format!("arn:aws:lambda:local:000000000000:layer:{}:{}", p.display(), i + 1))
+            .map(|(i, p)| {
+                let layer_name = p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("layer-{}", i));
+                format!("arn:aws:lambda:local:000000000000:layer:{}:{}", layer_name, i + 1)
+            })
             .collect();
         config["Layers"] = serde_json::json!(
             layer_arns.iter().map(|arn| serde_json::json!({"Arn": arn})).collect::<Vec<_>>()
