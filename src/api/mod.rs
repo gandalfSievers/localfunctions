@@ -187,8 +187,33 @@ async fn invoke_function_inner(
     match result {
         Ok(Ok(invocation_result)) => match invocation_result {
             crate::types::InvocationResult::Success { body } => {
+                // AWS enforces a 6,291,556 byte limit on synchronous invocation responses.
+                const SYNC_RESPONSE_MAX_BYTES: usize = 6_291_556;
+                let body_bytes = body.into_bytes();
+                if body_bytes.len() > SYNC_RESPONSE_MAX_BYTES {
+                    warn!(
+                        actual = body_bytes.len(),
+                        limit = SYNC_RESPONSE_MAX_BYTES,
+                        "response payload size exceeded limit"
+                    );
+                    let mut resp_headers = base_headers();
+                    resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
+                    let error_body = serde_json::json!({
+                        "errorType": "ResponseSizeTooLarge",
+                        "errorMessage": format!(
+                            "Response payload size ({} bytes) exceeded maximum allowed payload size ({} bytes).",
+                            body_bytes.len(),
+                            SYNC_RESPONSE_MAX_BYTES
+                        ),
+                    });
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        resp_headers,
+                        serde_json::to_vec(&error_body).unwrap(),
+                    );
+                }
                 info!("invocation succeeded");
-                (StatusCode::OK, base_headers(), body.into_bytes())
+                (StatusCode::OK, base_headers(), body_bytes)
             }
             crate::types::InvocationResult::Error {
                 error_type,
@@ -1636,6 +1661,93 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let ctx = handle.await.unwrap();
         assert_eq!(ctx, Some("eyJ0ZXN0IjogdHJ1ZX0=".to_string()));
+    }
+
+    #[tokio::test]
+    async fn invoke_oversized_response_returns_413() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let app = invoke_routes().with_state(state);
+
+        // Spawn a fake runtime that responds with a payload exceeding 6,291,556 bytes.
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .await;
+            let oversized_body = "x".repeat(6_291_557);
+            bridge
+                .complete_invocation(inv.request_id, oversized_body)
+                .await;
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.headers().get("X-Amz-Function-Error").unwrap().to_str().unwrap(),
+            "Unhandled"
+        );
+        // Verify AWS-compatible headers are still present
+        let req_id = resp.headers().get("X-Amz-Request-Id").unwrap().to_str().unwrap();
+        uuid::Uuid::parse_str(req_id).expect("X-Amz-Request-Id should be a valid UUID");
+        assert_eq!(
+            resp.headers().get("X-Amz-Executed-Version").unwrap().to_str().unwrap(),
+            "$LATEST"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errorType"], "ResponseSizeTooLarge");
+        assert!(json["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("6291557 bytes"));
+        assert!(json["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("6291556 bytes"));
+    }
+
+    #[tokio::test]
+    async fn invoke_response_at_limit_returns_200() {
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let runtime_bridge = state.runtime_bridge.clone();
+
+        let app = invoke_routes().with_state(state);
+
+        // Respond with exactly 6,291,556 bytes — should succeed.
+        let bridge = runtime_bridge.clone();
+        tokio::spawn(async move {
+            let inv = bridge.next_invocation("my-func").await.unwrap();
+            bridge
+                .store_pending(inv.request_id, "my-func".into(), inv.response_tx)
+                .await;
+            let body = "x".repeat(6_291_556);
+            bridge.complete_invocation(inv.request_id, body).await;
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/2015-03-31/functions/my-func/invocations")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("X-Amz-Function-Error").is_none());
     }
 
     #[tokio::test]
