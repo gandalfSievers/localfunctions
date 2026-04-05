@@ -17,14 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use localfunctions::config::{Config, LogFormat};
-use localfunctions::container::ContainerRegistry;
+use localfunctions::container::{ContainerManager, ContainerRegistry};
 use localfunctions::function::FunctionsConfig;
 use localfunctions::runtime::RuntimeBridge;
 use localfunctions::server::AppState;
 use localfunctions::types::FunctionConfig;
 
 /// Build an AppState with a single function configured with the given timeout.
-fn build_state(
+async fn build_state(
     function_name: &str,
     timeout_secs: u64,
 ) -> (AppState, tokio::sync::watch::Sender<bool>) {
@@ -76,9 +76,29 @@ fn build_state(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime_bridge = Arc::new(RuntimeBridge::new(senders, receivers, shutdown_rx));
 
+    let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+    let container_manager = Arc::new(ContainerManager::new(
+        docker.clone(),
+        HashMap::new(),
+        "localfunctions".into(),
+        9601,
+        "us-east-1".into(),
+        container_registry.clone(),
+    ));
+    // Pre-populate an idle container so the invoke handler doesn't attempt
+    // real Docker operations in tests.
+    container_manager
+        .insert_test_container(
+            "test-container".into(),
+            function_name.into(),
+            localfunctions::types::ContainerState::Idle,
+        )
+        .await;
+
     let state = AppState {
         config: Arc::new(config),
-        container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
+        container_registry,
+        container_manager,
         docker,
         functions: Arc::new(functions),
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -91,7 +111,7 @@ fn build_state(
 #[tokio::test]
 async fn invoke_timeout_returns_200_with_unhandled_error() {
     // Configure a function with a very short timeout (1 second).
-    let (state, _shutdown_tx) = build_state("timeout-func", 1);
+    let (state, _shutdown_tx) = build_state("timeout-func", 1).await;
 
     // Start the Invoke API server on an ephemeral port.
     let invoke_app = localfunctions::server::invoke_router(state.clone());

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::function::validate_function_name;
 use crate::server::AppState;
-use crate::types::ServiceError;
+use crate::types::{ContainerState, ServiceError};
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -157,9 +157,39 @@ async fn invoke_function_inner(
     // Compute the deadline from the function's configured timeout.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
+    // Ensure a container is available for this function. Try to claim a warm
+    // idle container first; if none are available, cold-start a new one.
+    let container_id = match state.container_manager.claim_idle_container(&function_name).await {
+        Some(id) => {
+            debug!(container_id = %id, "warm container claimed");
+            id
+        }
+        None => {
+            debug!("no warm container available, cold starting");
+            match state.container_manager.create_and_start(function_config).await {
+                Ok(id) => {
+                    state
+                        .container_manager
+                        .set_state(&id, ContainerState::Busy)
+                        .await;
+                    id
+                }
+                Err(e) => {
+                    let err = ServiceError::ServiceException(e.to_string());
+                    return (
+                        err.status_code(),
+                        base_headers(),
+                        err.to_aws_response().to_json_bytes(),
+                    );
+                }
+            }
+        }
+    };
+
     info!(
         payload_size = body.len(),
         timeout_secs,
+        container_id = %container_id,
         "invoking function"
     );
 
@@ -171,7 +201,8 @@ async fn invoke_function_inner(
     {
         Ok(rx) => rx,
         Err(e) => {
-            // If submit fails (e.g. channel closed), return 502.
+            // If submit fails (e.g. channel closed), release the container.
+            state.container_manager.release_container(&container_id).await;
             let err = ServiceError::ServiceException(e.to_string());
             return (
                 StatusCode::BAD_GATEWAY,
@@ -248,6 +279,17 @@ async fn invoke_function_inner(
         },
         Ok(Err(_)) => {
             // The response channel was dropped — container likely crashed.
+            // Clean up the pending invocation and container.
+            let crashed_container = state
+                .runtime_bridge
+                .timeout_invocation(request_id)
+                .await;
+            let cid = crashed_container.unwrap_or(container_id);
+            let mgr = state.container_manager.clone();
+            tokio::spawn(async move {
+                let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
+            });
+
             let err = ServiceError::ServiceException(
                 "Container exited without responding".into(),
             );
@@ -269,14 +311,11 @@ async fn invoke_function_inner(
                 .await;
 
             // Kill the container in the background with a short grace period.
-            if let Some(container_id) = timed_out_container {
-                let registry = state.container_registry.clone();
-                tokio::spawn(async move {
-                    registry
-                        .stop_and_remove(&container_id, Duration::from_secs(2))
-                        .await;
-                });
-            }
+            let cid = timed_out_container.unwrap_or(container_id);
+            let mgr = state.container_manager.clone();
+            tokio::spawn(async move {
+                let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
+            });
 
             let mut resp_headers = base_headers();
             resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
@@ -532,7 +571,13 @@ async fn invocation_response(
         "invocation response received"
     );
 
-    if state.runtime_bridge.complete_invocation(uuid, body_str).await {
+    let (success, container_id) = state.runtime_bridge.complete_invocation(uuid, body_str).await;
+    if success {
+        // Release the container back to the idle pool for reuse.
+        if let Some(ref cid) = container_id {
+            debug!(container_id = %cid, "releasing container after successful invocation");
+            state.container_manager.release_container(cid).await;
+        }
         (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "OK"})))
     } else {
         let err = ServiceError::InvalidRequestContent(format!(
@@ -584,11 +629,18 @@ async fn invocation_error(
         "invocation error received"
     );
 
-    if state
+    let (success, container_id) = state
         .runtime_bridge
         .fail_invocation(uuid, error_type, error_message)
-        .await
-    {
+        .await;
+
+    if success {
+        // Release the container back to the idle pool for reuse.
+        // AWS Lambda reuses containers after handled errors.
+        if let Some(ref cid) = container_id {
+            debug!(container_id = %cid, "releasing container after invocation error");
+            state.container_manager.release_container(cid).await;
+        }
         (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "OK"})))
     } else {
         let err = ServiceError::InvalidRequestContent(format!(
@@ -665,6 +717,11 @@ async fn init_error(
             "stopped and removed containers due to init error"
         );
     }
+    // Also clean up ContainerManager tracking for these containers.
+    state
+        .container_manager
+        .deregister_by_function(&function_name)
+        .await;
 
     // Return 502 InvalidRuntimeException to match AWS behavior.
     let err_response = serde_json::json!({
@@ -684,7 +741,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
-    use crate::container::ContainerRegistry;
+    use crate::container::{ContainerManager, ContainerRegistry};
     use crate::function::FunctionsConfig;
     use crate::runtime::RuntimeBridge;
 
@@ -712,9 +769,19 @@ mod tests {
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
+        let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let container_manager = Arc::new(ContainerManager::new(
+            docker.clone(),
+            HashMap::new(),
+            "localfunctions".into(),
+            9601,
+            "us-east-1".into(),
+            container_registry.clone(),
+        ));
         AppState {
             config: Arc::new(config),
-            container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
+            container_registry,
+            container_manager,
             docker,
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1401,7 +1468,7 @@ mod tests {
 
     /// Create a test state with a real function configured and invocation
     /// channels wired through the RuntimeBridge.
-    fn test_state_with_function(
+    async fn test_state_with_function(
         function_name: &str,
         timeout: u64,
     ) -> (AppState, tokio::sync::watch::Sender<bool>) {
@@ -1456,9 +1523,30 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime_bridge = Arc::new(RuntimeBridge::new(senders, receivers, shutdown_rx));
 
+        let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let container_manager = Arc::new(ContainerManager::new(
+            docker.clone(),
+            HashMap::new(),
+            "localfunctions".into(),
+            9601,
+            "us-east-1".into(),
+            container_registry.clone(),
+        ));
+
+        // Pre-populate an idle container so the invoke handler doesn't attempt
+        // real Docker operations in unit tests.
+        container_manager
+            .insert_test_container(
+                "test-container".into(),
+                function_name.into(),
+                crate::types::ContainerState::Idle,
+            )
+            .await;
+
         let state = AppState {
             config: Arc::new(config),
-            container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
+            container_registry,
+            container_manager,
             docker,
             functions: Arc::new(functions),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1470,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_success_returns_200_with_body() {
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let app = invoke_routes().with_state(state);
@@ -1514,7 +1602,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_function_error_returns_200_with_handled_error_header() {
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let app = invoke_routes().with_state(state);
@@ -1566,7 +1654,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_timeout_returns_200_with_unhandled_error_header() {
         // Use a very short timeout (1 second) and never respond.
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1).await;
 
         let app = invoke_routes().with_state(state);
 
@@ -1603,7 +1691,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_unsupported_invocation_type_returns_400() {
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
         let app = invoke_routes().with_state(state);
 
         let resp = app
@@ -1627,7 +1715,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_request_response_type_accepted() {
         // RequestResponse is the default and should work.
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let bridge = runtime_bridge.clone();
@@ -1657,7 +1745,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_passes_client_context_to_runtime() {
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let bridge = runtime_bridge.clone();
@@ -1691,7 +1779,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_oversized_response_returns_413() {
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let app = invoke_routes().with_state(state);
@@ -1747,7 +1835,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_response_at_limit_returns_200() {
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 30);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 30).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let app = invoke_routes().with_state(state);
@@ -1780,7 +1868,7 @@ mod tests {
     async fn invoke_timeout_cleans_up_pending_invocation() {
         // Simulate a container that picks up the invocation via /next but
         // never responds — the timeout should clean up the pending state.
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         // Spawn a "container" that picks up the invocation and stores it as
@@ -1833,7 +1921,7 @@ mod tests {
     async fn invoke_timeout_with_dispatched_invocation_sends_timeout_result() {
         // Verify that when a dispatched (pending) invocation times out,
         // the InvocationResult::Timeout is sent on the response channel.
-        let (state, _shutdown_tx) = test_state_with_function("my-func", 1);
+        let (state, _shutdown_tx) = test_state_with_function("my-func", 1).await;
         let runtime_bridge = state.runtime_bridge.clone();
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -1858,7 +1946,7 @@ mod tests {
 
             // After timeout, timeout_invocation should have already been called
             // by the invoke handler. Attempting to complete should fail (not found).
-            let was_found = bridge.complete_invocation(request_id, "late".into()).await;
+            let (was_found, _) = bridge.complete_invocation(request_id, "late".into()).await;
             let _ = result_tx.send(was_found);
         });
 

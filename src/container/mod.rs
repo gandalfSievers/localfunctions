@@ -12,6 +12,7 @@ use bollard::Docker;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use futures_util::TryStreamExt;
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::types::{ContainerState, FunctionConfig, ServiceError};
@@ -438,6 +439,7 @@ pub struct ManagedContainer {
     pub function_name: String,
     pub state: ContainerState,
     pub image: String,
+    pub last_used: Instant,
 }
 
 /// Creates and manages Docker containers for Lambda function execution.
@@ -651,6 +653,7 @@ impl ContainerManager {
                     function_name: function.name.clone(),
                     state: ContainerState::Starting,
                     image: image.clone(),
+                    last_used: Instant::now(),
                 },
             );
         }
@@ -785,6 +788,116 @@ impl ContainerManager {
     /// Get a snapshot of all managed containers.
     pub async fn list(&self) -> Vec<ManagedContainer> {
         self.containers.read().await.values().cloned().collect()
+    }
+
+    /// Atomically claim an idle container for a function and mark it Busy.
+    ///
+    /// Uses FIFO selection (oldest `last_used` first) so that containers idle
+    /// the longest are reused first, giving the reaper a consistent window to
+    /// reap the most recently used ones.
+    ///
+    /// Returns the container ID if an idle container was found.
+    pub async fn claim_idle_container(&self, function_name: &str) -> Option<String> {
+        let mut containers = self.containers.write().await;
+        let oldest_idle = containers
+            .values()
+            .filter(|c| c.function_name == function_name && c.state == ContainerState::Idle)
+            .min_by_key(|c| c.last_used)
+            .map(|c| c.container_id.clone());
+
+        if let Some(ref id) = oldest_idle {
+            if let Some(entry) = containers.get_mut(id) {
+                debug!(
+                    container_id = %id,
+                    function = %function_name,
+                    "reusing warm container"
+                );
+                entry.state = ContainerState::Busy;
+            }
+        }
+        oldest_idle
+    }
+
+    /// Release a container back to the idle pool after an invocation completes.
+    ///
+    /// Transitions the container to Idle and updates `last_used` so the reaper
+    /// knows when it became idle.
+    pub async fn release_container(&self, container_id: &str) {
+        let mut containers = self.containers.write().await;
+        if let Some(entry) = containers.get_mut(container_id) {
+            debug!(
+                container_id = %container_id,
+                function = %entry.function_name,
+                "container released to idle pool"
+            );
+            entry.state = ContainerState::Idle;
+            entry.last_used = Instant::now();
+        }
+    }
+
+    /// Reap idle containers that have exceeded `idle_timeout`.
+    ///
+    /// Scans all managed containers for those in Idle state whose `last_used`
+    /// timestamp is older than the timeout, then stops and removes them.
+    pub async fn reap_idle_containers(&self, idle_timeout: Duration) {
+        let now = Instant::now();
+        let expired: Vec<(String, String)> = {
+            let containers = self.containers.read().await;
+            containers
+                .values()
+                .filter(|c| {
+                    c.state == ContainerState::Idle
+                        && now.duration_since(c.last_used) > idle_timeout
+                })
+                .map(|c| (c.container_id.clone(), c.function_name.clone()))
+                .collect()
+        };
+
+        if expired.is_empty() {
+            return;
+        }
+
+        info!(count = expired.len(), "reaping idle containers");
+
+        for (container_id, function_name) in expired {
+            debug!(
+                container_id = %container_id,
+                function = %function_name,
+                "reaping idle container"
+            );
+            if let Err(e) = self.stop_and_remove(&container_id, Duration::from_secs(5)).await {
+                error!(container_id = %container_id, %e, "failed to reap idle container");
+            }
+        }
+    }
+
+    /// Remove all internal tracking entries for a function.
+    ///
+    /// Used after init errors where containers are killed via the registry.
+    pub async fn deregister_by_function(&self, function_name: &str) {
+        let mut containers = self.containers.write().await;
+        containers.retain(|_, c| c.function_name != function_name);
+    }
+
+    /// Insert a container directly into tracking (for testing).
+    #[doc(hidden)]
+    pub async fn insert_test_container(
+        &self,
+        container_id: String,
+        function_name: String,
+        state: ContainerState,
+    ) {
+        let mut containers = self.containers.write().await;
+        containers.insert(
+            container_id.clone(),
+            ManagedContainer {
+                container_id,
+                function_name,
+                state,
+                image: "test:latest".into(),
+                last_used: Instant::now(),
+            },
+        );
     }
 }
 
@@ -1220,6 +1333,7 @@ mod tests {
                     function_name: "test-func".to_string(),
                     state: ContainerState::Starting,
                     image: "test:latest".to_string(),
+                    last_used: Instant::now(),
                 },
             );
         }
@@ -1269,6 +1383,7 @@ mod tests {
                     function_name: "func-a".to_string(),
                     state: ContainerState::Idle,
                     image: "img-a:latest".to_string(),
+                    last_used: Instant::now(),
                 },
             );
             containers.insert(
@@ -1278,6 +1393,7 @@ mod tests {
                     function_name: "func-b".to_string(),
                     state: ContainerState::Busy,
                     image: "img-b:latest".to_string(),
+                    last_used: Instant::now(),
                 },
             );
         }
@@ -1299,10 +1415,266 @@ mod tests {
             function_name: "f".into(),
             state: ContainerState::Idle,
             image: "img:latest".into(),
+            last_used: Instant::now(),
         };
         let mc2 = mc.clone();
         assert_eq!(mc2.container_id, "abc");
         assert_eq!(mc2.state, ContainerState::Idle);
+    }
+
+    // -- Warm container pool ------------------------------------------------
+
+    #[tokio::test]
+    async fn claim_idle_container_returns_none_when_empty() {
+        let mgr = make_container_manager();
+        assert!(mgr.claim_idle_container("test-func").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_idle_container_returns_idle_container() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        let claimed = mgr.claim_idle_container("test-func").await;
+        assert_eq!(claimed, Some("ctr-1".to_string()));
+
+        // Container should now be Busy
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Busy));
+    }
+
+    #[tokio::test]
+    async fn claim_idle_container_skips_busy_containers() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+
+        assert!(mgr.claim_idle_container("test-func").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_idle_container_skips_wrong_function() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "other-func".into(), ContainerState::Idle)
+            .await;
+
+        assert!(mgr.claim_idle_container("test-func").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_idle_container_fifo_selects_oldest() {
+        let mgr = make_container_manager();
+
+        // Insert two idle containers with different last_used times
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "ctr-old".to_string(),
+                ManagedContainer {
+                    container_id: "ctr-old".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Idle,
+                    image: "test:latest".into(),
+                    last_used: Instant::now() - Duration::from_secs(60),
+                },
+            );
+            containers.insert(
+                "ctr-new".to_string(),
+                ManagedContainer {
+                    container_id: "ctr-new".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Idle,
+                    image: "test:latest".into(),
+                    last_used: Instant::now(),
+                },
+            );
+        }
+
+        // FIFO should pick the oldest
+        let claimed = mgr.claim_idle_container("test-func").await;
+        assert_eq!(claimed, Some("ctr-old".to_string()));
+        assert_eq!(mgr.get_state("ctr-old").await, Some(ContainerState::Busy));
+        assert_eq!(mgr.get_state("ctr-new").await, Some(ContainerState::Idle));
+    }
+
+    #[tokio::test]
+    async fn claim_idle_container_second_claim_gets_next() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+        mgr.insert_test_container("ctr-2".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        let first = mgr.claim_idle_container("test-func").await;
+        assert!(first.is_some());
+
+        let second = mgr.claim_idle_container("test-func").await;
+        assert!(second.is_some());
+        assert_ne!(first, second);
+
+        // Third claim should fail — both are busy
+        assert!(mgr.claim_idle_container("test-func").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn release_container_transitions_to_idle() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+
+        mgr.release_container("ctr-1").await;
+
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Idle));
+    }
+
+    #[tokio::test]
+    async fn release_container_updates_last_used() {
+        let mgr = make_container_manager();
+        let old_time = Instant::now() - Duration::from_secs(600);
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "ctr-1".to_string(),
+                ManagedContainer {
+                    container_id: "ctr-1".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Busy,
+                    image: "test:latest".into(),
+                    last_used: old_time,
+                },
+            );
+        }
+
+        mgr.release_container("ctr-1").await;
+
+        let containers = mgr.containers.read().await;
+        let c = containers.get("ctr-1").unwrap();
+        assert!(c.last_used > old_time);
+    }
+
+    #[tokio::test]
+    async fn release_nonexistent_container_is_noop() {
+        let mgr = make_container_manager();
+        // Should not panic
+        mgr.release_container("nonexistent").await;
+    }
+
+    #[tokio::test]
+    async fn reap_idle_containers_removes_expired() {
+        let mgr = make_container_manager();
+        let expired_time = Instant::now() - Duration::from_secs(600);
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "ctr-expired".to_string(),
+                ManagedContainer {
+                    container_id: "ctr-expired".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Idle,
+                    image: "test:latest".into(),
+                    last_used: expired_time,
+                },
+            );
+            containers.insert(
+                "ctr-fresh".to_string(),
+                ManagedContainer {
+                    container_id: "ctr-fresh".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Idle,
+                    image: "test:latest".into(),
+                    last_used: Instant::now(),
+                },
+            );
+        }
+
+        mgr.reap_idle_containers(Duration::from_secs(300)).await;
+
+        // Expired container should be removed from tracking
+        assert!(mgr.get_state("ctr-expired").await.is_none());
+        // Fresh container should remain
+        assert_eq!(
+            mgr.get_state("ctr-fresh").await,
+            Some(ContainerState::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_idle_containers_skips_busy_containers() {
+        let mgr = make_container_manager();
+        let expired_time = Instant::now() - Duration::from_secs(600);
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "ctr-busy".to_string(),
+                ManagedContainer {
+                    container_id: "ctr-busy".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Busy,
+                    image: "test:latest".into(),
+                    last_used: expired_time,
+                },
+            );
+        }
+
+        mgr.reap_idle_containers(Duration::from_secs(300)).await;
+
+        // Busy container should NOT be reaped even if last_used is old
+        assert_eq!(
+            mgr.get_state("ctr-busy").await,
+            Some(ContainerState::Busy)
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_idle_containers_noop_when_none_expired() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        mgr.reap_idle_containers(Duration::from_secs(300)).await;
+
+        // Container should still be present (was just created, not expired)
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Idle));
+    }
+
+    #[tokio::test]
+    async fn deregister_by_function_removes_matching() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "func-a".into(), ContainerState::Idle)
+            .await;
+        mgr.insert_test_container("ctr-2".into(), "func-a".into(), ContainerState::Busy)
+            .await;
+        mgr.insert_test_container("ctr-3".into(), "func-b".into(), ContainerState::Idle)
+            .await;
+
+        mgr.deregister_by_function("func-a").await;
+
+        assert!(mgr.get_state("ctr-1").await.is_none());
+        assert!(mgr.get_state("ctr-2").await.is_none());
+        assert_eq!(mgr.get_state("ctr-3").await, Some(ContainerState::Idle));
+    }
+
+    #[tokio::test]
+    async fn warm_container_lifecycle_claim_release_reuse() {
+        let mgr = make_container_manager();
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        // Claim
+        let claimed = mgr.claim_idle_container("test-func").await;
+        assert_eq!(claimed, Some("ctr-1".to_string()));
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Busy));
+
+        // No more idle containers
+        assert!(mgr.claim_idle_container("test-func").await.is_none());
+
+        // Release
+        mgr.release_container("ctr-1").await;
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Idle));
+
+        // Can claim again
+        let reclaimed = mgr.claim_idle_container("test-func").await;
+        assert_eq!(reclaimed, Some("ctr-1".to_string()));
     }
 }
 

@@ -170,36 +170,40 @@ impl RuntimeBridge {
 
     /// Complete a pending invocation with a success result.
     ///
-    /// Returns `true` if the invocation was found and the result was sent,
-    /// `false` if the request_id was not found or the receiver was dropped.
-    pub async fn complete_invocation(&self, request_id: Uuid, body: String) -> bool {
+    /// Returns `(true, container_id)` if the invocation was found and the
+    /// result was sent, `(false, None)` if the request_id was not found or the
+    /// receiver was dropped.
+    pub async fn complete_invocation(&self, request_id: Uuid, body: String) -> (bool, Option<String>) {
         let pending = self.pending_invocations.lock().await.remove(&request_id);
         match pending {
             Some(p) => {
+                let container_id = p.container_id;
                 if p.response_tx.send(InvocationResult::Success { body }).is_err() {
                     warn!(%request_id, "invocation caller already dropped");
-                    false
+                    (false, container_id)
                 } else {
-                    true
+                    (true, container_id)
                 }
             }
-            None => false,
+            None => (false, None),
         }
     }
 
     /// Complete a pending invocation with an error result.
     ///
-    /// Returns `true` if the invocation was found and the result was sent,
-    /// `false` if the request_id was not found or the receiver was dropped.
+    /// Returns `(true, container_id)` if the invocation was found and the
+    /// result was sent, `(false, None)` if the request_id was not found or the
+    /// receiver was dropped.
     pub async fn fail_invocation(
         &self,
         request_id: Uuid,
         error_type: String,
         error_message: String,
-    ) -> bool {
+    ) -> (bool, Option<String>) {
         let pending = self.pending_invocations.lock().await.remove(&request_id);
         match pending {
             Some(p) => {
+                let container_id = p.container_id;
                 if p.response_tx
                     .send(InvocationResult::Error {
                         error_type,
@@ -208,12 +212,12 @@ impl RuntimeBridge {
                     .is_err()
                 {
                     warn!(%request_id, "invocation caller already dropped");
-                    false
+                    (false, container_id)
                 } else {
-                    true
+                    (true, container_id)
                 }
             }
-            None => false,
+            None => (false, None),
         }
     }
 
@@ -427,7 +431,8 @@ mod tests {
         let request_id = Uuid::new_v4();
         bridge.store_pending(request_id, "test-func".into(), None, tx).await;
 
-        assert!(bridge.complete_invocation(request_id, "done".into()).await);
+        let (success, _) = bridge.complete_invocation(request_id, "done".into()).await;
+        assert!(success);
         assert_eq!(
             rx.await.unwrap(),
             InvocationResult::Success {
@@ -441,7 +446,8 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
-        assert!(!bridge.complete_invocation(Uuid::new_v4(), "x".into()).await);
+        let (success, _) = bridge.complete_invocation(Uuid::new_v4(), "x".into()).await;
+        assert!(!success);
     }
 
     #[tokio::test]
@@ -453,9 +459,10 @@ mod tests {
         let request_id = Uuid::new_v4();
         bridge.store_pending(request_id, "test-func".into(), None, tx).await;
 
-        assert!(bridge
+        let (success, _) = bridge
             .fail_invocation(request_id, "RuntimeError".into(), "boom".into())
-            .await);
+            .await;
+        assert!(success);
         assert_eq!(
             rx.await.unwrap(),
             InvocationResult::Error {
@@ -470,9 +477,10 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
-        assert!(!bridge
+        let (success, _) = bridge
             .fail_invocation(Uuid::new_v4(), "X".into(), "Y".into())
-            .await);
+            .await;
+        assert!(!success);
     }
 
     #[tokio::test]
@@ -626,7 +634,9 @@ mod tests {
             .await;
 
         // Complete normally — should still work
-        assert!(bridge.complete_invocation(request_id, "ok".into()).await);
+        let (success, cid) = bridge.complete_invocation(request_id, "ok".into()).await;
+        assert!(success);
+        assert_eq!(cid, Some("ctr-123".into()));
         assert_eq!(
             rx.await.unwrap(),
             InvocationResult::Success { body: "ok".into() }

@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::api;
 use crate::config::Config;
-use crate::container::ContainerRegistry;
+use crate::container::{ContainerManager, ContainerRegistry};
 use crate::function::FunctionsConfig;
 use crate::runtime::RuntimeBridge;
 
@@ -21,6 +21,7 @@ pub struct AppState {
     pub docker: Docker,
     pub functions: Arc<FunctionsConfig>,
     pub container_registry: Arc<ContainerRegistry>,
+    pub container_manager: Arc<ContainerManager>,
     pub shutting_down: Arc<AtomicBool>,
     pub runtime_bridge: Arc<RuntimeBridge>,
 }
@@ -151,9 +152,19 @@ mod tests {
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
+        let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+        let container_manager = Arc::new(ContainerManager::new(
+            docker.clone(),
+            HashMap::new(),
+            "localfunctions".into(),
+            9601,
+            "us-east-1".into(),
+            container_registry.clone(),
+        ));
         AppState {
             config: Arc::new(config),
-            container_registry: Arc::new(ContainerRegistry::new(docker.clone())),
+            container_registry,
+            container_manager,
             docker,
             functions: Arc::new(functions),
             shutting_down: Arc::new(AtomicBool::new(false)),

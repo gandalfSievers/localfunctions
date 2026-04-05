@@ -16,7 +16,7 @@ use bollard::Docker;
 use futures_util::TryStreamExt;
 use tracing::{error, info, warn};
 
-use container::{ContainerRegistry, DockerNetwork};
+use container::{ContainerManager, ContainerRegistry, DockerNetwork};
 use runtime::RuntimeBridge;
 use server::AppState;
 
@@ -95,19 +95,53 @@ async fn main() -> Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let reaper_shutdown_rx = shutdown_rx.clone();
     let runtime_bridge = Arc::new(RuntimeBridge::new(invocation_senders, invocation_receivers, shutdown_rx));
 
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout);
+    let container_idle_timeout = Duration::from_secs(config.container_idle_timeout);
     let container_registry = Arc::new(ContainerRegistry::new(docker.clone()));
+
+    let container_manager = Arc::new(ContainerManager::new(
+        docker.clone(),
+        functions_config.runtime_images.clone(),
+        config.docker_network.clone(),
+        config.runtime_port,
+        config.region.clone(),
+        container_registry.clone(),
+    ));
 
     let state = AppState {
         config: Arc::new(config),
         docker,
         functions: Arc::new(functions_config),
         container_registry: container_registry.clone(),
+        container_manager: container_manager.clone(),
         shutting_down: Arc::new(AtomicBool::new(false)),
         runtime_bridge,
     };
+
+    // Spawn background idle container reaper (30-second interval).
+    {
+        let reaper_manager = container_manager.clone();
+        let mut shutdown_rx = reaper_shutdown_rx;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            // First tick completes immediately — skip it.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        reaper_manager.reap_idle_containers(container_idle_timeout).await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        info!("idle container reaper shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Start both API servers (blocks until shutdown signal)
     server::start(state).await?;
