@@ -7,13 +7,20 @@ use uuid::Uuid;
 
 use bytes::Bytes;
 
-use crate::types::{Invocation, InvocationResult, ServiceError};
+use crate::types::{Invocation, InvocationResult, ServiceError, StreamChunk};
+
+/// The response channel for a pending invocation — either a oneshot (synchronous)
+/// or an mpsc sender (streaming).
+enum ResponseChannel {
+    Oneshot(oneshot::Sender<InvocationResult>),
+    Streaming(mpsc::Sender<StreamChunk>),
+}
 
 /// A dispatched invocation waiting for a response from the container runtime.
 struct PendingInvocation {
     function_name: String,
     container_id: Option<String>,
-    response_tx: oneshot::Sender<InvocationResult>,
+    response_channel: ResponseChannel,
 }
 
 /// Bridges the Invoke API (which sends invocations) and the Runtime API (where
@@ -170,6 +177,7 @@ impl RuntimeBridge {
             trace_id,
             client_context,
             response_tx,
+            stream_tx: None,
         };
 
         sender.send(invocation).await.map_err(|_| {
@@ -180,6 +188,51 @@ impl RuntimeBridge {
         })?;
 
         Ok(response_rx)
+    }
+
+    /// Submit a streaming invocation for a function. Like `submit_invocation`
+    /// but returns an `mpsc::Receiver<StreamChunk>` for streaming responses.
+    ///
+    /// The streaming channel is carried inside the `Invocation` and stored in
+    /// `pending_invocations` when the container calls `/next`.
+    pub async fn submit_streaming_invocation(
+        &self,
+        function_name: &str,
+        request_id: Uuid,
+        payload: Bytes,
+        deadline: tokio::time::Instant,
+        trace_id: Option<String>,
+        client_context: Option<String>,
+    ) -> Result<mpsc::Receiver<StreamChunk>, ServiceError> {
+        let sender = self
+            .senders
+            .get(function_name)
+            .ok_or_else(|| ServiceError::ResourceNotFound(function_name.to_string()))?;
+
+        // Dummy oneshot — for streaming, the mpsc channel is used instead.
+        let (response_tx, _response_rx) = oneshot::channel();
+
+        let (stream_tx, stream_rx) = mpsc::channel(64);
+
+        let invocation = Invocation {
+            request_id,
+            function_name: function_name.to_string(),
+            payload,
+            deadline,
+            trace_id,
+            client_context,
+            response_tx,
+            stream_tx: Some(stream_tx),
+        };
+
+        sender.send(invocation).await.map_err(|_| {
+            ServiceError::ServiceException(format!(
+                "Failed to enqueue invocation for function '{}'",
+                function_name
+            ))
+        })?;
+
+        Ok(stream_rx)
     }
 
     /// Store the response channel for a dispatched invocation so that the
@@ -195,7 +248,65 @@ impl RuntimeBridge {
         self.pending_invocations
             .lock()
             .await
-            .insert(request_id, PendingInvocation { function_name, container_id, response_tx });
+            .insert(request_id, PendingInvocation {
+                function_name,
+                container_id,
+                response_channel: ResponseChannel::Oneshot(response_tx),
+            });
+    }
+
+    /// Store a streaming response channel for a dispatched invocation.
+    pub async fn store_streaming_pending(
+        &self,
+        request_id: Uuid,
+        function_name: String,
+        container_id: Option<String>,
+        stream_tx: mpsc::Sender<StreamChunk>,
+    ) {
+        self.pending_invocations
+            .lock()
+            .await
+            .insert(request_id, PendingInvocation {
+                function_name,
+                container_id,
+                response_channel: ResponseChannel::Streaming(stream_tx),
+            });
+    }
+
+    /// Check whether a pending invocation uses a streaming response channel.
+    pub async fn is_streaming_invocation(&self, request_id: Uuid) -> bool {
+        self.pending_invocations
+            .lock()
+            .await
+            .get(&request_id)
+            .map(|p| matches!(p.response_channel, ResponseChannel::Streaming(_)))
+            .unwrap_or(false)
+    }
+
+    /// Take the streaming sender from a pending invocation, returning it along
+    /// with the container_id. The pending invocation is removed from tracking.
+    pub async fn take_streaming_sender(
+        &self,
+        request_id: Uuid,
+    ) -> Option<(mpsc::Sender<StreamChunk>, Option<String>)> {
+        let pending = self.pending_invocations.lock().await.remove(&request_id);
+        match pending {
+            Some(PendingInvocation {
+                response_channel: ResponseChannel::Streaming(tx),
+                container_id,
+                ..
+            }) => Some((tx, container_id)),
+            Some(p) => {
+                // Put it back — it wasn't streaming.
+                let request_id_copy = request_id;
+                self.pending_invocations
+                    .lock()
+                    .await
+                    .insert(request_id_copy, p);
+                None
+            }
+            None => None,
+        }
     }
 
     /// Complete a pending invocation with a success result.
@@ -208,11 +319,26 @@ impl RuntimeBridge {
         match pending {
             Some(p) => {
                 let container_id = p.container_id;
-                if p.response_tx.send(InvocationResult::Success { body }).is_err() {
-                    warn!(%request_id, "invocation caller already dropped");
-                    (false, container_id)
-                } else {
-                    (true, container_id)
+                match p.response_channel {
+                    ResponseChannel::Oneshot(tx) => {
+                        if tx.send(InvocationResult::Success { body }).is_err() {
+                            warn!(%request_id, "invocation caller already dropped");
+                            (false, container_id)
+                        } else {
+                            (true, container_id)
+                        }
+                    }
+                    ResponseChannel::Streaming(tx) => {
+                        // For streaming invocations that complete via the normal
+                        // /response endpoint (non-chunked), send the entire body
+                        // as a single data chunk followed by completion.
+                        let data_ok = tx
+                            .send(StreamChunk::Data(bytes::Bytes::from(body)))
+                            .await
+                            .is_ok();
+                        let _ = tx.send(StreamChunk::Complete).await;
+                        (data_ok, container_id)
+                    }
                 }
             }
             None => (false, None),
@@ -234,17 +360,31 @@ impl RuntimeBridge {
         match pending {
             Some(p) => {
                 let container_id = p.container_id;
-                if p.response_tx
-                    .send(InvocationResult::Error {
-                        error_type,
-                        error_message,
-                    })
-                    .is_err()
-                {
-                    warn!(%request_id, "invocation caller already dropped");
-                    (false, container_id)
-                } else {
-                    (true, container_id)
+                match p.response_channel {
+                    ResponseChannel::Oneshot(tx) => {
+                        if tx
+                            .send(InvocationResult::Error {
+                                error_type,
+                                error_message,
+                            })
+                            .is_err()
+                        {
+                            warn!(%request_id, "invocation caller already dropped");
+                            (false, container_id)
+                        } else {
+                            (true, container_id)
+                        }
+                    }
+                    ResponseChannel::Streaming(tx) => {
+                        let ok = tx
+                            .send(StreamChunk::Error {
+                                error_type,
+                                error_message,
+                            })
+                            .await
+                            .is_ok();
+                        (ok, container_id)
+                    }
                 }
             }
             None => (false, None),
@@ -258,7 +398,17 @@ impl RuntimeBridge {
         let pending = self.pending_invocations.lock().await.remove(&request_id);
         match pending {
             Some(p) => {
-                let _ = p.response_tx.send(InvocationResult::Timeout);
+                match p.response_channel {
+                    ResponseChannel::Oneshot(tx) => {
+                        let _ = tx.send(InvocationResult::Timeout);
+                    }
+                    ResponseChannel::Streaming(tx) => {
+                        let _ = tx.send(StreamChunk::Error {
+                            error_type: "TimeoutError".into(),
+                            error_message: "Function timed out".into(),
+                        }).await;
+                    }
+                }
                 p.container_id
             }
             None => None,
@@ -287,7 +437,7 @@ impl RuntimeBridge {
                 // receiver (invoke handler) to see a RecvError, which maps to
                 // a 502 BAD_GATEWAY response — matching the AC requirement for
                 // a ServiceException on container crash.
-                drop(p.response_tx);
+                drop(p.response_channel);
                 count += 1;
             }
         }
@@ -335,7 +485,17 @@ impl RuntimeBridge {
 
         for id in matching_ids {
             if let Some(p) = pending.remove(&id) {
-                let _ = p.response_tx.send(init_error.clone());
+                match p.response_channel {
+                    ResponseChannel::Oneshot(tx) => {
+                        let _ = tx.send(init_error.clone());
+                    }
+                    ResponseChannel::Streaming(tx) => {
+                        let _ = tx.send(StreamChunk::Error {
+                            error_type: "InvalidRuntimeException".into(),
+                            error_message: "Runtime failed to initialize".into(),
+                        }).await;
+                    }
+                }
                 count += 1;
             }
         }
@@ -362,6 +522,7 @@ mod tests {
             trace_id: None,
             client_context: None,
             response_tx: tx,
+            stream_tx: None,
         };
         (inv, rx)
     }
@@ -831,5 +992,187 @@ mod tests {
 
         // Invocation should still be pending
         assert!(rx.try_recv().is_err());
+    }
+
+    // -- Streaming invocation tests -----------------------------------------
+
+    #[tokio::test]
+    async fn submit_streaming_invocation_returns_receiver() {
+        let (tx, rx) = mpsc::channel(10);
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let mut senders = HashMap::new();
+        senders.insert("test-func".to_string(), tx);
+        let mut receivers = HashMap::new();
+        receivers.insert("test-func".to_string(), rx);
+
+        let bridge = RuntimeBridge::new(senders, receivers, shutdown_rx);
+
+        let request_id = Uuid::new_v4();
+        let result = bridge
+            .submit_streaming_invocation(
+                "test-func",
+                request_id,
+                Bytes::from("{}"),
+                Instant::now() + std::time::Duration::from_secs(30),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn submit_streaming_invocation_unknown_function_returns_error() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let result = bridge
+            .submit_streaming_invocation(
+                "nonexistent",
+                Uuid::new_v4(),
+                Bytes::from("{}"),
+                Instant::now() + std::time::Duration::from_secs(30),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn is_streaming_invocation_returns_true_for_streaming() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (stream_tx, _stream_rx) = mpsc::channel(10);
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_streaming_pending(request_id, "test-func".into(), None, stream_tx)
+            .await;
+
+        assert!(bridge.is_streaming_invocation(request_id).await);
+    }
+
+    #[tokio::test]
+    async fn is_streaming_invocation_returns_false_for_oneshot() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx, _rx) = oneshot::channel();
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_pending(request_id, "test-func".into(), None, tx)
+            .await;
+
+        assert!(!bridge.is_streaming_invocation(request_id).await);
+    }
+
+    #[tokio::test]
+    async fn take_streaming_sender_returns_sender_for_streaming() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (stream_tx, mut stream_rx) = mpsc::channel(10);
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_streaming_pending(request_id, "test-func".into(), Some("ctr-1".into()), stream_tx)
+            .await;
+
+        let result = bridge.take_streaming_sender(request_id).await;
+        assert!(result.is_some());
+        let (tx, container_id) = result.unwrap();
+        assert_eq!(container_id, Some("ctr-1".into()));
+
+        // Verify the sender works
+        tx.send(crate::types::StreamChunk::Data(Bytes::from("hello"))).await.unwrap();
+        let chunk = stream_rx.recv().await.unwrap();
+        assert!(matches!(chunk, crate::types::StreamChunk::Data(data) if data == "hello"));
+    }
+
+    #[tokio::test]
+    async fn take_streaming_sender_returns_none_for_oneshot() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (tx, _rx) = oneshot::channel();
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_pending(request_id, "test-func".into(), None, tx)
+            .await;
+
+        let result = bridge.take_streaming_sender(request_id).await;
+        assert!(result.is_none());
+
+        // Verify the oneshot is still pending (wasn't consumed)
+        assert!(!bridge.is_streaming_invocation(request_id).await);
+    }
+
+    #[tokio::test]
+    async fn complete_invocation_with_streaming_channel() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (stream_tx, mut stream_rx) = mpsc::channel(10);
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_streaming_pending(request_id, "test-func".into(), None, stream_tx)
+            .await;
+
+        let (success, _) = bridge.complete_invocation(request_id, "response body".into()).await;
+        assert!(success);
+
+        // Should receive data chunk then complete
+        let chunk = stream_rx.recv().await.unwrap();
+        assert!(matches!(chunk, crate::types::StreamChunk::Data(data) if data == "response body"));
+        let chunk = stream_rx.recv().await.unwrap();
+        assert!(matches!(chunk, crate::types::StreamChunk::Complete));
+    }
+
+    #[tokio::test]
+    async fn fail_invocation_with_streaming_channel() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (stream_tx, mut stream_rx) = mpsc::channel(10);
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_streaming_pending(request_id, "test-func".into(), None, stream_tx)
+            .await;
+
+        let (success, _) = bridge
+            .fail_invocation(request_id, "RuntimeError".into(), "boom".into())
+            .await;
+        assert!(success);
+
+        let chunk = stream_rx.recv().await.unwrap();
+        assert!(matches!(
+            chunk,
+            crate::types::StreamChunk::Error { ref error_type, ref error_message }
+            if error_type == "RuntimeError" && error_message == "boom"
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_invocation_with_streaming_channel() {
+        let (_shutdown_tx, shutdown_rx) = shutdown_channel();
+        let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
+
+        let (stream_tx, mut stream_rx) = mpsc::channel(10);
+        let request_id = Uuid::new_v4();
+        bridge
+            .store_streaming_pending(request_id, "test-func".into(), Some("ctr-1".into()), stream_tx)
+            .await;
+
+        let container_id = bridge.timeout_invocation(request_id).await;
+        assert_eq!(container_id, Some("ctr-1".into()));
+
+        let chunk = stream_rx.recv().await.unwrap();
+        assert!(matches!(
+            chunk,
+            crate::types::StreamChunk::Error { ref error_type, .. }
+            if error_type == "TimeoutError"
+        ));
     }
 }

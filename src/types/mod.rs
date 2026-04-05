@@ -86,6 +86,9 @@ pub struct Invocation {
     pub trace_id: Option<String>,
     pub client_context: Option<String>,
     pub response_tx: oneshot::Sender<InvocationResult>,
+    /// When set, this invocation uses response streaming and chunks should be
+    /// forwarded through this channel instead of the oneshot.
+    pub stream_tx: Option<mpsc::Sender<StreamChunk>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +108,24 @@ pub enum InvocationResult {
     },
     #[serde(rename = "timeout")]
     Timeout,
+}
+
+// ---------------------------------------------------------------------------
+// StreamChunk — used for InvokeWithResponseStream
+// ---------------------------------------------------------------------------
+
+/// A chunk in a streaming invocation response.
+#[derive(Debug)]
+pub enum StreamChunk {
+    /// A chunk of response data.
+    Data(Bytes),
+    /// An error occurred mid-stream.
+    Error {
+        error_type: String,
+        error_message: String,
+    },
+    /// The stream completed successfully.
+    Complete,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +482,7 @@ mod tests {
             trace_id: None,
             client_context: None,
             response_tx: tx,
+            stream_tx: None,
         };
         assert_eq!(inv.function_name, "test-fn");
         assert_eq!(inv.payload, Bytes::from("{}"));
@@ -477,6 +499,7 @@ mod tests {
             trace_id: None,
             client_context: None,
             response_tx: tx,
+            stream_tx: None,
         };
         // Simulate sending a result back
         _inv.response_tx

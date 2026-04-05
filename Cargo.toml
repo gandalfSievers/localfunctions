@@ -38,9 +38,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # HTTP types
 bytes = "1"
 http = "1"
+http-body-util = "0.1"
 
 # Async stream utilities
 futures-util = "0.3"
+tokio-stream = "0.1"
+
+# CRC for AWS event stream encoding
+crc32c = "0.6"
 
 # Utilities
 base64 = "0.22"
