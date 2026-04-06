@@ -85,7 +85,7 @@ docker-build: docker-build-debian docker-build-alpine ## Build both images (nati
 	@echo "Build complete! Images:"
 	@docker images $(IMAGE_NAME) --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}"
 
-docker-build-multi: docker-buildx-setup ## Build multi-arch images (amd64 + arm64)
+docker-build-multi: docker-buildx-setup ## Build multi-arch images (amd64 + arm64, cache only)
 	@echo "Building multi-arch Debian image..."
 	docker buildx build \
 		--platform linux/amd64,linux/arm64 \
@@ -98,7 +98,6 @@ docker-build-multi: docker-buildx-setup ## Build multi-arch images (amd64 + arm6
 		-t $(REGISTRY_IMAGE):debian \
 		-t $(REGISTRY_IMAGE):$(VERSION) \
 		-t $(REGISTRY_IMAGE):$(VERSION)-debian \
-		--load \
 		.
 	@echo "Building multi-arch Alpine image..."
 	docker buildx build \
@@ -108,7 +107,6 @@ docker-build-multi: docker-buildx-setup ## Build multi-arch images (amd64 + arm6
 		-t $(IMAGE_NAME):$(VERSION)-alpine \
 		-t $(REGISTRY_IMAGE):alpine \
 		-t $(REGISTRY_IMAGE):$(VERSION)-alpine \
-		--load \
 		.
 
 docker-push-debian: docker-buildx-setup ## Push multi-arch Debian image to registry
