@@ -1,6 +1,7 @@
 pub(crate) mod common;
 mod eventstream;
 pub(crate) mod function_url;
+pub(crate) mod health;
 mod sample_events;
 
 use common::*;
@@ -22,27 +23,13 @@ use crate::function::validate_function_name;
 use crate::server::AppState;
 use crate::types::{ContainerState, ServiceError};
 
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    docker: DockerStatus,
-}
-
-#[derive(Debug, Serialize)]
-struct DockerStatus {
-    connected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Invoke API routes (external, port 9600 by default)
 // ---------------------------------------------------------------------------
 
 pub fn invoke_routes() -> Router<AppState> {
     Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(get_metrics))
+        .merge(health::health_routes())
         .route("/2015-03-31/functions", get(list_functions))
         .route(
             "/2015-03-31/functions/:function_name",
@@ -71,38 +58,6 @@ pub fn invoke_routes() -> Router<AppState> {
 }
 
 /// Health check endpoint — pings Docker daemon and reports connectivity.
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let docker_status = match state.docker.ping().await {
-        Ok(_) => DockerStatus {
-            connected: true,
-            error: None,
-        },
-        Err(e) => DockerStatus {
-            connected: false,
-            error: Some(e.to_string()),
-        },
-    };
-
-    let status = if docker_status.connected {
-        "healthy"
-    } else {
-        "degraded"
-    };
-
-    let response = HealthResponse {
-        status,
-        docker: docker_status,
-    };
-
-    (StatusCode::OK, Json(response))
-}
-
-/// GET /metrics — return per-function invocation metrics.
-async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let snapshot = state.metrics.snapshot();
-    (StatusCode::OK, Json(serde_json::json!({ "functions": snapshot })))
-}
-
 // ---------------------------------------------------------------------------
 // List / Get Function APIs
 // ---------------------------------------------------------------------------
@@ -1495,7 +1450,7 @@ pub(crate) async fn acquire_container(
 
 pub fn runtime_routes() -> Router<AppState> {
     Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health::health))
         .route(
             "/2018-06-01/runtime/invocation/next",
             get(next_invocation),
@@ -2302,76 +2257,6 @@ mod tests {
                 tokio::sync::watch::channel(false).1,
             )),
         }
-    }
-
-    #[tokio::test]
-    async fn invoke_health_returns_ok_with_json() {
-        let app = invoke_routes().with_state(test_state());
-        let resp = app
-            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("status").is_some());
-        assert!(json.get("docker").is_some());
-        assert!(json["docker"].get("connected").is_some());
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_returns_empty_on_fresh_start() {
-        let app = invoke_routes().with_state(test_state());
-        let resp = app
-            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let functions = json.get("functions").unwrap().as_object().unwrap();
-        assert!(functions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_reflects_recorded_invocations() {
-        let state = test_state();
-        // Simulate recording some invocations directly.
-        state.metrics.record_invocation(
-            "test-func",
-            std::time::Duration::from_millis(50),
-            false,
-            true,
-        );
-        state.metrics.record_invocation(
-            "test-func",
-            std::time::Duration::from_millis(150),
-            true,
-            false,
-        );
-
-        let app = invoke_routes().with_state(state);
-        let resp = app
-            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let func_metrics = &json["functions"]["test-func"];
-        assert_eq!(func_metrics["invocation_count"], 2);
-        assert_eq!(func_metrics["error_count"], 1);
-        assert_eq!(func_metrics["cold_start_count"], 1);
-        assert!(func_metrics["avg_duration_ms"].as_f64().unwrap() > 0.0);
-        assert!(func_metrics["p50_duration_ms"].as_f64().unwrap() > 0.0);
-        assert!(func_metrics["p95_duration_ms"].as_f64().unwrap() > 0.0);
-        assert!(func_metrics["p99_duration_ms"].as_f64().unwrap() > 0.0);
     }
 
     #[tokio::test]
