@@ -620,7 +620,7 @@ fn format_time(epoch_secs: u64) -> String {
     let seconds = time_of_day % 60;
 
     // Simplified date calculation.
-    let (year, month, day) = epoch_days_to_ymd(days);
+    let (year, month, day) = super::common::epoch_days_to_ymd(days);
     let month_name = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -634,22 +634,6 @@ fn format_time(epoch_secs: u64) -> String {
         "{:02}/{}/{:04}:{:02}:{:02}:{:02} +0000",
         day, m, year, hours, minutes, seconds
     )
-}
-
-/// Convert epoch days to (year, month, day).
-fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Civil calendar algorithm.
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -794,12 +778,4 @@ mod tests {
         assert!(result.contains("+0000"));
     }
 
-    #[test]
-    fn test_epoch_days_to_ymd() {
-        // 2024-01-01 = day 19723 since epoch
-        let (y, m, d) = epoch_days_to_ymd(19723);
-        assert_eq!(y, 2024);
-        assert_eq!(m, 1);
-        assert_eq!(d, 1);
-    }
 }

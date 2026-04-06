@@ -1,6 +1,9 @@
+pub(crate) mod common;
 mod eventstream;
 pub(crate) mod function_url;
 mod sample_events;
+
+use common::*;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -14,122 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// X-Ray Trace ID generation
-// ---------------------------------------------------------------------------
-
-/// Generate an AWS X-Ray trace header in the format:
-/// `Root=1-{hex-timestamp}-{96-bit-hex-id};Parent={64-bit-hex-id};Sampled=1`
-fn generate_xray_trace_id() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Use two UUIDs to get enough random bytes for the 96-bit and 64-bit IDs.
-    let root_rand = Uuid::new_v4();
-    let parent_rand = Uuid::new_v4();
-
-    let root_bytes = root_rand.as_bytes();
-    let parent_bytes = parent_rand.as_bytes();
-
-    // 96-bit (12 bytes) hex ID for Root
-    let root_id: String = root_bytes[..12]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-
-    // 64-bit (8 bytes) hex ID for Parent
-    let parent_id: String = parent_bytes[..8]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-
-    format!(
-        "Root=1-{:08x}-{};Parent={};Sampled=1",
-        timestamp, root_id, parent_id
-    )
-}
-
 use crate::extensions::ExtensionEventType;
 use crate::function::validate_function_name;
 use crate::server::AppState;
-
-// ---------------------------------------------------------------------------
-// Qualifier parsing
-// ---------------------------------------------------------------------------
-
-/// Query parameters accepted by the Invoke and GetFunction APIs.
-#[derive(Debug, Deserialize, Default)]
-struct QualifierParams {
-    #[serde(rename = "Qualifier")]
-    qualifier: Option<String>,
-}
-
-/// Parse a function name that may contain a colon-separated qualifier
-/// (e.g. `my-function:PROD`) and merge with an optional `?Qualifier=` query
-/// parameter. The query parameter takes precedence if both are present.
-///
-/// Returns `(base_name, qualifier)` where qualifier is `None` for unqualified
-/// requests and `Some(q)` when a qualifier was specified.
-fn parse_qualifier(raw_name: &str, query_qualifier: Option<&str>) -> (String, Option<String>) {
-    let (base_name, inline_qualifier) = match raw_name.split_once(':') {
-        Some((name, qual)) => (name.to_string(), Some(qual.to_string())),
-        None => (raw_name.to_string(), None),
-    };
-    let qualifier = query_qualifier
-        .map(|q| q.to_string())
-        .or(inline_qualifier);
-    (base_name, qualifier)
-}
-
-/// Validate that a qualifier is supported. Only `$LATEST` (or absent) is valid
-/// for this local emulator — all other qualifiers are treated as not found.
-///
-/// Returns `Ok(())` if the qualifier is acceptable, or `Err(ServiceError)` with
-/// a `ResourceNotFoundException` for unrecognized qualifiers.
-fn validate_qualifier(qualifier: &Option<String>, function_name: &str) -> Result<(), ServiceError> {
-    match qualifier.as_deref() {
-        None | Some("$LATEST") => Ok(()),
-        Some(q) => Err(ServiceError::ResourceNotFound(format!(
-            "Function not found: arn:aws:lambda:us-east-1:000000000000:function:{}:{}",
-            function_name, q
-        ))),
-    }
-}
-
-/// Maximum size of the decoded client context in bytes (AWS limit).
-const CLIENT_CONTEXT_MAX_BYTES: usize = 3_583;
-
-/// Validate the `X-Amz-Client-Context` header value.
-///
-/// The value must be valid base64, decode to valid JSON, and the decoded
-/// payload must not exceed 3,583 bytes (AWS limit).
-fn validate_client_context(value: &str) -> Result<(), ServiceError> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|e| {
-            ServiceError::InvalidRequestContent(format!(
-                "Could not base64 decode client context: {e}"
-            ))
-        })?;
-
-    if decoded.len() > CLIENT_CONTEXT_MAX_BYTES {
-        return Err(ServiceError::InvalidRequestContent(format!(
-            "Client context must be no more than {CLIENT_CONTEXT_MAX_BYTES} bytes when decoded, got {} bytes",
-            decoded.len()
-        )));
-    }
-
-    serde_json::from_slice::<serde_json::Value>(&decoded).map_err(|e| {
-        ServiceError::InvalidRequestContent(format!(
-            "Client context must be valid JSON when decoded: {e}"
-        ))
-    })?;
-
-    Ok(())
-}
-
 use crate::types::{ContainerState, ServiceError};
 
 #[derive(Debug, Serialize)]
@@ -315,62 +205,6 @@ async fn get_function(
         headers,
         serde_json::to_vec(&body).unwrap_or_default(),
     )
-}
-
-/// Build the AWS-format function configuration JSON for a single function.
-fn function_configuration_json(
-    f: &crate::types::FunctionConfig,
-    arn_prefix: &str,
-) -> serde_json::Value {
-    let mut config = serde_json::json!({
-        "FunctionName": f.name,
-        "FunctionArn": format!("{}{}", arn_prefix, f.name),
-        "Runtime": f.runtime,
-        "Handler": f.handler,
-        "CodeSize": 0,
-        "Timeout": f.timeout,
-        "MemorySize": f.memory_size,
-        "LastModified": "1970-01-01T00:00:00.000+0000",
-        "Version": "$LATEST",
-        "RevisionId": "00000000-0000-0000-0000-000000000000",
-        "PackageType": if f.image_uri.is_some() { "Image" } else { "Zip" },
-        "EphemeralStorage": {
-            "Size": f.ephemeral_storage_mb,
-        },
-    });
-
-    if !f.environment.is_empty() {
-        config["Environment"] = serde_json::json!({
-            "Variables": f.environment,
-        });
-    }
-
-    if !f.layers.is_empty() {
-        let layer_arns: Vec<String> = f
-            .layers
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let layer_name = p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("layer-{}", i));
-                format!("arn:aws:lambda:local:000000000000:layer:{}:{}", layer_name, i + 1)
-            })
-            .collect();
-        config["Layers"] = serde_json::json!(
-            layer_arns.iter().map(|arn| serde_json::json!({"Arn": arn})).collect::<Vec<_>>()
-        );
-    }
-
-    config
-}
-
-/// Build the standard headers for an invoke response.
-fn invoke_base_headers(request_id: Uuid) -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert("X-Amz-Request-Id", request_id.to_string().parse().unwrap());
-    h.insert("X-Amz-Executed-Version", "$LATEST".parse().unwrap());
-    h
 }
 
 /// Invoke a Lambda function by name.
@@ -4422,102 +4256,6 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["Type"].as_str().unwrap(), "TooManyRequestsException");
-    }
-
-    #[test]
-    fn generate_xray_trace_id_has_correct_format() {
-        let trace_id = generate_xray_trace_id();
-
-        // Must start with "Root=1-"
-        assert!(trace_id.starts_with("Root=1-"), "trace_id: {}", trace_id);
-        // Must contain ";Parent=" and ";Sampled=1"
-        assert!(trace_id.contains(";Parent="), "trace_id: {}", trace_id);
-        assert!(trace_id.ends_with(";Sampled=1"), "trace_id: {}", trace_id);
-
-        // Parse out the components
-        let root_part = trace_id.split(";Parent=").next().unwrap();
-        let root_value = root_part.strip_prefix("Root=1-").unwrap();
-        let parts: Vec<&str> = root_value.split('-').collect();
-        assert_eq!(parts.len(), 2, "Root should have timestamp-id: {}", root_value);
-
-        // Timestamp: 8 hex chars
-        assert_eq!(parts[0].len(), 8, "timestamp hex: {}", parts[0]);
-        assert!(u32::from_str_radix(parts[0], 16).is_ok());
-
-        // Root ID: 24 hex chars (96 bits)
-        assert_eq!(parts[1].len(), 24, "root id hex: {}", parts[1]);
-        assert!(u128::from_str_radix(parts[1], 16).is_ok());
-
-        // Parent ID: 16 hex chars (64 bits)
-        let parent_part = trace_id
-            .split(";Parent=")
-            .nth(1)
-            .unwrap()
-            .split(";Sampled=")
-            .next()
-            .unwrap();
-        assert_eq!(parent_part.len(), 16, "parent id hex: {}", parent_part);
-        assert!(u64::from_str_radix(parent_part, 16).is_ok());
-    }
-
-    #[test]
-    fn generate_xray_trace_id_is_unique() {
-        let id1 = generate_xray_trace_id();
-        let id2 = generate_xray_trace_id();
-        assert_ne!(id1, id2);
-    }
-
-    // -- Qualifier parsing unit tests -----------------------------------------
-
-    #[test]
-    fn parse_qualifier_no_qualifier() {
-        let (name, qual) = parse_qualifier("my-func", None);
-        assert_eq!(name, "my-func");
-        assert_eq!(qual, None);
-    }
-
-    #[test]
-    fn parse_qualifier_inline_colon() {
-        let (name, qual) = parse_qualifier("my-func:PROD", None);
-        assert_eq!(name, "my-func");
-        assert_eq!(qual, Some("PROD".into()));
-    }
-
-    #[test]
-    fn parse_qualifier_query_param() {
-        let (name, qual) = parse_qualifier("my-func", Some("STAGING"));
-        assert_eq!(name, "my-func");
-        assert_eq!(qual, Some("STAGING".into()));
-    }
-
-    #[test]
-    fn parse_qualifier_query_param_overrides_inline() {
-        let (name, qual) = parse_qualifier("my-func:DEV", Some("PROD"));
-        assert_eq!(name, "my-func");
-        assert_eq!(qual, Some("PROD".into()));
-    }
-
-    #[test]
-    fn parse_qualifier_dollar_latest() {
-        let (name, qual) = parse_qualifier("my-func:$LATEST", None);
-        assert_eq!(name, "my-func");
-        assert_eq!(qual, Some("$LATEST".into()));
-    }
-
-    #[test]
-    fn validate_qualifier_accepts_none() {
-        assert!(validate_qualifier(&None, "my-func").is_ok());
-    }
-
-    #[test]
-    fn validate_qualifier_accepts_latest() {
-        assert!(validate_qualifier(&Some("$LATEST".into()), "my-func").is_ok());
-    }
-
-    #[test]
-    fn validate_qualifier_rejects_unknown() {
-        let result = validate_qualifier(&Some("PROD".into()), "my-func");
-        assert!(result.is_err());
     }
 
     // -- Qualifier integration tests (Invoke API) -----------------------------
