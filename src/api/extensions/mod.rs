@@ -15,7 +15,7 @@ use crate::extensions::ExtensionEventType;
 use crate::server::AppState;
 use crate::types::ServiceError;
 
-use super::HEADER_FUNCTION_NAME;
+use super::runtime::HEADER_FUNCTION_NAME;
 
 /// Header used by extensions to identify themselves after registration.
 pub(crate) const HEADER_EXTENSION_ID: &str = "Lambda-Extension-Identifier";
