@@ -1,0 +1,9 @@
+Create localfunctions, a project to execute AWS lambda functions locally.
+
+See /Users/gs/code/localObjectStorage and /Users/gs/code/localSecrets for the exact docker build setup to replicate.
+
+localfunctions should be writtien in Rust but allow invocations of lambdas of all kind of languages.
+It will have a config of functions and how to invoke the runners themselves. It could use user-configured side case containers to support different run times.
+Local lambda serves as entry point so that the lambda.<region>.amazonaws.com route only needs to exist once in a local setup. But it's flexible for the user to configure with multiple lambdas.
+
+

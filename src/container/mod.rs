@@ -1086,7 +1086,10 @@ impl ContainerManager {
         if output.len() > max_bytes {
             // Find a valid char boundary at or after the cut point.
             let start = output.len() - max_bytes;
-            let start = output.ceil_char_boundary(start);
+            let mut start = start;
+            while start < output.len() && !output.is_char_boundary(start) {
+                start += 1;
+            }
             output = output[start..].to_string();
         }
         output

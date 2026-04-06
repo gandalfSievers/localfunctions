@@ -13,6 +13,9 @@
 *.swp
 *.swo
 
+# Function config (user-specific)
+functions.json
+
 # OS files
 .DS_Store
 

@@ -64,7 +64,7 @@ wait-ready: ## Wait for server to be ready on ports 9600 and 9601
 
 test-integration: docker-build-debian docker-up wait-ready ## Build, run, and test against Docker container
 	@echo "Running integration tests..."
-	@cargo test --test integration -- --ignored; \
+	@cargo test --test '*_integration' -- --ignored; \
 	TEST_EXIT=$$?; \
 	echo "Stopping container..."; \
 	docker compose down; \
