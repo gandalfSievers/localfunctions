@@ -267,6 +267,42 @@ localfunctions works well alongside other local AWS service emulators. Pass serv
 
 Use `host.docker.internal` to reach services running on the Docker host from inside Lambda containers.
 
+### TLS termination with Traefik
+
+localfunctions does not handle TLS itself. To serve functions over HTTPS (e.g. to fully emulate `lambda.<region>.amazonaws.com`), put [Traefik](https://doc.traefik.io/traefik/) in front on the same Docker network:
+
+```yaml
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --entrypoints.https.address=:443
+      - --providers.docker=true
+    ports:
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/certs:ro
+    networks:
+      - localservices
+
+  localfunctions:
+    # ... existing localfunctions service ...
+    labels:
+      - "traefik.http.routers.lambda.rule=HostRegexp(`{name:.+}.lambda.${LOCAL_LAMBDA_REGION:-us-east-1}.amazonaws.com`)"
+      - "traefik.http.routers.lambda.tls=true"
+      - "traefik.http.routers.lambda.tls.certresolver=default"
+      - "traefik.http.services.lambda.loadbalancer.server.port=9600"
+    networks:
+      - localservices
+
+networks:
+  localservices:
+    name: localservices
+```
+
+Pair this with a local DNS resolver (e.g. dnsmasq) that points `*.amazonaws.com` at Traefik, and your AWS SDKs can connect over TLS just like in production.
+
 ## Docker
 
 ### Run with Docker Compose
