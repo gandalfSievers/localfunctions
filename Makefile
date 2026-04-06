@@ -1,4 +1,4 @@
-.PHONY: help build test fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup
+.PHONY: help build test fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs
 
 .DEFAULT_GOAL := help
 
@@ -130,6 +130,17 @@ docker-push-alpine: docker-buildx-setup ## Push multi-arch Alpine image to regis
 		.
 
 docker-push: docker-push-debian docker-push-alpine ## Push both images to registry
+
+docker-up: ## Start container via docker compose (detached, with build)
+	docker compose up -d --build
+
+docker-down: ## Stop and remove container via docker compose
+	docker compose down
+
+docker-restart: docker-down docker-up ## Restart container (stop then start)
+
+docker-logs: ## Tail container logs via docker compose
+	docker compose logs -f
 
 docker-clean: ## Remove Docker images and build artifacts
 	@echo "Cleaning Docker artifacts..."
