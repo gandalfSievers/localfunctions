@@ -2,7 +2,7 @@ services:
   localfunctions:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.debian
     ports:
       - "9600:9600"
       - "9601:9601"

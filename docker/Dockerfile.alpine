@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+
+# ---------- builder ----------
+# Build natively per platform via QEMU — avoids external musl cross-compiler downloads
+FROM rust:1.83-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache musl-dev gcc
+
+WORKDIR /build
+
+# Cache dependencies by building a dummy project first
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs
+RUN cargo build --release || true
+
+# Copy real source and rebuild
+COPY src/ src/
+RUN touch src/main.rs src/lib.rs
+RUN rm -f target/release/localfunctions && \
+    cargo build --release && \
+    cp target/release/localfunctions /build/localfunctions
+
+# ---------- runtime ----------
+FROM alpine:3.19 AS runtime
+
+# Add non-root user and install ca-certificates + curl (for healthcheck)
+RUN addgroup -S app && adduser -S -G app -H app && \
+    apk add --no-cache ca-certificates curl
+
+COPY --from=builder /build/localfunctions /usr/local/bin/localfunctions
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+RUN chmod +x /usr/local/bin/localfunctions /usr/local/bin/entrypoint.sh
+
+EXPOSE 9600 9601
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+    CMD curl -f http://localhost:9600/health || exit 1
+
+USER app
+
+ENTRYPOINT ["entrypoint.sh"]
