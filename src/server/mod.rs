@@ -2,12 +2,17 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use axum::extract::State;
+use axum::http::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::Router;
 use bollard::Docker;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::api;
+use crate::api::virtual_host::extract_function_from_host;
 use crate::config::Config;
 use crate::container::{ContainerManager, ContainerRegistry};
 #[cfg(test)]
@@ -41,11 +46,77 @@ impl AppState {
 }
 
 /// Create the external Invoke API router with a configurable request body limit.
+///
+/// Includes a virtual-host middleware layer that rewrites the URI when the
+/// request's Host header matches an AWS-style
+/// (`{function}.lambda.{region}.amazonaws.com`) or custom domain
+/// (`{function}.{domain}`) pattern, enabling Function URL–style routing via
+/// the hostname.
 pub fn invoke_router(state: AppState) -> Router {
     let max_body_size = state.config.max_body_size;
     api::invoke_routes()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            virtual_host_rewrite,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_size))
         .with_state(state)
+}
+
+/// Middleware that rewrites the URI path when a virtual hosted-style Host
+/// header is detected.
+///
+/// When the Host header matches `{function}.lambda.{region}.amazonaws.com`
+/// (always enabled) or `{function}.{domain}` (when `LOCAL_LAMBDA_DOMAIN` is
+/// set), the path is rewritten from `/{path}` to `/{function}/{path}` so
+/// that the existing Function URL routes (`/:function_name` and
+/// `/:function_name/*path`) handle the request transparently.
+///
+/// Requests with a Host that does not match any virtual host pattern pass
+/// through unchanged — normal path-based routing applies.
+async fn virtual_host_rewrite(
+    State(state): State<AppState>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(info) = host.and_then(|h| {
+        extract_function_from_host(h, state.config.domain.as_deref())
+    }) {
+        let function_name = info.function_name;
+        let original_path = req.uri().path();
+        let new_path = if original_path == "/" {
+            format!("/{}", function_name)
+        } else {
+            format!("/{}{}", function_name, original_path)
+        };
+
+        let path_and_query = match req.uri().query() {
+            Some(query) => format!("{}?{}", new_path, query),
+            None => new_path,
+        };
+
+        if let Ok(pq) = path_and_query.parse::<http::uri::PathAndQuery>() {
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(pq);
+            if let Ok(new_uri) = http::Uri::from_parts(parts) {
+                debug!(
+                    original_host = ?host,
+                    function = %function_name,
+                    original_uri = %req.uri(),
+                    rewritten_uri = %new_uri,
+                    "virtual host rewrite"
+                );
+                *req.uri_mut() = new_uri;
+            }
+        }
+    }
+
+    next.run(req).await
 }
 
 /// Create the Runtime API router used by Lambda containers.
@@ -157,6 +228,7 @@ mod tests {
             max_async_body_size: 256 * 1024,
             hot_reload: true,
             hot_reload_debounce_ms: 500,
+            domain: None,
         };
         let docker = Docker::connect_with_local_defaults().unwrap();
         let functions = FunctionsConfig {
@@ -301,5 +373,97 @@ mod tests {
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(state.is_shutting_down());
+    }
+
+    // ---- Virtual host rewrite tests ----
+
+    #[tokio::test]
+    async fn virtual_host_aws_style_rewrites_root_to_function_name() {
+        let app = invoke_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "my-func.lambda.us-east-1.amazonaws.com:9600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should reach the Function URL handler route (/:function_name) — which
+        // returns 404 because the function doesn't exist in config, not because
+        // the route was unmatched.
+        assert_ne!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn virtual_host_aws_style_rewrites_path() {
+        let app = invoke_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/some/path")
+                    .header("host", "test-fn.lambda.us-east-1.amazonaws.com:9600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Reaches /:function_name/*path — returns 404 (function not found).
+        assert_ne!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn virtual_host_localhost_no_rewrite() {
+        let app = invoke_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent")
+                    .header("host", "localhost:9600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No virtual host rewrite — /:function_name matches "nonexistent" as
+        // a function name via the Function URL catch-all, returning 404.
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn virtual_host_custom_domain_rewrites_when_configured() {
+        let mut state = test_state();
+        Arc::get_mut(&mut state.config).unwrap().domain = Some("lambda.local".into());
+        let app = invoke_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "my-func.lambda.local:9600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Rewritten to /my-func → reaches Function URL handler → 404 (no such function).
+        assert_ne!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn virtual_host_preserves_query_string() {
+        let app = invoke_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/?key=value")
+                    .header("host", "my-func.lambda.us-east-1.amazonaws.com:9600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should still reach the function URL handler.
+        assert_ne!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
     }
 }

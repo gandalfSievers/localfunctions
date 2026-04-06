@@ -33,6 +33,7 @@ fn test_state() -> AppState {
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
     let functions = FunctionsConfig {
@@ -116,6 +117,7 @@ fn test_state_with_functions() -> AppState {
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -294,6 +296,7 @@ async fn test_state_with_function(
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -1155,6 +1158,7 @@ async fn invoke_returns_429_when_max_containers_reached() {
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 

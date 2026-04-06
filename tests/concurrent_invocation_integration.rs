@@ -50,6 +50,7 @@ async fn build_concurrent_state(
         max_async_body_size: 256 * 1024,
         hot_reload: false,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();

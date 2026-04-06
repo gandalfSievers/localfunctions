@@ -7,6 +7,7 @@ pub(crate) mod health;
 pub(crate) mod invoke;
 pub(crate) mod runtime;
 pub(crate) mod streaming;
+pub(crate) mod virtual_host;
 mod sample_events;
 
 use common::*;

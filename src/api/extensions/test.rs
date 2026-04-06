@@ -34,6 +34,7 @@ fn test_state() -> AppState {
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
     let functions = FunctionsConfig {
@@ -258,6 +259,7 @@ async fn extension_event_next_returns_shutdown_on_shutdown_signal() {
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let functions = FunctionsConfig {
         functions: HashMap::new(),

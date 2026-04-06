@@ -44,6 +44,12 @@ pub struct Config {
     /// Debounce window in milliseconds for file change events. Rapid changes
     /// within this window are coalesced into a single reload. Default: 500ms.
     pub hot_reload_debounce_ms: u64,
+    /// Base domain for virtual hosted-style function addressing.
+    /// When set, requests to `<function>.<domain>` extract the function name
+    /// from the Host header. AWS-style addressing
+    /// (`<function>.lambda.<region>.amazonaws.com`) is always enabled
+    /// regardless of this setting.
+    pub domain: Option<String>,
 }
 
 /// Controls the format of log output.
@@ -102,6 +108,7 @@ impl Config {
         let mount_aws_credentials = parse_env("LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS", "false")?;
         let hot_reload = parse_env("LOCAL_LAMBDA_HOT_RELOAD", "true")?;
         let hot_reload_debounce_ms = parse_env("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS", "500")?;
+        let domain = std::env::var("LOCAL_LAMBDA_DOMAIN").ok().filter(|s| !s.is_empty());
 
         Ok(Config {
             host,
@@ -125,6 +132,7 @@ impl Config {
             mount_aws_credentials,
             hot_reload,
             hot_reload_debounce_ms,
+            domain,
         })
     }
 }
@@ -193,6 +201,7 @@ mod tests {
             "LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS",
             "LOCAL_LAMBDA_HOT_RELOAD",
             "LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS",
+            "LOCAL_LAMBDA_DOMAIN",
         ] {
             std::env::remove_var(key);
         }
@@ -219,6 +228,7 @@ mod tests {
         assert!(!config.mount_aws_credentials);
         assert!(config.hot_reload);
         assert_eq!(config.hot_reload_debounce_ms, 500);
+        assert!(config.domain.is_none());
     }
 
     #[test]
@@ -572,5 +582,31 @@ mod tests {
         let result = Config::from_env();
         assert!(result.is_err());
         std::env::remove_var("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_domain_default_none() {
+        std::env::remove_var("LOCAL_LAMBDA_DOMAIN");
+        let config = Config::from_env().unwrap();
+        assert!(config.domain.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_domain_custom() {
+        std::env::set_var("LOCAL_LAMBDA_DOMAIN", "lambda.local");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.domain.as_deref(), Some("lambda.local"));
+        std::env::remove_var("LOCAL_LAMBDA_DOMAIN");
+    }
+
+    #[test]
+    #[serial]
+    fn test_domain_empty_is_none() {
+        std::env::set_var("LOCAL_LAMBDA_DOMAIN", "");
+        let config = Config::from_env().unwrap();
+        assert!(config.domain.is_none());
+        std::env::remove_var("LOCAL_LAMBDA_DOMAIN");
     }
 }

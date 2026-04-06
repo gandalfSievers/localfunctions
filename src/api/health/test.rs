@@ -34,6 +34,7 @@ fn test_state() -> AppState {
         max_async_body_size: 256 * 1024,
         hot_reload: true,
         hot_reload_debounce_ms: 500,
+        domain: None,
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
     let functions = FunctionsConfig {
