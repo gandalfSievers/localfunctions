@@ -220,12 +220,10 @@ fn spawn_echo_runtime(
 // Tests — AWS-style virtual host routing
 // ---------------------------------------------------------------------------
 
-/// Invoke a Python function via AWS-style Host header:
-///   Host: python-hello.lambda.us-east-1.amazonaws.com
-/// instead of using the path-based /2015-03-31/functions/{name}/invocations.
-///
-/// The virtual host middleware extracts the function name from the Host header
-/// and rewrites the URI so path-based handlers process it normally.
+/// Invoke a Python function with both an AWS-style Host header and the
+/// standard Lambda API path. The middleware detects the Lambda API prefix
+/// in the path and skips rewriting, so the request routes directly to the
+/// standard invoke handler.
 #[tokio::test]
 #[ignore] // Requires Docker daemon — run with `cargo test --test integration_awsstyle -- --ignored`
 async fn awsstyle_python_invocation_via_host_header() {
@@ -275,7 +273,9 @@ async fn awsstyle_python_invocation_via_host_header() {
     runtime_handle.abort();
 }
 
-/// Invoke a Node.js function via AWS-style Host header.
+/// Invoke a Node.js function with both an AWS-style Host header and the
+/// standard Lambda API path. The middleware skips rewriting for Lambda API
+/// paths, routing directly to the standard invoke handler.
 #[tokio::test]
 #[ignore]
 async fn awsstyle_nodejs_invocation_via_host_header() {
@@ -325,9 +325,9 @@ async fn awsstyle_nodejs_invocation_via_host_header() {
     runtime_handle.abort();
 }
 
-/// Concurrent invocations of two functions via AWS-style Host headers.
-/// Validates that virtual host routing works correctly under concurrent load
-/// with different function names in the Host header.
+/// Concurrent invocations of two functions with AWS-style Host headers and
+/// standard Lambda API paths. Validates that the middleware correctly skips
+/// rewriting for both when under concurrent load.
 #[tokio::test]
 #[ignore]
 async fn awsstyle_concurrent_invocations_via_host_header() {
@@ -485,6 +485,109 @@ async fn awsstyle_different_region_routes_correctly() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["statusCode"], 200);
     assert_eq!(body["body"]["input"]["region"], "eu-west-1");
+
+    tokio::time::timeout(Duration::from_secs(5), runtime_task)
+        .await
+        .expect("runtime should complete")
+        .expect("runtime should not panic");
+
+    invoke_handle.abort();
+    runtime_handle.abort();
+}
+
+/// Invoke a Python function via AWS-style Host header with a simple root path.
+///
+/// This is the intended virtual host pattern: the Host header identifies the
+/// function and the path is just `/` — no function name in the URI. The
+/// middleware rewrites the path to `/{function_name}` so the Function URL
+/// catch-all route handles it.
+#[tokio::test]
+#[ignore]
+async fn awsstyle_host_only_root_path_python() {
+    let (state, _shutdown_tx) =
+        build_awsstyle_state(vec![("python-hello", "python3.12", "main.handler", 30)]).await;
+
+    let (invoke_addr, runtime_addr, invoke_handle, runtime_handle) =
+        start_servers(state).await;
+
+    let runtime_task = spawn_echo_runtime(
+        runtime_addr,
+        "python-hello",
+        "awsstyle-container-python-hello",
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/", invoke_addr))
+        .header(
+            "host",
+            "python-hello.lambda.us-east-1.amazonaws.com:9600",
+        )
+        .body(r#"{"key":"host-only"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("X-Amz-Function-Error").is_none(),
+        "should not have function error header"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["statusCode"], 200);
+    assert_eq!(body["body"]["input"]["key"], "host-only");
+
+    tokio::time::timeout(Duration::from_secs(5), runtime_task)
+        .await
+        .expect("runtime should complete")
+        .expect("runtime should not panic");
+
+    invoke_handle.abort();
+    runtime_handle.abort();
+}
+
+/// Invoke a Node.js function via AWS-style Host header with a sub-path.
+///
+/// Sends Host: nodejs-hello.lambda.us-east-1.amazonaws.com with path /event
+/// (no function name in the URI). The middleware rewrites to
+/// /nodejs-hello/event which matches the Function URL catch-all route.
+#[tokio::test]
+#[ignore]
+async fn awsstyle_host_only_subpath_nodejs() {
+    let (state, _shutdown_tx) =
+        build_awsstyle_state(vec![("nodejs-hello", "nodejs20.x", "index.handler", 30)]).await;
+
+    let (invoke_addr, runtime_addr, invoke_handle, runtime_handle) =
+        start_servers(state).await;
+
+    let runtime_task = spawn_echo_runtime(
+        runtime_addr,
+        "nodejs-hello",
+        "awsstyle-container-nodejs-hello",
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/event", invoke_addr))
+        .header(
+            "host",
+            "nodejs-hello.lambda.us-east-1.amazonaws.com:9600",
+        )
+        .body(r#"{"greeting":"host-only"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("X-Amz-Function-Error").is_none(),
+        "should not have function error header"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["statusCode"], 200);
+    assert_eq!(body["body"]["input"]["greeting"], "host-only");
 
     tokio::time::timeout(Duration::from_secs(5), runtime_task)
         .await

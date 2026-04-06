@@ -131,6 +131,7 @@ Defines the functions to serve and which runtime images to use.
 | `LOCAL_LAMBDA_MOUNT_AWS_CREDENTIALS` | `false` | Mount `~/.aws` directory into containers |
 | `LOCAL_LAMBDA_HOT_RELOAD` | `true` | Watch code paths and recycle containers on changes |
 | `LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS` | `500` | File change debounce interval |
+| `LOCAL_LAMBDA_DOMAIN` | - | Custom domain for virtual host routing (e.g. `lambda.local`). Enables `{function}.{domain}` addressing via `Host` header |
 
 Copy `.env.example` to `.env` to set these locally.
 

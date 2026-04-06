@@ -89,7 +89,16 @@ async fn virtual_host_rewrite(
     }) {
         let function_name = info.function_name;
         let original_path = req.uri().path();
-        let new_path = if original_path == "/" {
+
+        // Skip rewriting when the path already matches a known Lambda API pattern.
+        // These paths are fully qualified and should route directly to the standard
+        // invoke handler without prepending the function name.
+        let is_lambda_api_path = original_path.starts_with("/2015-03-31/")
+            || original_path.starts_with("/2021-11-15/");
+
+        let new_path = if is_lambda_api_path {
+            original_path.to_string()
+        } else if original_path == "/" {
             format!("/{}", function_name)
         } else {
             format!("/{}{}", function_name, original_path)
@@ -465,5 +474,27 @@ mod tests {
             .unwrap();
         // Should still reach the function URL handler.
         assert_ne!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn virtual_host_skips_rewrite_for_lambda_api_path() {
+        let app = invoke_router(test_state());
+        // When the path already matches a Lambda API pattern, the middleware
+        // should NOT prepend the function name — the path routes directly to
+        // the standard invoke handler.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/2015-03-31/functions/my-func/invocations")
+                    .header("host", "my-func.lambda.us-east-1.amazonaws.com:9600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should reach the standard invoke route and return 404 (function not
+        // in config), NOT 405 Method Not Allowed (route not matched).
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
     }
 }

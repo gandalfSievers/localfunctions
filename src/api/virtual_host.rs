@@ -41,13 +41,14 @@ pub fn extract_function_from_host<'a>(
     // Fall back to custom domain: <function>.<domain>
     if let Some(domain) = domain {
         if !domain.is_empty() {
-            let suffix = format!(".{}", domain);
-            if let Some(function_name) = host_without_port.strip_suffix(&suffix) {
-                if !function_name.is_empty() {
-                    return Some(VirtualHostInfo {
-                        function_name,
-                        region: None,
-                    });
+            if let Some(without_domain) = host_without_port.strip_suffix(domain) {
+                if let Some(function_name) = without_domain.strip_suffix('.') {
+                    if !function_name.is_empty() {
+                        return Some(VirtualHostInfo {
+                            function_name,
+                            region: None,
+                        });
+                    }
                 }
             }
         }
