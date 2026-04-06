@@ -1,6 +1,7 @@
 pub(crate) mod common;
 mod eventstream;
 pub(crate) mod function_url;
+pub(crate) mod functions;
 pub(crate) mod health;
 mod sample_events;
 
@@ -30,11 +31,7 @@ use crate::types::{ContainerState, ServiceError};
 pub fn invoke_routes() -> Router<AppState> {
     Router::new()
         .merge(health::health_routes())
-        .route("/2015-03-31/functions", get(list_functions))
-        .route(
-            "/2015-03-31/functions/:function_name",
-            get(get_function),
-        )
+        .merge(functions::functions_routes())
         .route(
             "/2015-03-31/functions/:function_name/invocations",
             post(invoke_function),
@@ -55,111 +52,6 @@ pub fn invoke_routes() -> Router<AppState> {
             "/:function_name/*path",
             axum::routing::any(function_url::function_url_handler),
         )
-}
-
-/// Health check endpoint — pings Docker daemon and reports connectivity.
-// ---------------------------------------------------------------------------
-// List / Get Function APIs
-// ---------------------------------------------------------------------------
-
-/// List all configured functions in AWS ListFunctions response format.
-///
-/// GET /2015-03-31/functions
-async fn list_functions(State(state): State<AppState>) -> impl IntoResponse {
-    let arn_prefix = format!(
-        "arn:aws:lambda:{}:{}:function:",
-        state.config.region, state.config.account_id
-    );
-
-    let mut functions: Vec<serde_json::Value> = state
-        .functions
-        .functions
-        .values()
-        .map(|f| function_configuration_json(f, &arn_prefix))
-        .collect();
-
-    // Sort by function name for deterministic output.
-    functions.sort_by(|a, b| {
-        a["FunctionName"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["FunctionName"].as_str().unwrap_or(""))
-    });
-
-    let body = serde_json::json!({
-        "Functions": functions,
-        "NextMarker": null,
-    });
-
-    (StatusCode::OK, Json(body))
-}
-
-/// Get a single function's configuration in AWS GetFunction response format.
-///
-/// GET /2015-03-31/functions/{name}
-async fn get_function(
-    State(state): State<AppState>,
-    Path(raw_function_name): Path<String>,
-    Query(params): Query<QualifierParams>,
-) -> (StatusCode, HeaderMap, Vec<u8>) {
-    // Parse qualifier from function name (colon-separated) or query parameter.
-    let (function_name, qualifier) =
-        parse_qualifier(&raw_function_name, params.qualifier.as_deref());
-
-    // Validate function name.
-    if let Err(e) = validate_function_name(&function_name) {
-        let err = ServiceError::InvalidRequestContent(e.to_string());
-        return (
-            err.status_code(),
-            HeaderMap::new(),
-            err.to_aws_response().to_json_bytes(),
-        );
-    }
-
-    // Validate qualifier — only $LATEST is supported.
-    if let Err(err) = validate_qualifier(&qualifier, &function_name) {
-        return (
-            err.status_code(),
-            HeaderMap::new(),
-            err.to_aws_response().to_json_bytes(),
-        );
-    }
-
-    // Look up the function.
-    let function_config = match state.functions.functions.get(&function_name) {
-        Some(config) => config,
-        None => {
-            let err = ServiceError::ResourceNotFound(function_name);
-            return (
-                err.status_code(),
-                HeaderMap::new(),
-                err.to_aws_response().to_json_bytes(),
-            );
-        }
-    };
-
-    let arn_prefix = format!(
-        "arn:aws:lambda:{}:{}:function:",
-        state.config.region, state.config.account_id
-    );
-
-    let body = serde_json::json!({
-        "Configuration": function_configuration_json(function_config, &arn_prefix),
-        "Code": {
-            "Location": "",
-            "RepositoryType": "S3",
-        },
-        "Tags": {},
-    });
-
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", "application/json".parse().unwrap());
-
-    (
-        StatusCode::OK,
-        headers,
-        serde_json::to_vec(&body).unwrap_or_default(),
-    )
 }
 
 /// Invoke a Lambda function by name.
@@ -2285,8 +2177,6 @@ mod tests {
         assert_eq!(json["Type"], "ResourceNotFoundException");
     }
 
-    // -- List Functions / Get Function ----------------------------------------
-
     fn test_state_with_functions() -> AppState {
         let config = Config {
             host: "127.0.0.1".parse().unwrap(),
@@ -2389,135 +2279,6 @@ mod tests {
                 tokio::sync::watch::channel(false).1,
             )),
         }
-    }
-
-    #[tokio::test]
-    async fn list_functions_returns_all_functions() {
-        let app = invoke_routes().with_state(test_state_with_functions());
-        let resp = app
-            .oneshot(Request::get("/2015-03-31/functions").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let functions = json["Functions"].as_array().unwrap();
-        assert_eq!(functions.len(), 2);
-
-        // Sorted alphabetically
-        assert_eq!(functions[0]["FunctionName"], "alpha-func");
-        assert_eq!(functions[1]["FunctionName"], "beta-func");
-
-        // Verify ARN format
-        assert_eq!(
-            functions[0]["FunctionArn"],
-            "arn:aws:lambda:us-east-1:123456789012:function:alpha-func"
-        );
-
-        // Verify fields present
-        assert_eq!(functions[0]["Runtime"], "python3.12");
-        assert_eq!(functions[0]["Handler"], "main.handler");
-        assert_eq!(functions[0]["Timeout"], 60);
-        assert_eq!(functions[0]["MemorySize"], 256);
-
-        // Environment included when non-empty
-        assert_eq!(functions[0]["Environment"]["Variables"]["ENV_KEY"], "env_val");
-
-        // Environment absent when empty
-        assert!(functions[1]["Environment"].is_null());
-
-        // PackageType for image-based
-        assert_eq!(functions[1]["PackageType"], "Image");
-        assert_eq!(functions[0]["PackageType"], "Zip");
-    }
-
-    #[tokio::test]
-    async fn list_functions_empty() {
-        let app = invoke_routes().with_state(test_state());
-        let resp = app
-            .oneshot(Request::get("/2015-03-31/functions").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let functions = json["Functions"].as_array().unwrap();
-        assert_eq!(functions.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn get_function_returns_configuration() {
-        let app = invoke_routes().with_state(test_state_with_functions());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/alpha-func")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let config = &json["Configuration"];
-        assert_eq!(config["FunctionName"], "alpha-func");
-        assert_eq!(
-            config["FunctionArn"],
-            "arn:aws:lambda:us-east-1:123456789012:function:alpha-func"
-        );
-        assert_eq!(config["Runtime"], "python3.12");
-        assert_eq!(config["Handler"], "main.handler");
-        assert_eq!(config["Timeout"], 60);
-        assert_eq!(config["MemorySize"], 256);
-        assert_eq!(config["Environment"]["Variables"]["ENV_KEY"], "env_val");
-        assert_eq!(config["EphemeralStorage"]["Size"], 1024);
-        assert_eq!(config["Version"], "$LATEST");
-        assert_eq!(config["PackageType"], "Zip");
-
-        // Code section present
-        assert!(json["Code"].is_object());
-    }
-
-    #[tokio::test]
-    async fn get_function_not_found_returns_404() {
-        let app = invoke_routes().with_state(test_state());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["Type"], "ResourceNotFoundException");
-    }
-
-    #[tokio::test]
-    async fn get_function_invalid_name_returns_400() {
-        let app = invoke_routes().with_state(test_state());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/inv@lid!")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["Type"], "InvalidRequestContentException");
     }
 
     #[tokio::test]
@@ -4223,76 +3984,6 @@ mod tests {
             .oneshot(
                 Request::post("/2015-03-31/functions/alpha-func/invocations?Qualifier=3")
                     .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["Type"], "ResourceNotFoundException");
-    }
-
-    // -- Qualifier integration tests (GetFunction API) ------------------------
-
-    #[tokio::test]
-    async fn get_function_with_latest_qualifier() {
-        let app = invoke_routes().with_state(test_state_with_functions());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/alpha-func?Qualifier=$LATEST")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["Configuration"]["FunctionName"], "alpha-func");
-    }
-
-    #[tokio::test]
-    async fn get_function_with_unknown_qualifier_returns_404() {
-        let app = invoke_routes().with_state(test_state_with_functions());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/alpha-func?Qualifier=PROD")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["Type"], "ResourceNotFoundException");
-    }
-
-    #[tokio::test]
-    async fn get_function_with_colon_qualifier_latest() {
-        let app = invoke_routes().with_state(test_state_with_functions());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/alpha-func:$LATEST")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["Configuration"]["FunctionName"], "alpha-func");
-    }
-
-    #[tokio::test]
-    async fn get_function_with_colon_qualifier_unknown() {
-        let app = invoke_routes().with_state(test_state_with_functions());
-        let resp = app
-            .oneshot(
-                Request::get("/2015-03-31/functions/alpha-func:STAGING")
-                    .body(Body::empty())
                     .unwrap(),
             )
             .await
