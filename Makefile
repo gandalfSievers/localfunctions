@@ -1,4 +1,4 @@
-.PHONY: help build test fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs
+.PHONY: help build build-debug test test-unit test-integration test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
 
 .DEFAULT_GOAL := help
 
@@ -9,11 +9,18 @@ help: ## Show this help message
 
 all: fmt clippy build test ## Run fmt, clippy, build, and test
 
-build: ## Build the project (debug)
+build: ## Build release binary
+	cargo build --release
+
+build-debug: ## Build debug binary
 	cargo build
 
-test: ## Run unit tests
+test: test-unit ## Run unit tests
+
+test-unit: ## Run unit tests (alias for cargo test)
 	cargo test
+
+test-all: test-unit test-integration ## Run all tests (unit + integration)
 
 fmt: ## Check code formatting
 	cargo fmt --check
@@ -34,6 +41,36 @@ run: ## Run server locally (debug)
 
 run-release: ## Run server locally (release)
 	cargo run --release
+
+INVOKE_PORT := 9600
+RUNTIME_PORT := 9601
+
+wait-ready: ## Wait for server to be ready on ports 9600 and 9601
+	@echo "Waiting for server to be ready on ports $(INVOKE_PORT) and $(RUNTIME_PORT)..."
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
+		if nc -z localhost $(INVOKE_PORT) 2>/dev/null && nc -z localhost $(RUNTIME_PORT) 2>/dev/null; then \
+			echo "Server is ready!"; \
+			break; \
+		fi; \
+		echo "Waiting... ($$i/30)"; \
+		sleep 1; \
+	done
+	@if ! nc -z localhost $(INVOKE_PORT) 2>/dev/null || ! nc -z localhost $(RUNTIME_PORT) 2>/dev/null; then \
+		echo "Error: Server did not become ready within 30 seconds"; \
+		docker compose logs || true; \
+		docker compose down; \
+		exit 1; \
+	fi
+
+test-integration: docker-build-debian docker-up wait-ready ## Build, run, and test against Docker container
+	@echo "Running integration tests..."
+	@cargo test --test integration -- --ignored; \
+	TEST_EXIT=$$?; \
+	echo "Stopping container..."; \
+	docker compose down; \
+	exit $$TEST_EXIT
+
+docker-test: test-integration ## Run integration tests (alias)
 
 VERSION := $(shell cat VERSION 2>/dev/null || echo "0.1.0")
 IMAGE_NAME := localfunctions
