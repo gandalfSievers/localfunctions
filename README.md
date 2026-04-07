@@ -96,7 +96,7 @@ Defines the functions to serve and which runtime images to use.
 | `environment` | No | `{}` | Environment variables passed to the function |
 | `image` | No | - | Custom Docker image (for `custom` runtime) |
 | `image_uri` | No | - | Complete OCI image URI (bypasses runtime images) |
-| `architecture` | No | `x86_64` | `x86_64` or `arm64` |
+| `architecture` | No | host arch | `x86_64` or `arm64` |
 | `layers` | No | `[]` | Local directory paths mounted as /opt layers |
 | `function_url_enabled` | No | `false` | Enable HTTP endpoint at `/{function_name}/` |
 | `reserved_concurrent_executions` | No | - | Per-function concurrency limit (1-1000) |
@@ -363,4 +363,4 @@ Idle containers are kept warm for 5 minutes (configurable) and reused across inv
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT
