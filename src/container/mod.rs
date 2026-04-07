@@ -757,7 +757,7 @@ impl ContainerManager {
             cpu_quota: Some(cpu_quota),
             cpu_shares: Some(cpu_shares),
             network_mode: Some(self.network_name.clone()),
-            extra_hosts: Some(container_extra_hosts()),
+            extra_hosts: Some(container_extra_hosts(&function.name)),
             tmpfs: Some(tmpfs),
             // Explicitly no privileged mode, no port bindings
             privileged: Some(false),
@@ -765,9 +765,20 @@ impl ContainerManager {
             ..Default::default()
         };
 
+        // Pass the handler as CMD so Lambda runtime images that require it as
+        // the first argument (e.g. public.ecr.aws/lambda/*) work correctly.
+        // For image_uri functions without a handler, leave CMD unset so the
+        // image's own CMD is respected.
+        let cmd = if function.handler.is_empty() {
+            None
+        } else {
+            Some(vec![function.handler.clone()])
+        };
+
         let container_config: ContainerConfig<String> = ContainerConfig {
             image: Some(image.clone()),
             env: Some(env),
+            cmd,
             labels: Some(labels),
             host_config: Some(host_config),
             ..Default::default()
@@ -1516,7 +1527,7 @@ pub fn lambda_env_vars(
     region: &str,
     credential_config: &CredentialForwardingConfig,
 ) -> Vec<String> {
-    let runtime_api = runtime_api_endpoint(runtime_port);
+    let runtime_api = runtime_api_endpoint(runtime_port, &function.name);
 
     // System variables required by the AWS Lambda execution environment
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -1605,35 +1616,33 @@ fn host_aws_config_dir() -> Option<String> {
 
 /// Build the `extra_hosts` entries for a Lambda container.
 ///
-/// Returns `["host.docker.internal:host-gateway"]` so that containers can
-/// resolve `host.docker.internal` to the host machine on all platforms.
-/// On macOS/Windows Docker Desktop this mapping is added automatically, but
-/// on Linux the explicit `host-gateway` directive is required.  Including it
-/// unconditionally is harmless and keeps the behaviour consistent.
+/// Includes:
+/// - `host.docker.internal:host-gateway` so containers can reach the host
+///   on all platforms.
+/// - `{function}.runtime.local:host-gateway` so the per-function Runtime API
+///   hostname resolves to the host (where the Runtime API port is mapped).
 ///
 /// This allows Lambda functions to reach other local* services (e.g.
 /// localObjectStorage, localSecrets) running on the host via
 /// `host.docker.internal:<port>`.  When other services run as Docker
 /// containers on the same user-defined bridge network, Docker's embedded DNS
 /// resolves their container names automatically — no extra config needed.
-pub fn container_extra_hosts() -> Vec<String> {
-    vec!["host.docker.internal:host-gateway".to_string()]
+pub fn container_extra_hosts(function_name: &str) -> Vec<String> {
+    vec![
+        "host.docker.internal:host-gateway".to_string(),
+        format!("{}.runtime.local:host-gateway", function_name),
+    ]
 }
 
 /// Build the `AWS_LAMBDA_RUNTIME_API` endpoint value that containers should
 /// use to reach the Runtime API.
 ///
-/// On macOS and Windows, containers reach the host via `host.docker.internal`.
-/// On Linux, the host IP on the Docker bridge network is used instead.
-pub fn runtime_api_endpoint(runtime_port: u16) -> String {
-    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-        format!("host.docker.internal:{}", runtime_port)
-    } else {
-        // On Linux the host gateway is typically 172.17.0.1, but Docker
-        // Desktop for Linux also supports host.docker.internal. We use the
-        // special hostname which Docker resolves automatically.
-        format!("host.docker.internal:{}", runtime_port)
-    }
+/// Uses a per-function hostname (`{function}.runtime.local`) so the Lambda
+/// RIC's HTTP `Host` header identifies the function. The runtime API
+/// middleware extracts the function name from this header, removing the need
+/// for the custom `Lambda-Runtime-Function-Name` header.
+pub fn runtime_api_endpoint(runtime_port: u16, function_name: &str) -> String {
+    format!("{}.runtime.local:{}", function_name, runtime_port)
 }
 
 /// Compute Docker CPU constraints proportional to the function's memory size.
@@ -1669,15 +1678,15 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn runtime_api_endpoint_contains_port() {
-        let endpoint = runtime_api_endpoint(9601);
-        assert_eq!(endpoint, "host.docker.internal:9601");
+    fn runtime_api_endpoint_contains_function_and_port() {
+        let endpoint = runtime_api_endpoint(9601, "my-func");
+        assert_eq!(endpoint, "my-func.runtime.local:9601");
     }
 
     #[test]
     fn runtime_api_endpoint_custom_port() {
-        let endpoint = runtime_api_endpoint(3000);
-        assert_eq!(endpoint, "host.docker.internal:3000");
+        let endpoint = runtime_api_endpoint(3000, "hello");
+        assert_eq!(endpoint, "hello.runtime.local:3000");
     }
 
     // -- lambda_env_vars ------------------------------------------------
@@ -1729,7 +1738,7 @@ mod tests {
     fn lambda_env_vars_contains_runtime_api() {
         let func = make_test_function();
         let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
-        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=host.docker.internal:9601".to_string()));
+        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=my-func.runtime.local:9601".to_string()));
     }
 
     #[test]
@@ -1785,7 +1794,7 @@ mod tests {
     fn lambda_env_vars_custom_port() {
         let func = make_test_function();
         let vars = lambda_env_vars(&func, 3000, "us-east-1", &CredentialForwardingConfig::default());
-        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=host.docker.internal:3000".to_string()));
+        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=my-func.runtime.local:3000".to_string()));
     }
 
     #[test]
@@ -2473,10 +2482,11 @@ mod tests {
     // -- container_extra_hosts -----------------------------------------------
 
     #[test]
-    fn container_extra_hosts_contains_host_gateway() {
-        let hosts = container_extra_hosts();
-        assert_eq!(hosts.len(), 1);
+    fn container_extra_hosts_contains_host_gateway_and_runtime_local() {
+        let hosts = container_extra_hosts("my-func");
+        assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0], "host.docker.internal:host-gateway");
+        assert_eq!(hosts[1], "my-func.runtime.local:host-gateway");
     }
 
     // -- mark_container_failed -------------------------------------------------

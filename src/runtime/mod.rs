@@ -119,16 +119,29 @@ impl RuntimeBridge {
     /// Returns an `Arc<Notify>` that will fire when the container calls `/next`
     /// for the first time (i.e. bootstrap is complete). If the container is
     /// already ready, the returned `Notify` is pre-fired.
-    pub async fn register_ready_signal(&self, container_id: &str) -> Arc<Notify> {
+    ///
+    /// When `alias` is provided, the signal is also registered under that key.
+    /// This allows standard Lambda RICs (which don't send the container ID
+    /// header) to trigger the signal using the function name instead.
+    pub async fn register_ready_signal(
+        &self,
+        container_id: &str,
+        alias: Option<&str>,
+    ) -> Arc<Notify> {
         let ready = self.ready_containers.lock().await;
         let mut signals = self.ready_signals.lock().await;
 
         let notify = Arc::new(Notify::new());
-        if ready.contains_key(container_id) {
+        if ready.contains_key(container_id)
+            || alias.map_or(false, |a| ready.contains_key(a))
+        {
             // Already ready (race: container called /next before we registered)
             notify.notify_one();
         } else {
             signals.insert(container_id.to_string(), notify.clone());
+            if let Some(alias) = alias {
+                signals.insert(alias.to_string(), notify.clone());
+            }
         }
         notify
     }
@@ -871,7 +884,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
 
-        let signal = bridge.register_ready_signal("ctr-1").await;
+        let signal = bridge.register_ready_signal("ctr-1", None).await;
 
         let bridge_clone = bridge.clone();
         tokio::spawn(async move {
@@ -893,7 +906,7 @@ mod tests {
         let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
         bridge.mark_ready("ctr-2").await;
-        let signal = bridge.register_ready_signal("ctr-2").await;
+        let signal = bridge.register_ready_signal("ctr-2", None).await;
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -908,7 +921,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let bridge = RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx);
 
-        let signal = bridge.register_ready_signal("ctr-3").await;
+        let signal = bridge.register_ready_signal("ctr-3", None).await;
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),

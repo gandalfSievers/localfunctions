@@ -296,7 +296,7 @@ async fn invoke_function_inner(
             // for the full function timeout.
             let ready_signal = state
                 .runtime_bridge
-                .register_ready_signal(&cold_id)
+                .register_ready_signal(&cold_id, Some(&function_name))
                 .await;
 
             let init_timeout = Duration::from_secs(state.config.init_timeout);
@@ -887,7 +887,7 @@ pub(crate) async fn acquire_container(
 
     let ready_signal = state
         .runtime_bridge
-        .register_ready_signal(&cold_id)
+        .register_ready_signal(&cold_id, Some(&function_config.name))
         .await;
 
     let init_timeout = Duration::from_secs(state.config.init_timeout);

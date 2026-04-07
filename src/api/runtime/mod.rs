@@ -49,6 +49,8 @@ pub fn runtime_routes() -> Router<AppState> {
 pub(crate) const HEADER_FUNCTION_NAME: &str = "Lambda-Runtime-Function-Name";
 /// Header sent by containers to identify themselves (optional).
 pub(crate) const HEADER_CONTAINER_ID: &str = "Lambda-Runtime-Container-Id";
+/// Suffix used in per-function Runtime API hostnames.
+const RUNTIME_HOST_SUFFIX: &str = ".runtime.local";
 
 /// GET /2018-06-01/runtime/invocation/next
 ///
@@ -64,17 +66,15 @@ async fn next_invocation(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Identify the function this container serves.
-    let function_name = match headers
-        .get(HEADER_FUNCTION_NAME)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(name) => name.to_string(),
+    // First try the explicit header, then fall back to extracting from the
+    // Host header (e.g. "python-hello.runtime.local:9601").
+    let function_name = match resolve_function_name(&headers) {
+        Some(name) => name,
         None => {
-            warn!("runtime /next called without {} header", HEADER_FUNCTION_NAME);
-            let err = ServiceError::InvalidRequestContent(format!(
-                "Missing required header: {}",
-                HEADER_FUNCTION_NAME
-            ));
+            warn!("runtime /next called without function identification");
+            let err = ServiceError::InvalidRequestContent(
+                "Cannot identify function: set Lambda-Runtime-Function-Name header or use per-function runtime hostname".into(),
+            );
             return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
         }
     };
@@ -154,6 +154,7 @@ async fn next_invocation(
             );
 
             let mut response_headers = HeaderMap::new();
+            response_headers.insert("content-type", "application/json".parse().unwrap());
             response_headers.insert(
                 "Lambda-Runtime-Aws-Request-Id",
                 request_id.to_string().parse().unwrap(),
@@ -226,6 +227,31 @@ struct RuntimeErrorRequest {
     errorType: String,
     #[serde(default)]
     stackTrace: Vec<String>,
+}
+
+/// Resolve the function name from request headers.
+///
+/// Tries the explicit `Lambda-Runtime-Function-Name` header first, then falls
+/// back to extracting the function name from the HTTP `Host` header. When
+/// `AWS_LAMBDA_RUNTIME_API` is set to `{function}.runtime.local:{port}`, the
+/// standard Lambda RIC sends this as the Host header automatically.
+fn resolve_function_name(headers: &HeaderMap) -> Option<String> {
+    // Explicit header (used by simulated runtimes and custom clients).
+    if let Some(name) = headers.get(HEADER_FUNCTION_NAME).and_then(|v| v.to_str().ok()) {
+        return Some(name.to_string());
+    }
+
+    // Fall back to Host header: "{function}.runtime.local:{port}"
+    if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
+        let host_no_port = host.split(':').next().unwrap_or(host);
+        if let Some(function_name) = host_no_port.strip_suffix(RUNTIME_HOST_SUFFIX) {
+            if !function_name.is_empty() {
+                return Some(function_name.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 /// Parse a runtime error from the request body and optional header.
@@ -470,17 +496,13 @@ async fn init_error(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let function_name = match headers
-        .get(HEADER_FUNCTION_NAME)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(name) => name.to_string(),
+    let function_name = match resolve_function_name(&headers) {
+        Some(name) => name,
         None => {
-            warn!("runtime /init/error called without {} header", HEADER_FUNCTION_NAME);
-            let err = ServiceError::InvalidRequestContent(format!(
-                "Missing required header: {}",
-                HEADER_FUNCTION_NAME
-            ));
+            warn!("runtime /init/error called without function identification");
+            let err = ServiceError::InvalidRequestContent(
+                "Cannot identify function: set Lambda-Runtime-Function-Name header or use per-function runtime hostname".into(),
+            );
             return (err.status_code(), Json(serde_json::to_value(err.to_aws_response()).unwrap()));
         }
     };

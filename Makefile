@@ -1,9 +1,20 @@
-.PHONY: help build build-debug test test-unit test-integration test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
+.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
 
 .DEFAULT_GOAL := help
 
+# Compose file variables
+COMPOSE_TEST := docker compose -f docker-compose.test.yml
+COMPOSE_AWSSTYLE := $(COMPOSE_TEST) -f docker-compose.test.awsstyle.yml
+
 help: ## Show this help message
 	@echo "Usage: make [target]"
+	@echo ""
+	@echo "  Testing:"
+	@echo "    make test                          - Run unit tests"
+	@echo "    make test-integration              - Run simulated integration tests"
+	@echo "    make test-integration-pathstyle    - Run path-style tests (real Lambda containers)"
+	@echo "    make test-integration-awsstyle     - Run AWS-style vhost tests (in Docker with dnsmasq)"
+	@echo "    make test-all                      - Run all tests"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
 
@@ -20,7 +31,15 @@ test: test-unit ## Run unit tests
 test-unit: ## Run unit tests (alias for cargo test)
 	cargo test
 
-test-all: test-unit test-integration ## Run all tests (unit + integration)
+# All tests (unit + simulated + path-style + AWS-style)
+# Docker image is built once; internal _targets skip the rebuild.
+test-all: docker-build-debian ## Run all tests
+	@exit_code=0; \
+	$(MAKE) test-unit || exit_code=$$?; \
+	$(MAKE) _test-integration || exit_code=$$?; \
+	$(MAKE) _test-integration-pathstyle || exit_code=$$?; \
+	$(MAKE) _test-integration-awsstyle || exit_code=$$?; \
+	exit $$exit_code
 
 fmt: ## Check code formatting
 	cargo fmt --check
@@ -62,13 +81,46 @@ wait-ready: ## Wait for server to be ready on ports 9600 and 9601
 		exit 1; \
 	fi
 
-test-integration: docker-build-debian docker-up wait-ready ## Build, run, and test against Docker container
-	@echo "Running integration tests..."
-	@cargo test --test '*_integration' -- --ignored; \
-	TEST_EXIT=$$?; \
-	echo "Stopping container..."; \
-	docker compose down; \
-	exit $$TEST_EXIT
+# Simulated integration tests (in-process servers with mock container runtimes)
+test-integration: docker-build-debian _test-integration ## Run simulated integration tests
+
+_test-integration: docker-up wait-ready
+	@echo "=========================================="
+	@echo "  SIMULATED integration tests"
+	@echo "=========================================="
+	@exit_code=0; \
+	cargo test --test e2e_integration --test integration_awsstyle \
+		--test bootstrap_failure_integration --test concurrent_invocation_integration \
+		--test timeout_integration -- --ignored --nocapture || exit_code=$$?; \
+	$(MAKE) docker-down; \
+	exit $$exit_code
+
+# Path-style integration tests (localfunctions in Docker, real Lambda containers)
+test-integration-pathstyle: docker-build-debian _test-integration-pathstyle ## Run path-style integration tests with real Lambda containers
+
+_test-integration-pathstyle:
+	@echo "=========================================="
+	@echo "  PATH-STYLE integration tests"
+	@echo "=========================================="
+	$(COMPOSE_TEST) up -d localfunctions
+	@$(MAKE) wait-ready
+	@exit_code=0; \
+	cargo test --test docker_pathstyle_integration -- --ignored --nocapture --test-threads=1 || exit_code=$$?; \
+	$(MAKE) docker-down; \
+	exit $$exit_code
+
+# AWS-style virtual host tests (localfunctions + dnsmasq in Docker, test-runner in Docker)
+test-integration-awsstyle: docker-build-debian _test-integration-awsstyle ## Run AWS-style vhost integration tests (in Docker with dnsmasq)
+
+_test-integration-awsstyle:
+	@echo "=========================================="
+	@echo "  AWS-STYLE VIRTUAL HOST integration tests"
+	@echo "=========================================="
+	@exit_code=0; \
+	$(COMPOSE_AWSSTYLE) up -d localfunctions dns-awsstyle; \
+	$(COMPOSE_AWSSTYLE) run --rm test-runner || exit_code=$$?; \
+	$(MAKE) docker-down; \
+	exit $$exit_code
 
 docker-test: test-integration ## Run integration tests (alias)
 
@@ -171,8 +223,10 @@ docker-push: docker-push-debian docker-push-alpine ## Push both images to regist
 docker-up: ## Start container via docker compose (detached, with build)
 	docker compose up -d --build
 
-docker-down: ## Stop and remove container via docker compose
-	docker compose down
+docker-down: ## Stop and remove all test containers
+	-$(COMPOSE_AWSSTYLE) down --remove-orphans 2>/dev/null
+	-$(COMPOSE_TEST) down --remove-orphans 2>/dev/null
+	-docker compose down --remove-orphans 2>/dev/null
 
 docker-restart: docker-down docker-up ## Restart container (stop then start)
 

@@ -145,7 +145,7 @@ async fn ready_signal_timeout() {
     // Register a ready signal for a container that will never become ready
     let signal = state
         .runtime_bridge
-        .register_ready_signal("never-ready-container")
+        .register_ready_signal("never-ready-container", None)
         .await;
 
     let result = tokio::time::timeout(Duration::from_secs(2), signal.notified()).await;
@@ -164,7 +164,7 @@ async fn ready_signal_fires_when_already_ready() {
     // Register signal after — should fire immediately
     let signal = state
         .runtime_bridge
-        .register_ready_signal("fast-container")
+        .register_ready_signal("fast-container", None)
         .await;
 
     let result = tokio::time::timeout(Duration::from_millis(100), signal.notified()).await;
@@ -179,7 +179,7 @@ async fn ready_signal_fires_on_mark_ready() {
 
     let signal = state
         .runtime_bridge
-        .register_ready_signal("delayed-container")
+        .register_ready_signal("delayed-container", None)
         .await;
 
     let bridge = state.runtime_bridge.clone();

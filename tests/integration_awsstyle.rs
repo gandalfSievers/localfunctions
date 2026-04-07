@@ -77,7 +77,7 @@ async fn build_awsstyle_state(
                 reserved_concurrent_executions: None,
                 architecture: "x86_64".into(),
                 layers: vec![],
-                function_url_enabled: false,
+                function_url_enabled: true,
                 max_retry_attempts: 2,
                 on_success: None,
                 on_failure: None,
@@ -534,9 +534,16 @@ async fn awsstyle_host_only_root_path_python() {
         "should not have function error header"
     );
 
+    // The Function URL handler wraps the request body in a v2.0 event, which
+    // the echo runtime returns as its "input". Verify the original body is
+    // present inside the Function URL event's `body` field.
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["statusCode"], 200);
-    assert_eq!(body["body"]["input"]["key"], "host-only");
+    let event_body = body["body"]["input"]["body"]
+        .as_str()
+        .expect("Function URL event should contain original body as string");
+    let parsed: serde_json::Value = serde_json::from_str(event_body).unwrap();
+    assert_eq!(parsed["key"], "host-only");
 
     tokio::time::timeout(Duration::from_secs(5), runtime_task)
         .await
@@ -585,9 +592,16 @@ async fn awsstyle_host_only_subpath_nodejs() {
         "should not have function error header"
     );
 
+    // The Function URL handler wraps the request body in a v2.0 event, which
+    // the echo runtime returns as its "input". Verify the original body is
+    // present inside the Function URL event's `body` field.
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["statusCode"], 200);
-    assert_eq!(body["body"]["input"]["greeting"], "host-only");
+    let event_body = body["body"]["input"]["body"]
+        .as_str()
+        .expect("Function URL event should contain original body as string");
+    let parsed: serde_json::Value = serde_json::from_str(event_body).unwrap();
+    assert_eq!(parsed["greeting"], "host-only");
 
     tokio::time::timeout(Duration::from_secs(5), runtime_task)
         .await

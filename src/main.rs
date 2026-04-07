@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
 
     info!(
         network = %config.docker_network,
-        runtime_api = %container::runtime_api_endpoint(config.runtime_port),
+        runtime_api = %format!("{{function}}.runtime.local:{}", config.runtime_port),
         "Docker network ready"
     );
 

@@ -309,8 +309,11 @@ pub fn parse_functions_config(
             }
         }
 
-        // Validate architecture
-        let architecture = entry.architecture.clone().unwrap_or_else(|| "x86_64".to_string());
+        // Validate architecture (default to host architecture)
+        let architecture = entry
+            .architecture
+            .clone()
+            .unwrap_or_else(|| default_architecture().to_string());
         if let Err(e) = validate_architecture(name, &architecture) {
             errors.push(e);
         }
@@ -722,6 +725,15 @@ fn validate_ephemeral_storage(name: &str, ephemeral_storage_mb: u64) -> Result<(
         });
     }
     Ok(())
+}
+
+/// Return the default architecture based on the host platform.
+fn default_architecture() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    }
 }
 
 /// Resolve and validate a code_path, preventing directory traversal.
@@ -1997,7 +2009,7 @@ mod tests {
     // -- architecture --------------------------------------------------------
 
     #[test]
-    fn architecture_defaults_to_x86_64() {
+    fn architecture_defaults_to_host() {
         let dir = setup_dirs(&["code"]);
         let json = r#"{
             "functions": {
@@ -2009,7 +2021,7 @@ mod tests {
             }
         }"#;
         let config = parse_functions_config(json, dir.path()).unwrap();
-        assert_eq!(config.functions["f1"].architecture, "x86_64");
+        assert_eq!(config.functions["f1"].architecture, default_architecture());
     }
 
     #[test]

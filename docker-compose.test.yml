@@ -1,29 +1,65 @@
-# Test infrastructure for localfunctions integration tests.
+# Base test infrastructure for localfunctions integration tests.
 #
-# Usage:
-#   docker compose -f docker-compose.test.yml up -d   # start test infra
-#   cargo test -- --ignored                            # run integration tests
-#   docker compose -f docker-compose.test.yml down     # tear down
-#
-# The integration tests expect:
-#   - Docker daemon running and accessible
-#   - The "localfunctions-test" network available
-#   - Lambda runtime images pre-pulled (see below)
+# Provides the localfunctions service and test network. Used directly for
+# path-style tests and extended by overlay files for AWS-style DNS tests.
 #
 # Pre-pull required images:
 #   docker pull public.ecr.aws/lambda/python:3.12
 #   docker pull public.ecr.aws/lambda/nodejs:20
 
 services:
-  # Create the test network and exit. Integration tests attach containers
-  # to this network dynamically.
+  localfunctions:
+    image: localfunctions:debian
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.debian
+    container_name: localfunctions-test
+    ports:
+      - "9600:9600"
+      - "9601:9601"
+    networks:
+      testnet:
+        ipv4_address: 172.31.0.10
+    # Working directory must match the fixtures mount so that relative
+    # code_path values in functions.json resolve inside the container AND
+    # produce host-absolute paths for Lambda container bind-mounts.
+    working_dir: ${PWD}/tests/fixtures
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount fixtures at the same absolute path as the host so that
+      # code_path bind-mounts resolve correctly on the Docker daemon.
+      - ${PWD}/tests/fixtures:${PWD}/tests/fixtures:ro
+    group_add:
+      - "${DOCKER_GID:-0}"
+    environment:
+      - LOCAL_LAMBDA_HOST=0.0.0.0
+      - LOCAL_LAMBDA_PORT=9600
+      - LOCAL_LAMBDA_RUNTIME_PORT=9601
+      - LOCAL_LAMBDA_FUNCTIONS_FILE=${PWD}/tests/fixtures/functions.json
+      - LOCAL_LAMBDA_DOCKER_NETWORK=localfunctions-test
+      - LOCAL_LAMBDA_PULL_IMAGES=false
+      - LOCAL_LAMBDA_HOT_RELOAD=false
+      - LOCAL_LAMBDA_INIT_TIMEOUT=60
+      - RUST_LOG=localfunctions=debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9600/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Lightweight entry so `docker compose -f docker-compose.test.yml up -d`
+  # always creates the network, even when the localfunctions service is not
+  # started (used by the simulated integration tests).
   network-setup:
     image: busybox:latest
     command: ["true"]
     networks:
-      - localfunctions-test
+      - testnet
 
 networks:
-  localfunctions-test:
+  testnet:
     name: localfunctions-test
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

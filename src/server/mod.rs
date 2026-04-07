@@ -7,6 +7,7 @@ use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::Router;
+use tower::Layer;
 use bollard::Docker;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
@@ -52,15 +53,23 @@ impl AppState {
 /// (`{function}.lambda.{region}.amazonaws.com`) or custom domain
 /// (`{function}.{domain}`) pattern, enabling Function URL–style routing via
 /// the hostname.
+///
+/// The virtual-host middleware is applied as an outer service wrapping the
+/// inner Router so that URI rewriting happens **before** axum's route matching.
+/// (`Router::layer()` only wraps matched route handlers, which is too late for
+/// URI rewrites that affect which route is matched.)
 pub fn invoke_router(state: AppState) -> Router {
     let max_body_size = state.config.max_body_size;
-    api::invoke_routes()
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            virtual_host_rewrite,
-        ))
+
+    // Build the inner router with all routes and body limit.
+    let inner = api::invoke_routes()
         .layer(axum::extract::DefaultBodyLimit::max(max_body_size))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Wrap with virtual-host middleware via fallback_service so the URI
+    // rewrite runs before the inner router's route matching.
+    let vhost_layer = middleware::from_fn_with_state(state, virtual_host_rewrite);
+    Router::new().fallback_service(vhost_layer.layer(inner))
 }
 
 /// Middleware that rewrites the URI path when a virtual hosted-style Host

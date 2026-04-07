@@ -1,14 +1,13 @@
-# Test infrastructure for AWS-style virtual hosted Lambda routing.
+# AWS-style virtual host routing test infrastructure.
 #
-# This extends the base docker-compose.test.yml with a dnsmasq container that
-# resolves *.amazonaws.com to the localfunctions container. This allows
-# integration tests to call functions via:
-#
-#   http://<function>.lambda.us-east-1.amazonaws.com:9600/2015-03-31/functions/<function>/invocations
+# Extends docker-compose.test.yml with a dnsmasq container that resolves
+# *.amazonaws.com to the localfunctions container. The test-runner executes
+# inside the Docker network so DNS resolution works transparently.
 #
 # Usage:
 #   docker compose -f docker-compose.test.yml -f docker-compose.test.awsstyle.yml up -d
-#   cargo test --test integration_awsstyle -- --ignored
+#   docker compose -f docker-compose.test.yml -f docker-compose.test.awsstyle.yml \
+#     run --rm test-runner
 #   docker compose -f docker-compose.test.yml -f docker-compose.test.awsstyle.yml down
 #
 # Pre-pull required images:
@@ -16,34 +15,6 @@
 #   docker pull public.ecr.aws/lambda/nodejs:20
 
 services:
-  localfunctions:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.debian
-    container_name: localfunctions-test
-    networks:
-      testnet:
-        ipv4_address: 172.31.0.10
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./functions.json:/app/functions.json:ro
-      - ./functions:/app/functions:ro
-    group_add:
-      - "${DOCKER_GID:-0}"
-    environment:
-      - LOCAL_LAMBDA_HOST=0.0.0.0
-      - LOCAL_LAMBDA_PORT=9600
-      - LOCAL_LAMBDA_RUNTIME_PORT=9601
-      - LOCAL_LAMBDA_FUNCTIONS_FILE=/app/functions.json
-      - LOCAL_LAMBDA_DOCKER_NETWORK=localfunctions-awstest
-      - LOCAL_LAMBDA_PULL_IMAGES=false
-      - RUST_LOG=localfunctions=debug
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9600/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   dns-awsstyle:
     image: alpine
     container_name: localfunctions-dns-awsstyle
@@ -76,15 +47,7 @@ services:
         condition: service_healthy
       dns-awsstyle:
         condition: service_started
-    command: cargo test --test integration_awsstyle -- --ignored
-
-networks:
-  testnet:
-    name: localfunctions-awstest
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.31.0.0/24
+    command: cargo test --test docker_awsstyle_integration -- --ignored --test-threads=1
 
 volumes:
   lf-cargo-registry:

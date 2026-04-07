@@ -196,7 +196,7 @@ async fn invoke_function_streaming_inner(
 
             let ready_signal = state
                 .runtime_bridge
-                .register_ready_signal(&cold_id)
+                .register_ready_signal(&cold_id, Some(&function_name))
                 .await;
 
             let init_timeout = Duration::from_secs(state.config.init_timeout);
