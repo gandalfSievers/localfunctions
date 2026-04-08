@@ -200,7 +200,39 @@ async fn main() -> Result<()> {
         event_source_manager.add_poller(Box::new(poller));
     }
 
-    // Future: register SNS subscription handles from functions_config.sns_subscriptions here.
+    // Register SNS subscriptions from sns_subscriptions config.
+    let sns_configs =
+        eventsource::sns::parse_sns_subscriptions(&state.functions.sns_subscriptions);
+    for sns_config in sns_configs {
+        if !sns_config.enabled {
+            info!(
+                topic_arn = %sns_config.topic_arn,
+                function = %sns_config.function_name,
+                "SNS subscription disabled, skipping"
+            );
+            continue;
+        }
+        // Verify target function exists.
+        if !state.functions.functions.contains_key(&sns_config.function_name) {
+            warn!(
+                topic_arn = %sns_config.topic_arn,
+                function = %sns_config.function_name,
+                "SNS subscription skipped: target function does not exist in config"
+            );
+            continue;
+        }
+        // Subscribe (non-blocking: logs error and skips if SNS unreachable).
+        if let Some(handle) = eventsource::sns::subscribe(
+            &sns_config,
+            &state.config.callback_url,
+            &state.config.region,
+        )
+        .await
+        {
+            event_source_manager.add_sns_handle(handle);
+        }
+    }
+
     event_source_manager.start(state.clone());
 
     // Spawn file watcher for hot reload (if enabled).

@@ -5,6 +5,7 @@
 //! that manages poller tasks and SNS subscription handles with consistent
 //! startup and graceful shutdown.
 
+pub mod sns;
 pub mod sqs;
 
 #[cfg(test)]
@@ -56,7 +57,15 @@ pub trait EventSourcePoller: Send + Sync {
 pub struct SnsSubscriptionHandle {
     pub function_name: String,
     pub topic_arn: String,
+    /// The subscription ARN returned by the Subscribe call. `None` if the
+    /// subscribe call failed; "pending confirmation" if not yet confirmed.
+    pub subscription_arn: Option<String>,
     pub endpoint_url: String,
+    /// SNS endpoint URL override (e.g. LocalStack) needed to build the client
+    /// for unsubscribe.
+    pub sns_endpoint_override: Option<String>,
+    /// AWS region used for the SNS client.
+    pub region: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,15 +262,11 @@ impl EventSourceManager {
             }
         }
 
-        // Log SNS handle cleanup (actual unsubscribe would require SNS API)
-        for handle in &self.sns_handles {
-            info!(
-                function = %handle.function_name,
-                topic = %handle.topic_arn,
-                "releasing SNS subscription handle"
-            );
+        // Unsubscribe from SNS topics (best-effort)
+        let handles = std::mem::take(&mut self.sns_handles);
+        for handle in &handles {
+            sns::unsubscribe(handle).await;
         }
-        self.sns_handles.clear();
 
         info!("event source manager shutdown complete");
     }

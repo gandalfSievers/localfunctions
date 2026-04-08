@@ -61,8 +61,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Async trait support
 async-trait = "0.1"
 
-# AWS SDK (SQS event source polling)
+# AWS SDK (SQS event source polling, SNS subscription lifecycle)
 aws-sdk-sqs = "1"
+aws-sdk-sns = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # Utilities
