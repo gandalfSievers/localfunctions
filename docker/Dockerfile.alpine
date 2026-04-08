@@ -2,7 +2,7 @@
 
 # ---------- builder ----------
 # Cross-compile via musl target triples for multi-arch builds
-FROM rust:1.83-alpine AS builder
+FROM rust:1.94-alpine AS builder
 
 # Install build dependencies
 ARG TARGETARCH

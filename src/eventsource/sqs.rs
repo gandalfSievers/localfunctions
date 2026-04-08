@@ -403,7 +403,6 @@ impl SqsPoller {
                             .queue_url(&self.config.queue_url)
                             .max_number_of_messages(remaining)
                             .wait_time_seconds(wait_secs)
-                            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::All)
                             .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::All)
                             .message_attribute_names("All")
                             .send() => res,
@@ -438,7 +437,6 @@ impl SqsPoller {
                     .queue_url(&self.config.queue_url)
                     .max_number_of_messages(batch_size)
                     .wait_time_seconds(20)
-                    .attribute_names(aws_sdk_sqs::types::QueueAttributeName::All)
                     .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::All)
                     .message_attribute_names("All")
                     .send();

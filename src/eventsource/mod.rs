@@ -60,7 +60,6 @@ pub struct SnsSubscriptionHandle {
     /// The subscription ARN returned by the Subscribe call. `None` if the
     /// subscribe call failed; "pending confirmation" if not yet confirmed.
     pub subscription_arn: Option<String>,
-    pub endpoint_url: String,
     /// SNS endpoint URL override (e.g. LocalStack) needed to build the client
     /// for unsubscribe.
     pub sns_endpoint_override: Option<String>,
@@ -271,12 +270,12 @@ impl EventSourceManager {
         info!("event source manager shutdown complete");
     }
 
-    /// Returns the number of active poller handles.
+    #[cfg(test)]
     pub fn poller_count(&self) -> usize {
         self.poller_handles.len()
     }
 
-    /// Returns the number of tracked SNS subscription handles.
+    #[cfg(test)]
     pub fn sns_handle_count(&self) -> usize {
         self.sns_handles.len()
     }

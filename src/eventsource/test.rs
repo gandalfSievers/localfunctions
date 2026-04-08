@@ -56,7 +56,6 @@ fn manager_add_sns_handle() {
         function_name: "my-func".into(),
         topic_arn: "arn:aws:sns:us-east-1:000000000000:my-topic".into(),
         subscription_arn: None,
-        endpoint_url: "http://localhost:9600/sns/my-func".into(),
         sns_endpoint_override: None,
         region: "us-east-1".into(),
     });
@@ -129,7 +128,6 @@ async fn manager_shutdown_clears_sns_handles() {
         function_name: "func-a".into(),
         topic_arn: "arn:aws:sns:us-east-1:000000000000:topic-a".into(),
         subscription_arn: None,
-        endpoint_url: "http://localhost/sns/func-a".into(),
         sns_endpoint_override: None,
         region: "us-east-1".into(),
     });
@@ -137,7 +135,6 @@ async fn manager_shutdown_clears_sns_handles() {
         function_name: "func-b".into(),
         topic_arn: "arn:aws:sns:us-east-1:000000000000:topic-b".into(),
         subscription_arn: None,
-        endpoint_url: "http://localhost/sns/func-b".into(),
         sns_endpoint_override: None,
         region: "us-east-1".into(),
     });

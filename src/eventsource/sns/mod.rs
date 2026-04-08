@@ -173,7 +173,6 @@ pub async fn subscribe(
                 function_name: config.function_name.clone(),
                 topic_arn: config.topic_arn.clone(),
                 subscription_arn: Some(subscription_arn),
-                endpoint_url: endpoint,
                 sns_endpoint_override: config.endpoint_url.clone(),
                 region: region.to_string(),
             })
