@@ -150,7 +150,7 @@ _test-integration-eventsource:
 
 docker-test: test-integration ## Run integration tests (alias)
 
-VERSION := $(shell cat VERSION 2>/dev/null || echo "0.1.0")
+VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 IMAGE_NAME := localfunctions
 REGISTRY_IMAGE := gandalfsievers/localfunctions
 BUILDER_NAME := localfunctions-builder
