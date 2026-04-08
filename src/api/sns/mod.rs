@@ -157,10 +157,45 @@ async fn handle_subscription_confirmation(
     }
 }
 
+/// Build an SNS Lambda event payload from a raw SNS notification message.
+///
+/// Returns a JSON value matching the AWS Lambda SNS event format:
+/// ```json
+/// {
+///   "Records": [{
+///     "EventVersion": "1.0",
+///     "EventSubscriptionArn": "arn:aws:sns:...",
+///     "EventSource": "aws:sns",
+///     "Sns": { /* raw SNS message */ }
+///   }]
+/// }
+/// ```
+pub fn build_sns_event(
+    sns_message: &serde_json::Value,
+    region: &str,
+    account_id: &str,
+    function_name: &str,
+) -> serde_json::Value {
+    let subscription_arn = format!(
+        "arn:aws:sns:{}:{}:{}",
+        region, account_id, function_name
+    );
+
+    serde_json::json!({
+        "Records": [{
+            "EventVersion": "1.0",
+            "EventSubscriptionArn": subscription_arn,
+            "EventSource": "aws:sns",
+            "Sns": sns_message
+        }]
+    })
+}
+
 /// Forward an SNS notification to the named function as a Lambda invocation.
 ///
 /// Wraps the raw SNS message in the standard Lambda SNS event format
-/// (`{"Records": [{"EventSource": "aws:sns", "Sns": {...}}]}`).
+/// (`{"Records": [{"EventSource": "aws:sns", "Sns": {...}}]}`) and invokes
+/// the function synchronously (matching real AWS SNS→Lambda behavior).
 async fn handle_notification(
     state: &AppState,
     function_name: &str,
@@ -174,24 +209,17 @@ async fn handle_notification(
         }
     };
 
-    // Build the SNS event record matching the Lambda event format.
     let topic_arn = parsed
         .get("TopicArn")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let subscription_arn = format!(
-        "arn:aws:sns:{}:{}:{}",
-        state.config.region, state.config.account_id, function_name
-    );
 
-    let sns_event = serde_json::json!({
-        "Records": [{
-            "EventVersion": "1.0",
-            "EventSubscriptionArn": subscription_arn,
-            "EventSource": "aws:sns",
-            "Sns": parsed
-        }]
-    });
+    let sns_event = build_sns_event(
+        &parsed,
+        &state.config.region,
+        &state.config.account_id,
+        function_name,
+    );
 
     let event_bytes = match serde_json::to_vec(&sns_event) {
         Ok(b) => b,
@@ -208,10 +236,9 @@ async fn handle_notification(
         "SNS: forwarding notification to function"
     );
 
-    // Use the standard invoke path via Event invocation type (async, fire-and-forget).
+    // Invoke synchronously (RequestResponse) — matches real AWS SNS→Lambda behavior.
     let request_id = uuid::Uuid::new_v4();
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert("X-Amz-Invocation-Type", "Event".parse().unwrap());
+    let headers = axum::http::HeaderMap::new();
 
     let (status, _resp_headers, _resp_body) = super::invoke::invoke_function_inner(
         state.clone(),
@@ -222,7 +249,7 @@ async fn handle_notification(
     )
     .await;
 
-    if status == StatusCode::ACCEPTED {
+    if status.is_success() {
         info!(
             function = %function_name,
             topic_arn = %topic_arn,

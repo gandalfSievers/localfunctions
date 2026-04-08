@@ -268,3 +268,101 @@ fn callback_url_used_in_endpoint_construction() {
     let url = sns_endpoint_url(&state.config.callback_url, "my-function");
     assert_eq!(url, "http://my-host:8080/sns/my-function");
 }
+
+#[test]
+fn build_sns_event_matches_reference_payload_structure() {
+    let sns_message = serde_json::json!({
+        "Type": "Notification",
+        "MessageId": "95df01b4-ee98-5cb9-9903-4c221d41eb5e",
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:my-topic",
+        "Subject": "Test Subject",
+        "Message": "Hello from SNS!",
+        "Timestamp": "2024-01-15T12:45:07.000Z",
+        "SignatureVersion": "1",
+        "Signature": "EXAMPLEpH+...",
+        "SigningCertUrl": "https://sns.us-east-1.amazonaws.com/cert.pem",
+        "UnsubscribeUrl": "https://sns.us-east-1.amazonaws.com/?Action=Unsubscribe",
+        "MessageAttributes": {
+            "TestKey": {
+                "Type": "String",
+                "Value": "TestValue"
+            }
+        }
+    });
+
+    let event = build_sns_event(&sns_message, "us-east-1", "123456789012", "my-function");
+
+    // Verify top-level Records array exists
+    let records = event.get("Records").expect("missing Records");
+    let records_arr = records.as_array().expect("Records should be array");
+    assert_eq!(records_arr.len(), 1);
+
+    let record = &records_arr[0];
+
+    // Verify required record fields
+    assert_eq!(record["EventVersion"], "1.0");
+    assert_eq!(record["EventSource"], "aws:sns");
+    assert_eq!(
+        record["EventSubscriptionArn"],
+        "arn:aws:sns:us-east-1:123456789012:my-function"
+    );
+
+    // Verify Sns object contains all original fields
+    let sns = record.get("Sns").expect("missing Sns object");
+    assert_eq!(sns["MessageId"], "95df01b4-ee98-5cb9-9903-4c221d41eb5e");
+    assert_eq!(sns["Message"], "Hello from SNS!");
+    assert_eq!(sns["TopicArn"], "arn:aws:sns:us-east-1:123456789012:my-topic");
+    assert_eq!(sns["Subject"], "Test Subject");
+    assert_eq!(sns["Timestamp"], "2024-01-15T12:45:07.000Z");
+    assert_eq!(sns["Type"], "Notification");
+
+    // Verify MessageAttributes are preserved
+    let attrs = sns.get("MessageAttributes").expect("missing MessageAttributes");
+    assert_eq!(attrs["TestKey"]["Type"], "String");
+    assert_eq!(attrs["TestKey"]["Value"], "TestValue");
+}
+
+#[test]
+fn build_sns_event_constructs_correct_subscription_arn() {
+    let sns_message = serde_json::json!({"Type": "Notification", "Message": "test"});
+    let event = build_sns_event(&sns_message, "eu-west-1", "999888777666", "handler-fn");
+
+    let arn = event["Records"][0]["EventSubscriptionArn"].as_str().unwrap();
+    assert_eq!(arn, "arn:aws:sns:eu-west-1:999888777666:handler-fn");
+}
+
+#[tokio::test]
+async fn sns_subscription_confirmation_auto_confirms() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/confirm"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let subscribe_url = format!("{}/confirm", mock_server.uri());
+
+    let app = sns_routes().with_state(test_state());
+    let body = serde_json::json!({
+        "Type": "SubscriptionConfirmation",
+        "Token": "abc123",
+        "TopicArn": "arn:aws:sns:us-east-1:000000000000:test-topic",
+        "SubscribeURL": subscribe_url
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/sns/my-function")
+                .header("x-amz-sns-message-type", "SubscriptionConfirmation")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
