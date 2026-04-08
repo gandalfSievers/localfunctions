@@ -50,6 +50,10 @@ pub struct Config {
     /// (`<function>.lambda.<region>.amazonaws.com`) is always enabled
     /// regardless of this setting.
     pub domain: Option<String>,
+    /// Base URL that external services (e.g. SNS) use to reach this
+    /// localfunctions instance. Defaults to `http://<host>:<port>`.
+    /// Must be a valid HTTP or HTTPS URL when set explicitly.
+    pub callback_url: String,
 }
 
 /// Controls the format of log output.
@@ -110,6 +114,14 @@ impl Config {
         let hot_reload_debounce_ms = parse_env("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS", "500")?;
         let domain = std::env::var("LOCAL_LAMBDA_DOMAIN").ok().filter(|s| !s.is_empty());
 
+        let callback_url = match std::env::var("LOCAL_LAMBDA_CALLBACK_URL").ok().filter(|s| !s.is_empty()) {
+            Some(url) => {
+                validate_callback_url(&url)?;
+                url
+            }
+            None => format!("http://{}:{}", host, port),
+        };
+
         Ok(Config {
             host,
             port,
@@ -133,6 +145,7 @@ impl Config {
             hot_reload,
             hot_reload_debounce_ms,
             domain,
+            callback_url,
         })
     }
 }
@@ -159,6 +172,19 @@ where
     let raw = std::env::var(key).unwrap_or_else(|_| default.to_string());
     raw.parse::<T>()
         .map_err(|e| ConfigError::InvalidValue(key.to_string(), e.to_string()))
+}
+
+fn validate_callback_url(raw: &str) -> Result<(), ConfigError> {
+    let parsed = url::Url::parse(raw).map_err(|e| {
+        ConfigError::InvalidValue("LOCAL_LAMBDA_CALLBACK_URL".to_string(), e.to_string())
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        other => Err(ConfigError::InvalidValue(
+            "LOCAL_LAMBDA_CALLBACK_URL".to_string(),
+            format!("scheme must be http or https, got '{}'", other),
+        )),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +228,7 @@ mod tests {
             "LOCAL_LAMBDA_HOT_RELOAD",
             "LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS",
             "LOCAL_LAMBDA_DOMAIN",
+            "LOCAL_LAMBDA_CALLBACK_URL",
         ] {
             std::env::remove_var(key);
         }
@@ -229,6 +256,7 @@ mod tests {
         assert!(config.hot_reload);
         assert_eq!(config.hot_reload_debounce_ms, 500);
         assert!(config.domain.is_none());
+        assert_eq!(config.callback_url, "http://0.0.0.0:9600");
     }
 
     #[test]
@@ -608,5 +636,69 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert!(config.domain.is_none());
         std::env::remove_var("LOCAL_LAMBDA_DOMAIN");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_default_from_host_port() {
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+        std::env::set_var("LOCAL_LAMBDA_HOST", "127.0.0.1");
+        std::env::set_var("LOCAL_LAMBDA_PORT", "3000");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.callback_url, "http://127.0.0.1:3000");
+        std::env::remove_var("LOCAL_LAMBDA_HOST");
+        std::env::remove_var("LOCAL_LAMBDA_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_explicit_override() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "http://localfunctions:9600");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.callback_url, "http://localfunctions:9600");
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_https() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "https://my-proxy.local:8443");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.callback_url, "https://my-proxy.local:8443");
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_invalid_scheme() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "ftp://example.com");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("LOCAL_LAMBDA_CALLBACK_URL"));
+        assert!(msg.contains("scheme"));
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_invalid_url() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "not a url at all");
+        let result = Config::from_env();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("LOCAL_LAMBDA_CALLBACK_URL"));
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_empty_uses_default() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "");
+        std::env::remove_var("LOCAL_LAMBDA_HOST");
+        std::env::remove_var("LOCAL_LAMBDA_PORT");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.callback_url, "http://0.0.0.0:9600");
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
     }
 }
