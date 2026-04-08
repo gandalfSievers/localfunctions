@@ -1,4 +1,4 @@
-.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
+.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-integration-eventsource _test-integration-eventsource test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
 
 .DEFAULT_GOAL := help
 
@@ -14,6 +14,7 @@ help: ## Show this help message
 	@echo "    make test-integration              - Run simulated integration tests"
 	@echo "    make test-integration-pathstyle    - Run path-style tests (real Lambda containers)"
 	@echo "    make test-integration-awsstyle     - Run AWS-style vhost tests (in Docker with dnsmasq)"
+	@echo "    make test-integration-eventsource  - Run SQS/SNS event source tests (local-sns + ElasticMQ)"
 	@echo "    make test-all                      - Run all tests"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -37,6 +38,7 @@ test-all: docker-build-debian ## Run all tests
 	@exit_code=0; \
 	$(MAKE) test-unit || exit_code=$$?; \
 	$(MAKE) _test-integration || exit_code=$$?; \
+	$(MAKE) _test-integration-eventsource || exit_code=$$?; \
 	$(MAKE) _test-integration-pathstyle || exit_code=$$?; \
 	$(MAKE) _test-integration-awsstyle || exit_code=$$?; \
 	exit $$exit_code
@@ -120,6 +122,30 @@ _test-integration-awsstyle:
 	$(COMPOSE_AWSSTYLE) up -d localfunctions dns-awsstyle; \
 	$(COMPOSE_AWSSTYLE) run --rm test-runner || exit_code=$$?; \
 	$(MAKE) docker-down; \
+	exit $$exit_code
+
+# Event source integration tests (SQS + SNS with local-sns and ElasticMQ)
+test-integration-eventsource: _test-integration-eventsource ## Run SQS/SNS event source integration tests
+
+_test-integration-eventsource:
+	@echo "=========================================="
+	@echo "  EVENT SOURCE integration tests (SQS+SNS)"
+	@echo "=========================================="
+	$(COMPOSE_TEST) up -d sns sqs
+	@echo "Waiting for SNS (local-sns) and SQS (ElasticMQ) to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		if nc -z localhost 9911 2>/dev/null && nc -z localhost 9324 2>/dev/null; then \
+			echo "SNS and SQS are ready!"; \
+			break; \
+		fi; \
+		echo "Waiting... ($$i/10)"; \
+		sleep 1; \
+	done
+	@exit_code=0; \
+	SQS_ENDPOINT=http://localhost:9324 SNS_ENDPOINT=http://localhost:9911 \
+		cargo test --test sqs_integration --test sns_integration -- --ignored --nocapture --test-threads=1 || exit_code=$$?; \
+	$(COMPOSE_TEST) stop sns sqs; \
+	$(COMPOSE_TEST) rm -f sns sqs; \
 	exit $$exit_code
 
 docker-test: test-integration ## Run integration tests (alias)

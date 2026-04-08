@@ -47,6 +47,28 @@ services:
       timeout: 3s
       retries: 10
 
+  # SNS emulator (jameskbride/local-sns) for SNS integration tests.
+  sns:
+    image: jameskbride/local-sns
+    container_name: localfunctions-sns
+    networks:
+      testnet:
+    ports:
+      - "9911:9911"
+    environment:
+      - AWS_ACCOUNT_ID=000000000000
+
+  # SQS emulator (ElasticMQ) for SQS integration tests.
+  sqs:
+    image: softwaremill/elasticmq-native
+    container_name: localfunctions-sqs
+    networks:
+      testnet:
+    ports:
+      - "9324:9324"
+    volumes:
+      - ./docker/elasticmq.conf:/opt/elasticmq.conf
+
   # Lightweight entry so `docker compose -f docker-compose.test.yml up -d`
   # always creates the network, even when the localfunctions service is not
   # started (used by the simulated integration tests).
