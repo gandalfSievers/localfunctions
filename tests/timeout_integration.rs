@@ -84,6 +84,8 @@ async fn build_state(
     let functions = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel(10);

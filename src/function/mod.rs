@@ -108,6 +108,10 @@ struct RawFunctionsFile {
     functions: HashMap<String, RawFunctionEntry>,
     #[serde(default)]
     runtime_images: HashMap<String, String>,
+    #[serde(default)]
+    event_source_mappings: Vec<serde_json::Value>,
+    #[serde(default)]
+    sns_subscriptions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +148,12 @@ struct RawFunctionEntry {
 pub struct FunctionsConfig {
     pub functions: HashMap<String, FunctionConfig>,
     pub runtime_images: HashMap<String, String>,
+    /// Optional event source mappings (e.g. SQS queue → function).
+    /// Parsed as raw JSON values for downstream consumers to interpret.
+    pub event_source_mappings: Vec<serde_json::Value>,
+    /// Optional SNS subscription definitions (topic → function).
+    /// Parsed as raw JSON values for downstream consumers to interpret.
+    pub sns_subscriptions: Vec<serde_json::Value>,
 }
 
 /// Parse and validate a functions.json file.
@@ -438,6 +448,8 @@ pub fn parse_functions_config(
     Ok(FunctionsConfig {
         functions,
         runtime_images: raw.runtime_images,
+        event_source_mappings: raw.event_source_mappings,
+        sns_subscriptions: raw.sns_subscriptions,
     })
 }
 
@@ -1889,6 +1901,8 @@ mod tests {
         let config = FunctionsConfig {
             functions: HashMap::new(),
             runtime_images: HashMap::new(),
+            event_source_mappings: Vec::new(),
+            sns_subscriptions: Vec::new(),
         };
         let (mgr, rxs) = FunctionManager::new(config, "us-east-1".into(), "000000000000".into(), 10);
 

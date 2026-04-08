@@ -40,6 +40,8 @@ fn test_state() -> AppState {
     let functions = FunctionsConfig {
         functions: HashMap::new(),
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));
@@ -173,6 +175,8 @@ fn test_state_with_functions() -> AppState {
     let functions = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -332,6 +336,8 @@ async fn test_state_with_function(
     let functions = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel(10);
@@ -1196,6 +1202,8 @@ async fn invoke_returns_429_when_max_containers_reached() {
     let functions = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
     let (tx, rx) = tokio::sync::mpsc::channel(10);
     let mut senders = HashMap::new();
@@ -1466,6 +1474,8 @@ fn test_state_with_url_function() -> AppState {
     let functions = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
     Arc::get_mut(&mut state.functions).map(|f| *f = functions);
     state

@@ -1167,6 +1167,8 @@ mod tests {
             functions: Arc::new(FunctionsConfig {
                 functions: HashMap::new(),
                 runtime_images: HashMap::new(),
+                event_source_mappings: Vec::new(),
+                sns_subscriptions: Vec::new(),
             }),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_bridge,

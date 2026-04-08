@@ -253,6 +253,8 @@ mod tests {
         let functions = FunctionsConfig {
             functions: HashMap::new(),
             runtime_images: HashMap::new(),
+            event_source_mappings: Vec::new(),
+            sns_subscriptions: Vec::new(),
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let extension_registry = Arc::new(ExtensionRegistry::new(shutdown_rx.clone()));

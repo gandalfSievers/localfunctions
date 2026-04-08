@@ -88,6 +88,8 @@ async fn build_e2e_state(
     let functions_config = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

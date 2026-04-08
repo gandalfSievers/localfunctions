@@ -41,6 +41,8 @@ fn test_state() -> AppState {
     let functions = FunctionsConfig {
         functions: HashMap::new(),
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime_bridge = Arc::new(RuntimeBridge::new(HashMap::new(), HashMap::new(), shutdown_rx));

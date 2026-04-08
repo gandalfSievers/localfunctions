@@ -71,6 +71,8 @@ fn test_state_with_callback(callback_url: &str) -> AppState {
     let functions = FunctionsConfig {
         functions: functions_map,
         runtime_images: HashMap::new(),
+        event_source_mappings: Vec::new(),
+        sns_subscriptions: Vec::new(),
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

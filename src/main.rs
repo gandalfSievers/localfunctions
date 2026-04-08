@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod container;
+mod eventsource;
 mod extensions;
 mod function;
 mod metrics;
@@ -176,6 +177,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Start event source manager (pollers and SNS subscription handles).
+    let mut event_source_manager = eventsource::EventSourceManager::new();
+    // Future: register pollers from functions_config.event_source_mappings here.
+    // Future: register SNS subscription handles from functions_config.sns_subscriptions here.
+    event_source_manager.start(state.clone());
+
     // Spawn file watcher for hot reload (if enabled).
     if state.config.hot_reload {
         let watcher_functions = state.functions.clone();
@@ -200,6 +207,9 @@ async fn main() -> Result<()> {
     // --- Graceful shutdown sequence ---
 
     info!("graceful shutdown started");
+
+    // Shut down event source pollers before stopping containers.
+    event_source_manager.shutdown().await;
 
     // Wake any long-polling runtime handlers so they can exit cleanly.
     let _ = shutdown_tx.send(true);

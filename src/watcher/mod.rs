@@ -206,6 +206,8 @@ mod tests {
         let config = FunctionsConfig {
             functions,
             runtime_images: HashMap::new(),
+            event_source_mappings: Vec::new(),
+            sns_subscriptions: Vec::new(),
         };
 
         let paths = watched_paths(&config);
@@ -228,6 +230,8 @@ mod tests {
         let config = FunctionsConfig {
             functions,
             runtime_images: HashMap::new(),
+            event_source_mappings: Vec::new(),
+            sns_subscriptions: Vec::new(),
         };
 
         let paths = watched_paths(&config);
@@ -250,6 +254,8 @@ mod tests {
         let config = FunctionsConfig {
             functions,
             runtime_images: HashMap::new(),
+            event_source_mappings: Vec::new(),
+            sns_subscriptions: Vec::new(),
         };
 
         let paths = watched_paths(&config);
@@ -275,6 +281,8 @@ mod tests {
         let config = FunctionsConfig {
             functions,
             runtime_images: HashMap::new(),
+            event_source_mappings: Vec::new(),
+            sns_subscriptions: Vec::new(),
         };
 
         let paths = watched_paths(&config);
