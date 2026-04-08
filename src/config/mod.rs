@@ -117,7 +117,7 @@ impl Config {
         let callback_url = match std::env::var("LOCAL_LAMBDA_CALLBACK_URL").ok().filter(|s| !s.is_empty()) {
             Some(url) => {
                 validate_callback_url(&url)?;
-                url
+                url.trim_end_matches('/').to_string()
             }
             None => format!("http://{}:{}", host, port),
         };
@@ -699,6 +699,24 @@ mod tests {
         std::env::remove_var("LOCAL_LAMBDA_PORT");
         let config = Config::from_env().unwrap();
         assert_eq!(config.callback_url, "http://0.0.0.0:9600");
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_trailing_slash_stripped() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "http://localfunctions:9600/");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.callback_url, "http://localfunctions:9600");
+        std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_callback_url_multiple_trailing_slashes_stripped() {
+        std::env::set_var("LOCAL_LAMBDA_CALLBACK_URL", "http://localfunctions:9600///");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.callback_url, "http://localfunctions:9600");
         std::env::remove_var("LOCAL_LAMBDA_CALLBACK_URL");
     }
 }

@@ -48,6 +48,7 @@ async fn build_state(
         hot_reload: false,
         hot_reload_debounce_ms: 500,
         domain: None,
+        callback_url: "http://127.0.0.1:9600".to_string(),
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();

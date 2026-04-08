@@ -38,6 +38,8 @@ pub fn invoke_routes() -> Router<AppState> {
         // Sample event payload generation endpoints.
         .route("/admin/sample-events", get(sample_events::list_sample_events))
         .route("/admin/sample-events/:source", get(sample_events::get_sample_event))
+        // SNS subscription lifecycle endpoints.
+        .merge(super::sns::sns_routes())
         // Function URL endpoints — placed last so static routes take priority.
         .route(
             "/:function_name",
@@ -92,7 +94,7 @@ async fn invoke_function(
         .await
 }
 
-async fn invoke_function_inner(
+pub(crate) async fn invoke_function_inner(
     state: AppState,
     function_name: String,
     headers: HeaderMap,
