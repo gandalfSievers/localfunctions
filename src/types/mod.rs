@@ -52,6 +52,10 @@ pub struct FunctionConfig {
     /// When true, this function gets a Function URL endpoint at `/{name}/`.
     #[serde(default)]
     pub function_url_enabled: bool,
+    /// Payload format version for Function URL events: "1.0" or "2.0" (default).
+    /// When "1.0", Function URL requests produce API Gateway v1 REST API style events.
+    #[serde(default = "default_payload_format_version")]
+    pub payload_format_version: String,
     /// Maximum number of retries for failed async (Event) invocations.
     /// AWS Lambda defaults to 2 retries (range 0-2).
     #[serde(default = "default_max_retry_attempts")]
@@ -83,6 +87,11 @@ fn default_ephemeral_storage_mb() -> u64 {
 #[allow(dead_code)]
 fn default_architecture() -> String {
     "x86_64".to_string()
+}
+
+#[allow(dead_code)]
+fn default_payload_format_version() -> String {
+    "2.0".to_string()
 }
 
 #[allow(dead_code)]
@@ -282,6 +291,7 @@ mod tests {
             architecture: "arm64".into(),
             layers: vec![],
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 2,
             on_success: None,
             on_failure: None,
@@ -358,6 +368,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 2,
             on_success: None,
             on_failure: None,
@@ -384,6 +395,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 2,
             on_success: Some("dest-a".into()),
             on_failure: Some("dest-b".into()),
@@ -423,6 +435,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 2,
             on_success: None,
             on_failure: None,
@@ -451,6 +464,7 @@ mod tests {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 2,
             on_success: None,
             on_failure: None,

@@ -90,6 +90,7 @@ fn test_state_with_functions() -> AppState {
             architecture: "x86_64".into(),
             layers: vec![],
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 2,
             on_success: None,
             on_failure: None,

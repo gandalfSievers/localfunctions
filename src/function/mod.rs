@@ -83,6 +83,9 @@ pub enum FunctionConfigError {
     #[error("function '{name}': invalid max_retry_attempts {value} — must be between 0 and 2")]
     InvalidMaxRetryAttempts { name: String, value: u32 },
 
+    #[error("function '{name}': invalid payload_format_version '{value}' — must be \"1.0\" or \"2.0\"")]
+    InvalidPayloadFormatVersion { name: String, value: String },
+
     #[error("function '{name}': layer path '{path}' does not exist or is not a directory")]
     LayerPathNotFound { name: String, path: String },
 
@@ -125,6 +128,7 @@ struct RawFunctionEntry {
     layers: Vec<String>,
     #[serde(default)]
     function_url_enabled: bool,
+    payload_format_version: Option<String>,
     max_retry_attempts: Option<u32>,
     on_success: Option<String>,
     on_failure: Option<String>,
@@ -349,6 +353,18 @@ pub fn parse_functions_config(
             }
         }
 
+        // Validate payload_format_version
+        let payload_format_version = entry
+            .payload_format_version
+            .clone()
+            .unwrap_or_else(|| "2.0".to_string());
+        if payload_format_version != "1.0" && payload_format_version != "2.0" {
+            errors.push(FunctionConfigError::InvalidPayloadFormatVersion {
+                name: name.clone(),
+                value: payload_format_version.clone(),
+            });
+        }
+
         // Validate max_retry_attempts
         let max_retry_attempts = entry.max_retry_attempts.unwrap_or(2);
         if max_retry_attempts > 2 {
@@ -375,6 +391,7 @@ pub fn parse_functions_config(
             architecture,
             layers,
             function_url_enabled: entry.function_url_enabled,
+            payload_format_version,
             max_retry_attempts,
             on_success: entry.on_success.clone(),
             on_failure: entry.on_failure.clone(),
@@ -2277,6 +2294,77 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("max_retry_attempts"), "error should mention the field: {msg}");
         assert!(msg.contains("3"), "error should contain the invalid value: {msg}");
+    }
+
+    // -- Payload format version validation ------------------------------------
+
+    #[test]
+    fn parse_config_payload_format_version_1_0() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "payload_format_version": "1.0"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].payload_format_version, "1.0");
+    }
+
+    #[test]
+    fn parse_config_payload_format_version_2_0() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "payload_format_version": "2.0"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].payload_format_version, "2.0");
+    }
+
+    #[test]
+    fn parse_config_payload_format_version_default() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code"
+                }
+            }
+        }"#;
+        let config = parse_functions_config(json, dir.path()).unwrap();
+        assert_eq!(config.functions["f1"].payload_format_version, "2.0");
+    }
+
+    #[test]
+    fn parse_config_payload_format_version_invalid() {
+        let dir = setup_dirs(&["code"]);
+        let json = r#"{
+            "functions": {
+                "f1": {
+                    "runtime": "python3.12",
+                    "handler": "main.handler",
+                    "code_path": "./code",
+                    "payload_format_version": "3.0"
+                }
+            }
+        }"#;
+        let err = parse_functions_config(json, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("payload_format_version"), "error should mention the field: {msg}");
+        assert!(msg.contains("3.0"), "error should contain the invalid value: {msg}");
     }
 
     // -- Destination validation -----------------------------------------------

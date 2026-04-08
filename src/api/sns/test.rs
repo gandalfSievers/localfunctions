@@ -65,6 +65,7 @@ fn test_state_with_callback(callback_url: &str) -> AppState {
             layers: vec![],
             architecture: "x86_64".into(),
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
         },
     );
     let functions = FunctionsConfig {

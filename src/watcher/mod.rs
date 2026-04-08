@@ -184,6 +184,7 @@ mod tests {
             architecture: "x86_64".to_string(),
             layers: Vec::new(),
             function_url_enabled: false,
+            payload_format_version: "2.0".to_string(),
             max_retry_attempts: 0,
             on_success: None,
             on_failure: None,
