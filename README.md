@@ -1,6 +1,6 @@
 # localfunctions
 
-A local AWS Lambda emulator written in Rust. Run Lambda functions locally using real AWS Lambda runtime containers, supporting all major languages.
+A local AWS Lambda emulator written in Rust. Run Lambda functions locally using real AWS Lambda runtime containers, supporting all major languages. Supports SQS event source mappings, SNS push subscriptions, Function URLs with API Gateway v1 and v2 payload formats, response streaming, virtual host routing, and hot reload.
 
 ## Quick start
 
@@ -99,12 +99,76 @@ Defines the functions to serve and which runtime images to use.
 | `architecture` | No | host arch | `x86_64` or `arm64` |
 | `layers` | No | `[]` | Local directory paths mounted as /opt layers |
 | `function_url_enabled` | No | `false` | Enable HTTP endpoint at `/{function_name}/` |
+| `payload_format_version` | No | `"2.0"` | API Gateway payload format: `"1.0"` (REST API) or `"2.0"` (HTTP API / Function URL) |
 | `reserved_concurrent_executions` | No | - | Per-function concurrency limit (1-1000) |
 | `max_retry_attempts` | No | `2` | Async invocation retry count (0-2) |
 | `on_success` | No | - | Destination function for successful async invocations |
 | `on_failure` | No | - | Destination function after all retries exhausted |
 
 *Not required when using `image_uri`.
+
+#### Event source mappings (SQS)
+
+Poll-based event sources are defined in the `event_source_mappings` array. localfunctions long-polls SQS on behalf of the function, batches messages, and invokes it synchronously — matching the real AWS Lambda event source mapping behavior.
+
+```json
+{
+  "functions": { "...": "..." },
+  "event_source_mappings": [
+    {
+      "function_name": "order-processor",
+      "queue_url": "http://localhost:9324/queue/orders",
+      "endpoint_url": "http://localhost:9324",
+      "batch_size": 10,
+      "maximum_batching_window_in_seconds": 5,
+      "function_response_types": ["ReportBatchItemFailures"]
+    }
+  ]
+}
+```
+
+| Property | Required | Default | Description |
+|---|---|---|---|
+| `function_name` | Yes | - | Target function (must exist in `functions`) |
+| `queue_url` | Yes | - | SQS queue URL |
+| `endpoint_url` | No | - | SQS endpoint override (e.g. ElasticMQ, LocalStack) |
+| `batch_size` | No | `10` | Max messages per invocation (1-10) |
+| `maximum_batching_window_in_seconds` | No | `0` | Wait up to N seconds to fill a batch |
+| `function_response_types` | No | `[]` | Include `"ReportBatchItemFailures"` for partial batch failure support |
+| `event_source_arn` | No | synthesized | SQS queue ARN (auto-generated from queue URL if omitted) |
+| `region` | No | global | AWS region override |
+| `enabled` | No | `true` | Whether the poller is active |
+
+On success, messages are deleted from the queue. On function error or timeout, messages remain and are retried after the visibility timeout. With `ReportBatchItemFailures`, only successful messages are deleted.
+
+#### SNS subscriptions
+
+Push-based SNS subscriptions are defined in the `sns_subscriptions` array. On startup, localfunctions subscribes to the configured SNS topics via HTTP and auto-confirms. Published messages are wrapped in the Lambda SNS event format and invoke the function synchronously.
+
+```json
+{
+  "functions": { "...": "..." },
+  "sns_subscriptions": [
+    {
+      "function_name": "notification-handler",
+      "topic_arn": "arn:aws:sns:us-east-1:000000000000:order-events",
+      "endpoint_url": "http://localhost:9911"
+    }
+  ]
+}
+```
+
+| Property | Required | Default | Description |
+|---|---|---|---|
+| `function_name` | Yes | - | Target function (must exist in `functions`) |
+| `topic_arn` | Yes | - | SNS topic ARN |
+| `endpoint_url` | No | - | SNS endpoint override (e.g. local-sns, LocalStack) |
+| `filter_policy` | No | `null` | SNS filter policy JSON (applied server-side by SNS) |
+| `filter_policy_scope` | No | `"MessageAttributes"` | Filter policy scope (`"MessageAttributes"` or `"MessageBody"`) |
+| `region` | No | global | AWS region override |
+| `enabled` | No | `true` | Whether the subscription is active |
+
+On shutdown, localfunctions unsubscribes from all active topics (best-effort).
 
 ### Environment variables
 
@@ -132,6 +196,7 @@ Defines the functions to serve and which runtime images to use.
 | `LOCAL_LAMBDA_HOT_RELOAD` | `true` | Watch code paths and recycle containers on changes |
 | `LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS` | `500` | File change debounce interval |
 | `LOCAL_LAMBDA_DOMAIN` | - | Custom domain for virtual host routing (e.g. `lambda.local`). Enables `{function}.{domain}` addressing via `Host` header |
+| `LOCAL_LAMBDA_CALLBACK_URL` | `http://<host>:<port>` | URL that external services (e.g. SNS) use to reach localfunctions. Set explicitly in Docker Compose environments |
 
 Copy `.env.example` to `.env` to set these locally.
 
@@ -185,11 +250,32 @@ curl http://localhost:9600/metrics
 
 ### Function URLs
 
-When `function_url_enabled` is set, the function is accessible at:
+When `function_url_enabled` is set, the function is accessible via path-based routing:
 
 ```sh
 curl http://localhost:9600/{FunctionName}/
+curl http://localhost:9600/{FunctionName}/any/sub/path?key=value
 ```
+
+The request is transformed into a Lambda Function URL event (API Gateway v2 HTTP API format by default). Set `payload_format_version` to `"1.0"` to produce an API Gateway v1 REST API proxy integration event instead — useful when your function expects `httpMethod`, `multiValueHeaders`, `multiValueQueryStringParameters`, or `requestContext.identity`.
+
+#### Virtual host routing (AWS-style)
+
+localfunctions supports AWS-style virtual hosted addressing, where the function name is encoded in the `Host` header rather than the URL path. Two patterns are supported:
+
+**AWS-style** (always enabled):
+```sh
+# {function}.lambda.{region}.amazonaws.com
+curl http://my-func.lambda.us-east-1.amazonaws.com:9600/
+```
+
+**Custom domain** (when `LOCAL_LAMBDA_DOMAIN` is set):
+```sh
+# LOCAL_LAMBDA_DOMAIN=lambda.local
+curl http://my-func.lambda.local:9600/
+```
+
+This enables AWS SDKs to connect to localfunctions with Function URL addressing, exactly as they would in production. Pair with a local DNS resolver (e.g. dnsmasq) or `/etc/hosts` entries to resolve the hostnames.
 
 ### Using the AWS SDK
 
@@ -247,7 +333,80 @@ Map runtime identifiers to Docker images in the `runtime_images` section of `fun
 
 ## Using with other local AWS services
 
-localfunctions works well alongside other local AWS service emulators. Pass service endpoints to your functions via environment variables:
+localfunctions works well alongside other local AWS service emulators.
+
+### SQS and SNS
+
+localfunctions has built-in support for SQS event source mappings and SNS push subscriptions. Use [ElasticMQ](https://github.com/softwaremill/elasticmq) for SQS and [local-sns](https://github.com/jameskbride/local-sns) for SNS:
+
+```yaml
+# docker-compose.yml
+services:
+  localfunctions:
+    image: localfunctions:debian
+    ports:
+      - "9600:9600"
+      - "9601:9601"
+    environment:
+      - LOCAL_LAMBDA_CALLBACK_URL=http://localfunctions:9600
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./functions.json:/app/functions.json:ro
+      - ./functions:/app/functions:ro
+    networks:
+      - localservices
+
+  sns:
+    image: jameskbride/local-sns
+    ports:
+      - "9911:9911"
+    environment:
+      - AWS_ACCOUNT_ID=000000000000
+    networks:
+      - localservices
+
+  sqs:
+    image: softwaremill/elasticmq-native
+    ports:
+      - "9324:9324"
+    networks:
+      - localservices
+
+networks:
+  localservices:
+```
+
+Then configure event sources in `functions.json`:
+
+```json
+{
+  "functions": {
+    "order-processor": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./functions/order-processor"
+    }
+  },
+  "event_source_mappings": [
+    {
+      "function_name": "order-processor",
+      "queue_url": "http://sqs:9324/queue/orders",
+      "endpoint_url": "http://sqs:9324"
+    }
+  ],
+  "sns_subscriptions": [
+    {
+      "function_name": "order-processor",
+      "topic_arn": "arn:aws:sns:us-east-1:000000000000:order-events",
+      "endpoint_url": "http://sns:9911"
+    }
+  ]
+}
+```
+
+### Other services
+
+Pass service endpoints to your functions via environment variables:
 
 ```json
 {
@@ -336,9 +495,12 @@ make build
 make run
 
 # Run tests
-make test              # unit tests
-make test-integration  # integration tests (requires Docker)
-make test-all          # both
+make test                          # unit tests
+make test-integration              # simulated integration tests (requires Docker)
+make test-integration-eventsource  # SQS/SNS tests (local-sns + ElasticMQ)
+make test-integration-pathstyle    # path-style tests (real Lambda containers)
+make test-integration-awsstyle     # AWS-style vhost tests (dnsmasq in Docker)
+make test-all                      # all of the above
 
 # Lint
 make lint              # fmt + clippy
