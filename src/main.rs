@@ -179,7 +179,27 @@ async fn main() -> Result<()> {
 
     // Start event source manager (pollers and SNS subscription handles).
     let mut event_source_manager = eventsource::EventSourceManager::new();
-    // Future: register pollers from functions_config.event_source_mappings here.
+
+    // Register SQS pollers from event_source_mappings.
+    let sqs_configs =
+        eventsource::sqs::parse_sqs_mappings(&state.functions.event_source_mappings);
+    for sqs_config in sqs_configs {
+        if !sqs_config.enabled {
+            info!(
+                queue_url = %sqs_config.queue_url,
+                function = %sqs_config.function_name,
+                "SQS event source mapping disabled, skipping"
+            );
+            continue;
+        }
+        let poller = eventsource::sqs::SqsPoller::new(
+            sqs_config,
+            state.config.region.clone(),
+            state.config.account_id.clone(),
+        );
+        event_source_manager.add_poller(Box::new(poller));
+    }
+
     // Future: register SNS subscription handles from functions_config.sns_subscriptions here.
     event_source_manager.start(state.clone());
 

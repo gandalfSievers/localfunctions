@@ -5,8 +5,12 @@
 //! that manages poller tasks and SNS subscription handles with consistent
 //! startup and graceful shutdown.
 
+pub mod sqs;
+
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+pub(crate) mod test_helpers;
 
 use std::sync::Arc;
 
