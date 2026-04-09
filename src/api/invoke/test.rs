@@ -35,6 +35,7 @@ fn test_state() -> AppState {
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://0.0.0.0:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
     let functions = FunctionsConfig {
@@ -55,6 +56,7 @@ fn test_state() -> AppState {
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
     AppState {
         config: Arc::new(config),
@@ -122,6 +124,7 @@ fn test_state_with_functions() -> AppState {
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://0.0.0.0:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -191,6 +194,7 @@ fn test_state_with_functions() -> AppState {
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
     AppState {
         config: Arc::new(config),
@@ -306,6 +310,7 @@ async fn test_state_with_function(
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://0.0.0.0:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -361,6 +366,7 @@ async fn test_state_with_function(
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
 
     // Pre-populate an idle container so the invoke handler doesn't attempt
@@ -1172,6 +1178,7 @@ async fn invoke_returns_429_when_max_containers_reached() {
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://0.0.0.0:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -1222,6 +1229,7 @@ async fn invoke_returns_429_when_max_containers_reached() {
         container_registry.clone(),
         1, // 1 slot
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
 
     // Fill the only slot with a Busy container so no idle container is

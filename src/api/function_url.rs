@@ -1144,6 +1144,7 @@ mod tests {
             hot_reload_debounce_ms: 500,
             domain: None,
             callback_url: "http://0.0.0.0:9600".to_string(),
+            runtime_host: "host-gateway".to_string(),
         };
         let docker = bollard::Docker::connect_with_local_defaults().unwrap();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1158,6 +1159,7 @@ mod tests {
             container_registry.clone(),
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         ));
         let state = AppState {
             config: Arc::new(config),

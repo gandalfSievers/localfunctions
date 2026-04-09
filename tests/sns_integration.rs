@@ -96,6 +96,7 @@ async fn build_sns_test_state(
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://127.0.0.1:0".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
@@ -151,6 +152,7 @@ async fn build_sns_test_state(
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
 
     // Pre-populate one idle container for the function.
@@ -198,6 +200,7 @@ async fn build_sns_test_state(
     // Update callback_url with actual invoke port.
     let updated_config = Config {
         callback_url: format!("http://127.0.0.1:{}", invoke_addr.port()),
+        runtime_host: "host-gateway".to_string(),
         ..(*state.config).clone()
     };
     let state = AppState {

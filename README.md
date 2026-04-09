@@ -197,6 +197,7 @@ On shutdown, localfunctions unsubscribes from all active topics (best-effort).
 | `LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS` | `500` | File change debounce interval |
 | `LOCAL_LAMBDA_DOMAIN` | - | Custom domain for virtual host routing (e.g. `lambda.local`). Enables `{function}.{domain}` addressing via `Host` header |
 | `LOCAL_LAMBDA_CALLBACK_URL` | `http://<host>:<port>` | URL that external services (e.g. SNS) use to reach localfunctions. Set explicitly in Docker Compose environments |
+| `LOCAL_LAMBDA_RUNTIME_HOST` | `host-gateway` | Host target for container `extra_hosts` entries (`host.docker.internal` and `{function}.runtime.local`). Set to a Docker network alias or container IP when `host-gateway` is unreachable (e.g. on internal Docker networks) |
 
 Copy `.env.example` to `.env` to set these locally.
 

@@ -491,6 +491,8 @@ pub struct ContainerManager {
     /// Controls whether and how host AWS credentials are forwarded to
     /// function containers.
     credential_config: CredentialForwardingConfig,
+    /// Host target for extra_hosts entries. Defaults to `"host-gateway"`.
+    runtime_host: String,
 }
 
 #[allow(dead_code)]
@@ -511,6 +513,7 @@ impl ContainerManager {
         registry: Arc<ContainerRegistry>,
         max_containers: usize,
         credential_config: CredentialForwardingConfig,
+        runtime_host: String,
     ) -> Self {
         Self {
             docker,
@@ -522,6 +525,7 @@ impl ContainerManager {
             containers: RwLock::new(HashMap::new()),
             container_semaphore: Arc::new(Semaphore::new(max_containers)),
             credential_config,
+            runtime_host,
         }
     }
 
@@ -757,7 +761,7 @@ impl ContainerManager {
             cpu_quota: Some(cpu_quota),
             cpu_shares: Some(cpu_shares),
             network_mode: Some(self.network_name.clone()),
-            extra_hosts: Some(container_extra_hosts(&function.name)),
+            extra_hosts: Some(container_extra_hosts(&function.name, &self.runtime_host)),
             tmpfs: Some(tmpfs),
             // Explicitly no privileged mode, no port bindings
             privileged: Some(false),
@@ -1627,10 +1631,10 @@ fn host_aws_config_dir() -> Option<String> {
 /// `host.docker.internal:<port>`.  When other services run as Docker
 /// containers on the same user-defined bridge network, Docker's embedded DNS
 /// resolves their container names automatically — no extra config needed.
-pub fn container_extra_hosts(function_name: &str) -> Vec<String> {
+pub fn container_extra_hosts(function_name: &str, runtime_host: &str) -> Vec<String> {
     vec![
-        "host.docker.internal:host-gateway".to_string(),
-        format!("{}.runtime.local:host-gateway", function_name),
+        format!("host.docker.internal:{}", runtime_host),
+        format!("{}.runtime.local:{}", function_name, runtime_host),
     ]
 }
 
@@ -1976,6 +1980,7 @@ mod tests {
             registry,
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         )
     }
 
@@ -2057,6 +2062,7 @@ mod tests {
             registry,
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
         let func = make_test_function();
         let err = mgr.resolve_image(&func).unwrap_err();
@@ -2484,7 +2490,7 @@ mod tests {
 
     #[test]
     fn container_extra_hosts_contains_host_gateway_and_runtime_local() {
-        let hosts = container_extra_hosts("my-func");
+        let hosts = container_extra_hosts("my-func", "host-gateway");
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0], "host.docker.internal:host-gateway");
         assert_eq!(hosts[1], "my-func.runtime.local:host-gateway");
@@ -2860,6 +2866,7 @@ mod tests {
             registry,
             2, // only 2 slots
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
 
         // Take both slots
@@ -2986,6 +2993,7 @@ mod integration_tests {
             registry.clone(),
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
 
         // Create a temp directory for code
@@ -3093,6 +3101,7 @@ mod integration_tests {
             registry,
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
 
         // Use a small, commonly available image
@@ -3215,6 +3224,7 @@ mod integration_tests {
             registry,
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
 
         // Stopping a nonexistent container should succeed (benign errors are swallowed)
@@ -3240,6 +3250,7 @@ mod integration_tests {
             registry,
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
 
         // Streaming from a nonexistent container should complete quickly without panicking.
@@ -3273,6 +3284,7 @@ mod integration_tests {
             registry,
             20,
             CredentialForwardingConfig::default(),
+            "host-gateway".to_string(),
         );
 
         let request_id = uuid::Uuid::new_v4().to_string();

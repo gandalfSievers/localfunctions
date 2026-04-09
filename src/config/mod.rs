@@ -54,6 +54,11 @@ pub struct Config {
     /// localfunctions instance. Defaults to `http://<host>:<port>`.
     /// Must be a valid HTTP or HTTPS URL when set explicitly.
     pub callback_url: String,
+    /// Host target for container extra_hosts entries (`host.docker.internal`
+    /// and `{function}.runtime.local`). Defaults to `"host-gateway"`.
+    /// Set to a Docker network alias or container IP when `host-gateway` is
+    /// unreachable (e.g. on internal Docker networks).
+    pub runtime_host: String,
 }
 
 /// Controls the format of log output.
@@ -113,6 +118,7 @@ impl Config {
         let hot_reload = parse_env("LOCAL_LAMBDA_HOT_RELOAD", "true")?;
         let hot_reload_debounce_ms = parse_env("LOCAL_LAMBDA_HOT_RELOAD_DEBOUNCE_MS", "500")?;
         let domain = std::env::var("LOCAL_LAMBDA_DOMAIN").ok().filter(|s| !s.is_empty());
+        let runtime_host = parse_env::<String>("LOCAL_LAMBDA_RUNTIME_HOST", "host-gateway")?;
 
         let callback_url = match std::env::var("LOCAL_LAMBDA_CALLBACK_URL").ok().filter(|s| !s.is_empty()) {
             Some(url) => {
@@ -146,6 +152,7 @@ impl Config {
             hot_reload_debounce_ms,
             domain,
             callback_url,
+            runtime_host,
         })
     }
 }

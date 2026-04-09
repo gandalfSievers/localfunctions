@@ -36,6 +36,7 @@ fn test_state() -> AppState {
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://0.0.0.0:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
     let functions = FunctionsConfig {
@@ -56,6 +57,7 @@ fn test_state() -> AppState {
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
     AppState {
         config: Arc::new(config),
@@ -97,6 +99,7 @@ fn test_state_with_functions() -> AppState {
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://0.0.0.0:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
 
@@ -166,6 +169,7 @@ fn test_state_with_functions() -> AppState {
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
     AppState {
         config: Arc::new(config),

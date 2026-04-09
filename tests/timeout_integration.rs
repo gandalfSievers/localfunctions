@@ -52,6 +52,7 @@ async fn build_state(
         hot_reload_debounce_ms: 500,
         domain: None,
         callback_url: "http://127.0.0.1:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
@@ -107,6 +108,7 @@ async fn build_state(
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
     // Pre-populate an idle container so the invoke handler doesn't attempt
     // real Docker operations in tests.

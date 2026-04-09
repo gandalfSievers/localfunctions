@@ -53,6 +53,7 @@ async fn build_awsstyle_state(
         hot_reload_debounce_ms: 500,
         domain: None, // AWS-style routing is always enabled regardless
         callback_url: "http://127.0.0.1:9600".to_string(),
+        runtime_host: "host-gateway".to_string(),
     };
 
     let docker = bollard::Docker::connect_with_local_defaults().unwrap();
@@ -110,6 +111,7 @@ async fn build_awsstyle_state(
         container_registry.clone(),
         20,
         CredentialForwardingConfig::default(),
+        "host-gateway".to_string(),
     ));
 
     // Pre-populate one idle container per function.

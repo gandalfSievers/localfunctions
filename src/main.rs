@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         container_registry.clone(),
         config.max_containers,
         credential_config,
+        config.runtime_host.clone(),
     ));
 
     let state = AppState {
