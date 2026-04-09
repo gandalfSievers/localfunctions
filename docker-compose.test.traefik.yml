@@ -1,0 +1,163 @@
+# Standalone Traefik TLS integration test infrastructure.
+#
+# Full end-to-end setup: Traefik reverse proxy terminates TLS for
+# *.amazonaws.com domains using mkcert-generated certificates. All services
+# (Lambda, SQS, SNS) are accessed exclusively through Traefik via their real
+# amazonaws.com hostnames — no short domains or ports.
+#
+# localfunctions trusts the mkcert CA via webpki-roots-patcher (LD_PRELOAD)
+# and polls SQS through Traefik HTTPS. The cert + patcher .so are shared
+# via a named volume populated from the Traefik image.
+#
+# Usage:
+#   docker compose -f docker-compose.test.traefik.yml up -d --build
+#   docker compose -f docker-compose.test.traefik.yml run --rm test-runner
+#   docker compose -f docker-compose.test.traefik.yml down
+#
+# Pre-pull required images:
+#   docker pull public.ecr.aws/lambda/python:3.12
+#   docker pull public.ecr.aws/lambda/nodejs:20
+
+services:
+  # ── Traefik reverse proxy (HTTPS :443 + HTTP :80) ──────────────────────────
+  traefik:
+    build:
+      context: docker/traefik
+    container_name: localfunctions-traefik
+    networks:
+      testnet:
+        ipv4_address: 172.31.0.20
+    volumes:
+      - certs:/certs
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── DNS — resolves all *.amazonaws.com to Traefik ──────────────────────────
+  dns:
+    image: alpine
+    container_name: localfunctions-traefik-dns
+    networks:
+      testnet:
+        ipv4_address: 172.31.0.53
+    volumes:
+      - ./docker/traefik/dnsmasq.conf:/etc/dnsmasq.conf
+    cap_add:
+      - NET_ADMIN
+    command: sh -c "apk add --no-cache dnsmasq && dnsmasq -k"
+
+  # ── localfunctions — Lambda emulator, polls SQS via Traefik HTTPS ─────────
+  # Pre-built FROM localfunctions:debian with webpki-roots-patcher baked in.
+  # LD_PRELOAD + SSL_CERT_FILE are set in the image; the cert volume
+  # provides /certs/rootCA.pem at runtime.
+  # Build separately: DOCKER_BUILDKIT=0 docker build -f docker/traefik/Dockerfile.localfunctions -t localfunctions:traefik .
+  localfunctions:
+    image: localfunctions:traefik
+    container_name: localfunctions-traefik-app
+    networks:
+      testnet:
+        ipv4_address: 172.31.0.10
+    dns:
+      - 172.31.0.53
+    working_dir: ${PWD}/tests/fixtures
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}/tests/fixtures:${PWD}/tests/fixtures:ro
+      - certs:/certs:ro
+    group_add:
+      - "${DOCKER_GID:-0}"
+    environment:
+      - LOCAL_LAMBDA_HOST=0.0.0.0
+      - LOCAL_LAMBDA_PORT=9600
+      - LOCAL_LAMBDA_RUNTIME_PORT=9601
+      - LOCAL_LAMBDA_FUNCTIONS_FILE=${PWD}/tests/fixtures/functions-traefik.json
+      - LOCAL_LAMBDA_DOCKER_NETWORK=localfunctions-traefik-test
+      - LOCAL_LAMBDA_PULL_IMAGES=false
+      - LOCAL_LAMBDA_HOT_RELOAD=false
+      - LOCAL_LAMBDA_INIT_TIMEOUT=60
+      # Lambda containers connect to runtime API via this IP (no host port forwarding).
+      - LOCAL_LAMBDA_RUNTIME_HOST=172.31.0.10
+      # SNS callback routed through Traefik HTTP (local-sns is Java, no patcher).
+      - LOCAL_LAMBDA_CALLBACK_URL=http://lambda.us-east-1.amazonaws.com
+      - RUST_LOG=localfunctions=debug
+      # Dummy credentials for SigV4 signing (ElasticMQ ignores signatures).
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9600/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      traefik:
+        condition: service_healthy
+      dns:
+        condition: service_started
+      sqs:
+        condition: service_started
+
+  # ── SQS emulator (ElasticMQ) — queue URLs use amazonaws.com domain ────────
+  sqs:
+    image: softwaremill/elasticmq-native
+    container_name: localfunctions-traefik-sqs
+    networks:
+      testnet:
+    dns:
+      - 172.31.0.53
+    volumes:
+      - ./docker/traefik/elasticmq.conf:/opt/elasticmq.conf
+
+  # ── SNS emulator (local-sns) — uses DNS to reach Traefik for callbacks ────
+  sns:
+    image: jameskbride/local-sns
+    container_name: localfunctions-traefik-sns
+    networks:
+      testnet:
+    dns:
+      - 172.31.0.53
+    environment:
+      - AWS_ACCOUNT_ID=000000000000
+
+  # ── Test runner — executes integration tests inside the Docker network ────
+  test-runner:
+    image: rust:1.94
+    container_name: localfunctions-traefik-test-runner
+    networks:
+      testnet:
+    dns:
+      - 172.31.0.53
+    volumes:
+      - .:/workspace
+      - traefik-cargo-registry:/usr/local/cargo/registry
+      - traefik-cargo-target:/workspace/target
+      - certs:/certs:ro
+    working_dir: /workspace
+    environment:
+      - TRAEFIK_CA_CERT=/certs/rootCA.pem
+    depends_on:
+      localfunctions:
+        condition: service_healthy
+      traefik:
+        condition: service_healthy
+      dns:
+        condition: service_started
+      sqs:
+        condition: service_started
+      sns:
+        condition: service_started
+    command: cargo test --test docker_traefik_integration -- --ignored --test-threads=1 --nocapture
+
+networks:
+  testnet:
+    name: localfunctions-traefik-test
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+volumes:
+  certs:
+  traefik-cargo-registry:
+  traefik-cargo-target:

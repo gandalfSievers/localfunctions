@@ -1,0 +1,14 @@
+entryPoints:
+  websecure:
+    address: ":443"
+  web:
+    address: ":80"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+ping: {}
+
+log:
+  level: INFO

@@ -1,0 +1,80 @@
+tls:
+  certificates:
+    - certFile: /certs/cert.pem
+      keyFile: /certs/key.pem
+
+http:
+  routers:
+    # ── HTTPS routers (test-runner, localfunctions via LD_PRELOAD patcher) ──
+    sqs:
+      rule: "HostRegexp(`^sqs\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - websecure
+      service: sqs
+      tls: {}
+
+    sns:
+      rule: "HostRegexp(`^sns\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - websecure
+      service: sns
+      tls: {}
+
+    lambda-function:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.lambda\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - websecure
+      service: localfunctions
+      tls: {}
+      priority: 100
+
+    lambda:
+      rule: "HostRegexp(`^lambda\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - websecure
+      service: localfunctions
+      tls: {}
+      priority: 50
+
+    # ── HTTP routers (SNS callback from local-sns, which is Java-based) ─────
+    sqs-http:
+      rule: "HostRegexp(`^sqs\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - web
+      service: sqs
+
+    sns-http:
+      rule: "HostRegexp(`^sns\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - web
+      service: sns
+
+    lambda-function-http:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.lambda\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - web
+      service: localfunctions
+      priority: 100
+
+    lambda-http:
+      rule: "HostRegexp(`^lambda\\.[a-z0-9-]+\\.amazonaws\\.com$`)"
+      entryPoints:
+        - web
+      service: localfunctions
+      priority: 50
+
+  services:
+    sqs:
+      loadBalancer:
+        servers:
+          - url: "http://sqs:9324"
+
+    sns:
+      loadBalancer:
+        servers:
+          - url: "http://sns:9911"
+
+    localfunctions:
+      loadBalancer:
+        servers:
+          - url: "http://localfunctions:9600"

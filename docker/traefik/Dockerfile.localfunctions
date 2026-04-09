@@ -1,0 +1,26 @@
+# Extends localfunctions with webpki-roots-patcher so the Rust AWS SDK
+# trusts the mkcert CA certificate for HTTPS through Traefik.
+#
+# The patcher uses LD_PRELOAD to inject the custom CA from SSL_CERT_FILE
+# into the webpki-roots trust store at runtime — no source changes needed.
+FROM localfunctions:debian
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && \
+    . /root/.cargo/env && \
+    git clone https://github.com/tyilo/webpki-roots-patcher /tmp/patcher && \
+    cd /tmp/patcher && \
+    cargo build --release && \
+    cp target/release/libwebpki_roots_patcher.so /usr/local/lib/libwebpki_roots_patcher.so && \
+    rm -rf /tmp/patcher /root/.cargo /root/.rustup && \
+    apt-get purge -y git build-essential && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LD_PRELOAD=/usr/local/lib/libwebpki_roots_patcher.so
+ENV SSL_CERT_FILE=/certs/rootCA.pem
+
+USER app

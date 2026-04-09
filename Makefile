@@ -1,10 +1,11 @@
-.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-integration-eventsource _test-integration-eventsource test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
+.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-integration-eventsource _test-integration-eventsource test-integration-traefik _test-integration-traefik test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
 
 .DEFAULT_GOAL := help
 
 # Compose file variables
 COMPOSE_TEST := docker compose -f docker-compose.test.yml
 COMPOSE_AWSSTYLE := $(COMPOSE_TEST) -f docker-compose.test.awsstyle.yml
+COMPOSE_TRAEFIK := docker compose -f docker-compose.test.traefik.yml
 
 help: ## Show this help message
 	@echo "Usage: make [target]"
@@ -15,6 +16,7 @@ help: ## Show this help message
 	@echo "    make test-integration-pathstyle    - Run path-style tests (real Lambda containers)"
 	@echo "    make test-integration-awsstyle     - Run AWS-style vhost tests (in Docker with dnsmasq)"
 	@echo "    make test-integration-eventsource  - Run SQS/SNS event source tests (local-sns + ElasticMQ)"
+	@echo "    make test-integration-traefik      - Run Traefik TLS proxy tests (Lambda+SQS+SNS via HTTPS)"
 	@echo "    make test-all                      - Run all tests"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -148,6 +150,22 @@ _test-integration-eventsource:
 	$(COMPOSE_TEST) rm -f sns sqs; \
 	exit $$exit_code
 
+# Traefik TLS integration tests (Traefik reverse proxy with mkcert certs, test-runner in Docker)
+test-integration-traefik: docker-build-debian _test-integration-traefik ## Run Traefik TLS proxy integration tests
+
+_test-integration-traefik:
+	@echo "=========================================="
+	@echo "  TRAEFIK TLS integration tests"
+	@echo "=========================================="
+	@echo "Building localfunctions:traefik (with webpki-roots-patcher)..."
+	DOCKER_BUILDKIT=0 docker build -f docker/traefik/Dockerfile.localfunctions -t localfunctions:traefik .
+	@exit_code=0; \
+	$(COMPOSE_TRAEFIK) up -d --build; \
+	$(COMPOSE_TRAEFIK) run --rm test-runner || exit_code=$$?; \
+	docker ps -q --filter "network=localfunctions-traefik-test" | xargs -r docker rm -f 2>/dev/null; \
+	$(COMPOSE_TRAEFIK) down --remove-orphans; \
+	exit $$exit_code
+
 docker-test: test-integration ## Run integration tests (alias)
 
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -250,6 +268,7 @@ docker-up: ## Start container via docker compose (detached, with build)
 	docker compose up -d --build
 
 docker-down: ## Stop and remove all test containers
+	-$(COMPOSE_TRAEFIK) down --remove-orphans 2>/dev/null
 	-$(COMPOSE_AWSSTYLE) down --remove-orphans 2>/dev/null
 	-$(COMPOSE_TEST) down --remove-orphans 2>/dev/null
 	-docker compose down --remove-orphans 2>/dev/null
