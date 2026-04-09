@@ -77,8 +77,9 @@ pub fn parse_sns_subscriptions(raw: &[Value]) -> Vec<SnsSubscriptionConfig> {
 
 /// Build an SNS client with optional endpoint override.
 ///
-/// Uses `no_credentials()` because this is designed for local SNS-compatible
-/// services (LocalStack) that don't require authentication.
+/// Uses the default AWS credential chain so that callers can supply
+/// dummy credentials for SigV4 signing when using DNS-overridden
+/// AWS endpoints (e.g. routed to LocalStack via Traefik).
 async fn build_sns_client(
     region: &str,
     endpoint_url: Option<&str>,
@@ -87,8 +88,7 @@ async fn build_sns_client(
 
     let mut config_builder =
         aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(region.clone())
-            .no_credentials();
+            .region(region.clone());
 
     if let Some(endpoint) = endpoint_url {
         config_builder = config_builder.endpoint_url(endpoint);

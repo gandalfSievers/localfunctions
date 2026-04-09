@@ -131,7 +131,7 @@ Poll-based event sources are defined in the `event_source_mappings` array. local
 |---|---|---|---|
 | `function_name` | Yes | - | Target function (must exist in `functions`) |
 | `queue_url` | Yes | - | SQS queue URL |
-| `endpoint_url` | No | - | SQS endpoint override (e.g. ElasticMQ, LocalStack) |
+| `endpoint_url` | No | - | SQS endpoint override (e.g. ElasticMQ, LocalStack). Omit when using DNS-based routing with Traefik |
 | `batch_size` | No | `10` | Max messages per invocation (1-10) |
 | `maximum_batching_window_in_seconds` | No | `0` | Wait up to N seconds to fill a batch |
 | `function_response_types` | No | `[]` | Include `"ReportBatchItemFailures"` for partial batch failure support |
@@ -162,7 +162,7 @@ Push-based SNS subscriptions are defined in the `sns_subscriptions` array. On st
 |---|---|---|---|
 | `function_name` | Yes | - | Target function (must exist in `functions`) |
 | `topic_arn` | Yes | - | SNS topic ARN |
-| `endpoint_url` | No | - | SNS endpoint override (e.g. local-sns, LocalStack) |
+| `endpoint_url` | No | - | SNS endpoint override (e.g. local-sns, LocalStack). Omit when using DNS-based routing with Traefik |
 | `filter_policy` | No | `null` | SNS filter policy JSON (applied server-side by SNS) |
 | `filter_policy_scope` | No | `"MessageAttributes"` | Filter policy scope (`"MessageAttributes"` or `"MessageBody"`) |
 | `region` | No | global | AWS region override |
@@ -461,6 +461,8 @@ networks:
 ```
 
 Pair this with a local DNS resolver (e.g. dnsmasq) that points `*.amazonaws.com` at Traefik, and your AWS SDKs can connect over TLS just like in production.
+
+The same approach works for SQS and SNS endpoints. By routing `sqs.<region>.amazonaws.com` and `sns.<region>.amazonaws.com` through Traefik to ElasticMQ or local-sns, you can omit the `endpoint_url` override and use real AWS queue URLs directly. Set dummy AWS credentials (e.g. `AWS_ACCESS_KEY_ID=test`) so the SDK can complete SigV4 signing — the local services will accept any signature.
 
 ## Docker
 

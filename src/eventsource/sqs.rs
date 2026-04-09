@@ -284,8 +284,10 @@ impl SqsPoller {
 
     /// Build the SQS client with optional endpoint override.
     ///
-    /// Uses `no_credentials()` because this is designed for local SQS-compatible
-    /// services (LocalStack, ElasticMQ) that don't require authentication.
+    /// Uses the default AWS credential chain so that callers can supply
+    /// dummy credentials (e.g. `AWS_ACCESS_KEY_ID=test`) for SigV4 signing.
+    /// This allows the SDK to work with DNS-overridden AWS endpoints
+    /// (e.g. `sqs.us-east-1.amazonaws.com` routed to ElasticMQ via Traefik).
     async fn build_client(&self) -> SqsClient {
         let region = aws_sdk_sqs::config::Region::new(
             self.effective_region().to_string(),
@@ -294,8 +296,7 @@ impl SqsPoller {
         let mut config_builder = aws_config::defaults(
             aws_config::BehaviorVersion::latest(),
         )
-        .region(region.clone())
-        .no_credentials();
+        .region(region.clone());
 
         if let Some(ref endpoint) = self.config.endpoint_url {
             config_builder = config_builder.endpoint_url(endpoint);
