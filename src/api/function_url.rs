@@ -274,19 +274,29 @@ pub async fn function_url_handler(
                 Err(resp) => return resp.into_response(),
             };
 
-        info!(
-            payload_size = payload.len(),
-            timeout_secs,
-            container_id = %container_id,
-            "invoking function via Function URL"
-        );
+        if let Some(ref cid) = container_id {
+            info!(
+                payload_size = payload.len(),
+                timeout_secs,
+                container_id = %cid,
+                "invoking function via Function URL (cold start)"
+            );
+        } else {
+            info!(
+                payload_size = payload.len(),
+                timeout_secs,
+                "invoking function via Function URL (warm)"
+            );
+        }
 
-        // Stream container logs.
-        let log_handle = state.container_manager.stream_container_logs(
-            &container_id,
-            &function_name,
-            &request_id.to_string(),
-        );
+        // Stream container logs for cold starts.
+        let log_handle = container_id.as_ref().map(|cid| {
+            state.container_manager.stream_container_logs(
+                cid,
+                &function_name,
+                &request_id.to_string(),
+            )
+        });
 
         // Submit the invocation as streaming so we can support chunked responses.
         let trace_id = headers
@@ -309,8 +319,12 @@ pub async fn function_url_handler(
         {
             Ok(rx) => rx,
             Err(e) => {
-                log_handle.abort();
-                state.container_manager.release_container(&container_id).await;
+                if let Some(ref h) = log_handle {
+                    h.abort();
+                }
+                if let Some(ref cid) = container_id {
+                    state.container_manager.release_container(cid).await;
+                }
                 warn!(error = %e, "failed to submit invocation");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -377,8 +391,12 @@ pub async fn function_url_handler(
             }
         }
 
-        log_handle.abort();
-        state.container_manager.release_container(&container_id).await;
+        if let Some(ref h) = log_handle {
+            h.abort();
+        }
+        if let Some(ref cid) = container_id {
+            state.container_manager.release_container(cid).await;
+        }
 
         // Record metrics with actual duration and error/timeout status.
         state.metrics.record_invocation(

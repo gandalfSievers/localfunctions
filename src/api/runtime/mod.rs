@@ -110,12 +110,22 @@ async fn next_invocation(
             let response_tx = invocation.response_tx;
             let stream_tx = invocation.stream_tx;
 
-            // Store the response channel so /response and /error can forward
-            // results back to the original invoke caller.
+            // Mark this container as Busy now that it has picked up an
+            // invocation.  This is the single source of truth for the
+            // Idle → Busy transition — the invoke path only checks
+            // *whether* an idle container exists, it never mutates state.
             let dispatched_container_id = headers
                 .get(HEADER_CONTAINER_ID)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
+
+            if let Some(ref cid) = dispatched_container_id {
+                debug!(container_id = %cid, "container picked up invocation, marking Busy");
+                state
+                    .container_manager
+                    .set_state(cid, crate::types::ContainerState::Busy)
+                    .await;
+            }
 
             if let Some(stx) = stream_tx {
                 // Streaming invocation — store the mpsc sender.

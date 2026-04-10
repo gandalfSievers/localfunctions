@@ -2,6 +2,8 @@
 
 A local AWS Lambda emulator written in Rust. Run Lambda functions locally using real AWS Lambda runtime containers, supporting all major languages. Supports SQS event source mappings, SNS push subscriptions, Function URLs with API Gateway v1 and v2 payload formats, response streaming, virtual host routing, and hot reload.
 
+[Docker Hub](https://hub.docker.com/r/gandalfsievers/localfunctions)
+
 ## Quick start
 
 ### Prerequisites

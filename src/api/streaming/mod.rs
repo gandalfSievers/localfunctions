@@ -163,103 +163,115 @@ async fn invoke_function_streaming_inner(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
-    // Acquire a container (same logic as synchronous invoke).
-    let container_id = match state.container_manager.claim_idle_container(&function_name).await {
-        Some(id) => {
-            debug!(container_id = %id, "warm container claimed");
-            id
+    // Acquire a container: check for a warm idle container first, cold-start
+    // if none available. The actual Idle → Busy transition happens in /next.
+    let container_id: Option<String> = if state
+        .container_manager
+        .has_idle_container(&function_name)
+        .await
+    {
+        debug!("warm container available, submitting to channel");
+        None
+    } else {
+        let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
+        if !state.container_manager.acquire_container_slot(acquire_timeout).await {
+            let err = ServiceError::TooManyRequests(
+                "Rate exceeded: max concurrent containers reached".into(),
+            );
+            return streaming_error_response(request_id, err.status_code(), &err.to_aws_response());
         }
-        None => {
-            let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
-            if !state.container_manager.acquire_container_slot(acquire_timeout).await {
-                let err = ServiceError::TooManyRequests(
-                    "Rate exceeded: max concurrent containers reached".into(),
-                );
+
+        is_cold_start = true;
+        debug!("no warm container available, cold starting");
+        let cold_id = match state.container_manager.create_and_start(function_config).await {
+            Ok(id) => id,
+            Err(e) => {
+                state.container_manager.release_container_slot();
+                let err = ServiceError::ServiceException(e.to_string());
                 return streaming_error_response(request_id, err.status_code(), &err.to_aws_response());
             }
+        };
 
-            is_cold_start = true;
-            debug!("no warm container available, cold starting");
-            let cold_id = match state.container_manager.create_and_start(function_config).await {
-                Ok(id) => id,
-                Err(e) => {
-                    state.container_manager.release_container_slot();
-                    let err = ServiceError::ServiceException(e.to_string());
-                    return streaming_error_response(request_id, err.status_code(), &err.to_aws_response());
-                }
-            };
+        state
+            .container_manager
+            .set_state(&cold_id, ContainerState::Busy)
+            .await;
 
-            state
-                .container_manager
-                .set_state(&cold_id, ContainerState::Busy)
-                .await;
+        let ready_signal = state
+            .runtime_bridge
+            .register_ready_signal(&cold_id, Some(&function_name))
+            .await;
 
-            let ready_signal = state
-                .runtime_bridge
-                .register_ready_signal(&cold_id, Some(&function_name))
-                .await;
+        let init_timeout = Duration::from_secs(state.config.init_timeout);
+        let mgr = state.container_manager.clone();
+        let wait_id = cold_id.clone();
 
-            let init_timeout = Duration::from_secs(state.config.init_timeout);
-            let mgr = state.container_manager.clone();
-            let wait_id = cold_id.clone();
+        enum BootstrapOutcome {
+            Ready,
+            Exited(Option<i64>),
+            Timeout,
+        }
 
-            enum BootstrapOutcome {
-                Ready,
-                Exited(Option<i64>),
-                Timeout,
+        let outcome = tokio::select! {
+            _ = ready_signal.notified() => BootstrapOutcome::Ready,
+            exit_code = async { mgr.wait_for_exit(&wait_id).await } => {
+                BootstrapOutcome::Exited(exit_code)
             }
+            _ = tokio::time::sleep(init_timeout) => {
+                if state.runtime_bridge.is_ready(&cold_id).await {
+                    BootstrapOutcome::Ready
+                } else {
+                    BootstrapOutcome::Timeout
+                }
+            }
+        };
 
-            let outcome = tokio::select! {
-                _ = ready_signal.notified() => BootstrapOutcome::Ready,
-                exit_code = async { mgr.wait_for_exit(&wait_id).await } => {
-                    BootstrapOutcome::Exited(exit_code)
-                }
-                _ = tokio::time::sleep(init_timeout) => {
-                    if state.runtime_bridge.is_ready(&cold_id).await {
-                        BootstrapOutcome::Ready
-                    } else {
-                        BootstrapOutcome::Timeout
-                    }
-                }
-            };
-
-            match outcome {
-                BootstrapOutcome::Ready => cold_id,
-                BootstrapOutcome::Exited(exit_code) => {
-                    let (status, _headers, body) = bootstrap_failure_response(
-                        &state, &cold_id, &function_name, false, exit_code, invoke_base_headers(request_id),
-                    ).await;
-                    return axum::response::Response::builder()
-                        .status(status)
-                        .header("X-Amz-Request-Id", request_id.to_string())
-                        .body(Body::from(body))
-                        .unwrap();
-                }
-                BootstrapOutcome::Timeout => {
-                    let (status, _headers, body) = bootstrap_failure_response(
-                        &state, &cold_id, &function_name, true, None, invoke_base_headers(request_id),
-                    ).await;
-                    return axum::response::Response::builder()
-                        .status(status)
-                        .header("X-Amz-Request-Id", request_id.to_string())
-                        .body(Body::from(body))
-                        .unwrap();
-                }
+        match outcome {
+            BootstrapOutcome::Ready => Some(cold_id),
+            BootstrapOutcome::Exited(exit_code) => {
+                let (status, _headers, body) = bootstrap_failure_response(
+                    &state, &cold_id, &function_name, false, exit_code, invoke_base_headers(request_id),
+                ).await;
+                return axum::response::Response::builder()
+                    .status(status)
+                    .header("X-Amz-Request-Id", request_id.to_string())
+                    .body(Body::from(body))
+                    .unwrap();
+            }
+            BootstrapOutcome::Timeout => {
+                let (status, _headers, body) = bootstrap_failure_response(
+                    &state, &cold_id, &function_name, true, None, invoke_base_headers(request_id),
+                ).await;
+                return axum::response::Response::builder()
+                    .status(status)
+                    .header("X-Amz-Request-Id", request_id.to_string())
+                    .body(Body::from(body))
+                    .unwrap();
             }
         }
     };
 
-    info!(
-        payload_size = body.len(),
-        timeout_secs,
-        container_id = %container_id,
-        "invoking function (streaming)"
-    );
+    if let Some(ref cid) = container_id {
+        info!(
+            payload_size = body.len(),
+            timeout_secs,
+            container_id = %cid,
+            "invoking function (streaming, cold start)"
+        );
+    } else {
+        info!(
+            payload_size = body.len(),
+            timeout_secs,
+            "invoking function (streaming, warm)"
+        );
+    }
 
-    // Start streaming container logs.
-    let log_handle = state
-        .container_manager
-        .stream_container_logs(&container_id, &function_name, &request_id.to_string());
+    // Start streaming container logs for cold starts.
+    let log_handle = container_id.as_ref().map(|cid| {
+        state
+            .container_manager
+            .stream_container_logs(cid, &function_name, &request_id.to_string())
+    });
 
     // Submit streaming invocation.
     let mut stream_rx = match state
@@ -269,8 +281,12 @@ async fn invoke_function_streaming_inner(
     {
         Ok(rx) => rx,
         Err(e) => {
-            log_handle.abort();
-            state.container_manager.release_container(&container_id).await;
+            if let Some(ref h) = log_handle {
+                h.abort();
+            }
+            if let Some(ref cid) = container_id {
+                state.container_manager.release_container(cid).await;
+            }
             let err = ServiceError::ServiceException(e.to_string());
             return streaming_error_response(request_id, StatusCode::BAD_GATEWAY, &err.to_aws_response());
         }
@@ -285,7 +301,7 @@ async fn invoke_function_streaming_inner(
     // Build a streaming response. We read from stream_rx with the function
     // timeout and encode each chunk as an AWS event stream PayloadChunk.
     let state_clone = state.clone();
-    let container_id_clone = container_id.clone();
+    let container_id_clone = container_id;
     let function_name_clone = function_name.clone();
 
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -335,12 +351,14 @@ async fn invoke_function_streaming_inner(
                     let frame = eventstream::encode_error(&error_code, &error_details);
                     let _ = body_tx.send(Ok(Bytes::from(frame))).await;
 
-                    // Kill the container.
-                    let cid = container_id_clone.clone();
-                    let mgr = state_clone.container_manager.clone();
-                    tokio::spawn(async move {
-                        let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
-                    });
+                    // Kill the container if we know which one it is.
+                    if let Some(ref cid) = container_id_clone {
+                        let cid = cid.clone();
+                        let mgr = state_clone.container_manager.clone();
+                        tokio::spawn(async move {
+                            let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
+                        });
+                    }
                     break;
                 }
             }
@@ -348,13 +366,17 @@ async fn invoke_function_streaming_inner(
 
         // Send InvokeComplete frame.
         let log_result = if log_type_tail {
-            const LOG_TAIL_MAX_BYTES: usize = 4096;
-            let logs = state_clone
-                .container_manager
-                .get_container_logs(&container_id_clone, LOG_TAIL_MAX_BYTES)
-                .await;
-            if !logs.is_empty() {
-                base64::engine::general_purpose::STANDARD.encode(logs.as_bytes())
+            if let Some(ref cid) = container_id_clone {
+                const LOG_TAIL_MAX_BYTES: usize = 4096;
+                let logs = state_clone
+                    .container_manager
+                    .get_container_logs(cid, LOG_TAIL_MAX_BYTES)
+                    .await;
+                if !logs.is_empty() {
+                    base64::engine::general_purpose::STANDARD.encode(logs.as_bytes())
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             }
@@ -370,7 +392,9 @@ async fn invoke_function_streaming_inner(
         let _ = body_tx.send(Ok(Bytes::from(complete_frame))).await;
 
         // Stop log streaming.
-        log_handle.abort();
+        if let Some(ref h) = log_handle {
+            h.abort();
+        }
 
         // Record metrics.
         state_clone.metrics.record_invocation(

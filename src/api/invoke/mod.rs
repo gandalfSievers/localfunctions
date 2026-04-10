@@ -254,105 +254,122 @@ pub(crate) async fn invoke_function_inner(
     // Compute the deadline from the function's configured timeout.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
-    // Ensure a container is available for this function. Try to claim a warm
-    // idle container first; if none are available, acquire a container slot
-    // and cold-start a new one. If all container slots are taken, wait up to
-    // container_acquire_timeout before rejecting with 429.
-    let container_id = match state.container_manager.claim_idle_container(&function_name).await {
-        Some(id) => {
-            debug!(container_id = %id, "warm container claimed");
-            id
+    // Ensure a container is available for this function. Check whether a warm
+    // idle container exists; if not, acquire a container slot and cold-start a
+    // new one. The actual Idle → Busy transition happens in the /next handler
+    // when a container picks up the invocation from the shared channel.
+    //
+    // `container_id` is Some only for cold starts (where we know the exact
+    // container). For warm reuse it is None — the /next handler will record
+    // the real container in `pending_invocations`.
+    let container_id: Option<String> = if state
+        .container_manager
+        .has_idle_container(&function_name)
+        .await
+    {
+        debug!("warm container available, submitting to channel");
+        None
+    } else {
+        let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
+        if !state.container_manager.acquire_container_slot(acquire_timeout).await {
+            let err = ServiceError::TooManyRequests(
+                "Rate exceeded: max concurrent containers reached".into(),
+            );
+            return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
         }
-        None => {
-            let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
-            if !state.container_manager.acquire_container_slot(acquire_timeout).await {
-                let err = ServiceError::TooManyRequests(
-                    "Rate exceeded: max concurrent containers reached".into(),
+
+        is_cold_start = true;
+        debug!("no warm container available, cold starting");
+        let cold_id = match state.container_manager.create_and_start(function_config).await {
+            Ok(id) => id,
+            Err(e) => {
+                // Release the container slot since no container was created.
+                state.container_manager.release_container_slot();
+                let err = ServiceError::ServiceException(e.to_string());
+                return (
+                    err.status_code(),
+                    invoke_base_headers(request_id),
+                    err.to_aws_response().to_json_bytes(),
                 );
-                return (err.status_code(), invoke_base_headers(request_id), err.to_aws_response().to_json_bytes());
             }
+        };
 
-            is_cold_start = true;
-            debug!("no warm container available, cold starting");
-            let cold_id = match state.container_manager.create_and_start(function_config).await {
-                Ok(id) => id,
-                Err(e) => {
-                    // Release the container slot since no container was created.
-                    state.container_manager.release_container_slot();
-                    let err = ServiceError::ServiceException(e.to_string());
-                    return (
-                        err.status_code(),
-                        invoke_base_headers(request_id),
-                        err.to_aws_response().to_json_bytes(),
-                    );
-                }
-            };
+        state
+            .container_manager
+            .set_state(&cold_id, ContainerState::Busy)
+            .await;
 
-            state
-                .container_manager
-                .set_state(&cold_id, ContainerState::Busy)
-                .await;
+        // Wait for the container's bootstrap process to complete (first
+        // /next call). Detect bootstrap failures early rather than waiting
+        // for the full function timeout.
+        let ready_signal = state
+            .runtime_bridge
+            .register_ready_signal(&cold_id, Some(&function_name))
+            .await;
 
-            // Wait for the container's bootstrap process to complete (first
-            // /next call). Detect bootstrap failures early rather than waiting
-            // for the full function timeout.
-            let ready_signal = state
-                .runtime_bridge
-                .register_ready_signal(&cold_id, Some(&function_name))
-                .await;
+        let init_timeout = Duration::from_secs(state.config.init_timeout);
+        let mgr = state.container_manager.clone();
+        let wait_id = cold_id.clone();
 
-            let init_timeout = Duration::from_secs(state.config.init_timeout);
-            let mgr = state.container_manager.clone();
-            let wait_id = cold_id.clone();
+        enum BootstrapOutcome {
+            Ready,
+            Exited(Option<i64>),
+            Timeout,
+        }
 
-            enum BootstrapOutcome {
-                Ready,
-                Exited(Option<i64>),
-                Timeout,
+        let outcome = tokio::select! {
+            _ = ready_signal.notified() => BootstrapOutcome::Ready,
+            exit_code = async { mgr.wait_for_exit(&wait_id).await } => {
+                BootstrapOutcome::Exited(exit_code)
             }
+            _ = tokio::time::sleep(init_timeout) => {
+                // Check if it became ready in the meantime
+                if state.runtime_bridge.is_ready(&cold_id).await {
+                    BootstrapOutcome::Ready
+                } else {
+                    BootstrapOutcome::Timeout
+                }
+            }
+        };
 
-            let outcome = tokio::select! {
-                _ = ready_signal.notified() => BootstrapOutcome::Ready,
-                exit_code = async { mgr.wait_for_exit(&wait_id).await } => {
-                    BootstrapOutcome::Exited(exit_code)
-                }
-                _ = tokio::time::sleep(init_timeout) => {
-                    // Check if it became ready in the meantime
-                    if state.runtime_bridge.is_ready(&cold_id).await {
-                        BootstrapOutcome::Ready
-                    } else {
-                        BootstrapOutcome::Timeout
-                    }
-                }
-            };
-
-            match outcome {
-                BootstrapOutcome::Ready => cold_id,
-                BootstrapOutcome::Exited(exit_code) => {
-                    return bootstrap_failure_response(
-                        &state, &cold_id, &function_name, false, exit_code, invoke_base_headers(request_id),
-                    ).await;
-                }
-                BootstrapOutcome::Timeout => {
-                    return bootstrap_failure_response(
-                        &state, &cold_id, &function_name, true, None, invoke_base_headers(request_id),
-                    ).await;
-                }
+        match outcome {
+            BootstrapOutcome::Ready => Some(cold_id),
+            BootstrapOutcome::Exited(exit_code) => {
+                return bootstrap_failure_response(
+                    &state, &cold_id, &function_name, false, exit_code, invoke_base_headers(request_id),
+                ).await;
+            }
+            BootstrapOutcome::Timeout => {
+                return bootstrap_failure_response(
+                    &state, &cold_id, &function_name, true, None, invoke_base_headers(request_id),
+                ).await;
             }
         }
     };
 
-    info!(
-        payload_size = body.len(),
-        timeout_secs,
-        container_id = %container_id,
-        "invoking function"
-    );
+    if let Some(ref cid) = container_id {
+        info!(
+            payload_size = body.len(),
+            timeout_secs,
+            container_id = %cid,
+            "invoking function (cold start)"
+        );
+    } else {
+        info!(
+            payload_size = body.len(),
+            timeout_secs,
+            "invoking function (warm)"
+        );
+    }
 
-    // Start streaming container stdout/stderr in the background.
-    let log_handle = state
-        .container_manager
-        .stream_container_logs(&container_id, &function_name, &request_id.to_string());
+    // Start streaming container stdout/stderr in the background for cold
+    // starts where we know the container ID. For warm reuse the /next handler
+    // determines the actual container; logs are still available via Docker.
+    let log_handle = container_id.as_ref().map(|cid| {
+        state
+            .container_manager
+            .stream_container_logs(cid, &function_name, &request_id.to_string())
+    });
 
     // Submit the invocation to the runtime bridge.
     let response_rx = match state
@@ -363,8 +380,12 @@ pub(crate) async fn invoke_function_inner(
         Ok(rx) => rx,
         Err(e) => {
             // If submit fails (e.g. channel closed), release the container.
-            log_handle.abort();
-            state.container_manager.release_container(&container_id).await;
+            if let Some(ref h) = log_handle {
+                h.abort();
+            }
+            if let Some(ref cid) = container_id {
+                state.container_manager.release_container(cid).await;
+            }
             let err = ServiceError::ServiceException(e.to_string());
             return (
                 StatusCode::BAD_GATEWAY,
@@ -447,11 +468,12 @@ pub(crate) async fn invoke_function_inner(
                 .runtime_bridge
                 .timeout_invocation(request_id)
                 .await;
-            let cid = crashed_container.unwrap_or_else(|| container_id.clone());
-            let mgr = state.container_manager.clone();
-            tokio::spawn(async move {
-                let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
-            });
+            if let Some(cid) = crashed_container.or_else(|| container_id.clone()) {
+                let mgr = state.container_manager.clone();
+                tokio::spawn(async move {
+                    let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
+                });
+            }
 
             let err = ServiceError::ServiceException(
                 "Container exited without responding".into(),
@@ -474,11 +496,12 @@ pub(crate) async fn invoke_function_inner(
                 .await;
 
             // Kill the container in the background with a short grace period.
-            let cid = timed_out_container.unwrap_or_else(|| container_id.clone());
-            let mgr = state.container_manager.clone();
-            tokio::spawn(async move {
-                let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
-            });
+            if let Some(cid) = timed_out_container.or_else(|| container_id.clone()) {
+                let mgr = state.container_manager.clone();
+                tokio::spawn(async move {
+                    let _ = mgr.stop_and_remove(&cid, Duration::from_secs(2)).await;
+                });
+            }
 
             let mut resp_headers = invoke_base_headers(request_id);
             resp_headers.insert("X-Amz-Function-Error", "Unhandled".parse().unwrap());
@@ -490,20 +513,24 @@ pub(crate) async fn invoke_function_inner(
     };
 
     // Stop streaming container logs now that the invocation is complete.
-    log_handle.abort();
+    if let Some(ref h) = log_handle {
+        h.abort();
+    }
 
     // If LogType is Tail, collect the last 4KB of logs and add as a base64-encoded
     // response header. Only applies to synchronous (RequestResponse) invocations.
     if log_type_tail {
-        const LOG_TAIL_MAX_BYTES: usize = 4096;
-        let logs = state
-            .container_manager
-            .get_container_logs(&container_id, LOG_TAIL_MAX_BYTES)
-            .await;
-        if !logs.is_empty() {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(logs.as_bytes());
-            if let Ok(value) = encoded.parse() {
-                response.1.insert("X-Amz-Log-Result", value);
+        if let Some(ref cid) = container_id {
+            const LOG_TAIL_MAX_BYTES: usize = 4096;
+            let logs = state
+                .container_manager
+                .get_container_logs(cid, LOG_TAIL_MAX_BYTES)
+                .await;
+            if !logs.is_empty() {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(logs.as_bytes());
+                if let Ok(value) = encoded.parse() {
+                    response.1.insert("X-Amz-Log-Result", value);
+                }
             }
         }
     }
@@ -844,20 +871,21 @@ pub(crate) async fn bootstrap_failure_response(
 // ---------------------------------------------------------------------------
 
 /// Acquire a container for the given function, reusing a warm one or cold-
-/// starting a new one.  Returns the container ID on success or an HTTP error
-/// tuple that the caller can return directly.
+/// starting a new one.  Returns `Ok(Some(id))` for cold-starts, `Ok(None)`
+/// when a warm container is available (the actual container is determined by
+/// the `/next` handler), or an HTTP error tuple.
 pub(crate) async fn acquire_container(
     state: &AppState,
     function_config: &crate::types::FunctionConfig,
     request_id: &Uuid,
-) -> Result<String, (StatusCode, HeaderMap, axum::body::Body)> {
+) -> Result<Option<String>, (StatusCode, HeaderMap, axum::body::Body)> {
     use axum::body::Body;
 
     let function_name = &function_config.name;
 
-    if let Some(id) = state.container_manager.claim_idle_container(function_name).await {
-        debug!(container_id = %id, "warm container claimed");
-        return Ok(id);
+    if state.container_manager.has_idle_container(function_name).await {
+        debug!("warm container available, submitting to channel");
+        return Ok(None);
     }
 
     let acquire_timeout = Duration::from_secs(state.config.container_acquire_timeout);
@@ -917,7 +945,7 @@ pub(crate) async fn acquire_container(
     };
 
     match outcome {
-        BootstrapOutcome::Ready => Ok(cold_id),
+        BootstrapOutcome::Ready => Ok(Some(cold_id)),
         BootstrapOutcome::Exited(exit_code) => {
             let (status, _, body) = bootstrap_failure_response(
                 state, &cold_id, function_name, false, exit_code, invoke_base_headers(*request_id),

@@ -986,32 +986,18 @@ impl ContainerManager {
         self.containers.read().await.values().cloned().collect()
     }
 
-    /// Atomically claim an idle container for a function and mark it Busy.
+    /// Check whether at least one idle container exists for a function.
     ///
-    /// Uses FIFO selection (oldest `last_used` first) so that containers idle
-    /// the longest are reused first, giving the reaper a consistent window to
-    /// reap the most recently used ones.
-    ///
-    /// Returns the container ID if an idle container was found.
-    pub async fn claim_idle_container(&self, function_name: &str) -> Option<String> {
-        let mut containers = self.containers.write().await;
-        let oldest_idle = containers
+    /// This is a read-only check — it does **not** change any container state.
+    /// The actual `Idle → Busy` transition happens in the `/next` handler when
+    /// a container picks up an invocation from the shared channel, which
+    /// guarantees the container that is marked Busy is the one that actually
+    /// received the work.
+    pub async fn has_idle_container(&self, function_name: &str) -> bool {
+        let containers = self.containers.read().await;
+        containers
             .values()
-            .filter(|c| c.function_name == function_name && c.state == ContainerState::Idle)
-            .min_by_key(|c| c.last_used)
-            .map(|c| c.container_id.clone());
-
-        if let Some(ref id) = oldest_idle {
-            if let Some(entry) = containers.get_mut(id) {
-                debug!(
-                    container_id = %id,
-                    function = %function_name,
-                    "reusing warm container"
-                );
-                entry.state = ContainerState::Busy;
-            }
-        }
-        oldest_idle
+            .any(|c| c.function_name == function_name && c.state == ContainerState::Idle)
     }
 
     /// Release a container back to the idle pool after an invocation completes.
@@ -2194,97 +2180,66 @@ mod tests {
     // -- Warm container pool ------------------------------------------------
 
     #[tokio::test]
-    async fn claim_idle_container_returns_none_when_empty() {
+    async fn has_idle_container_returns_false_when_empty() {
         let mgr = make_container_manager();
-        assert!(mgr.claim_idle_container("test-func").await.is_none());
+        assert!(!mgr.has_idle_container("test-func").await);
     }
 
     #[tokio::test]
-    async fn claim_idle_container_returns_idle_container() {
+    async fn has_idle_container_returns_true_for_idle_container() {
         let mgr = make_container_manager();
         mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
             .await;
 
-        let claimed = mgr.claim_idle_container("test-func").await;
-        assert_eq!(claimed, Some("ctr-1".to_string()));
+        assert!(mgr.has_idle_container("test-func").await);
 
-        // Container should now be Busy
-        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Busy));
+        // Container state should NOT change (read-only check)
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Idle));
     }
 
     #[tokio::test]
-    async fn claim_idle_container_skips_busy_containers() {
+    async fn has_idle_container_returns_false_for_busy_containers() {
         let mgr = make_container_manager();
         mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
             .await;
 
-        assert!(mgr.claim_idle_container("test-func").await.is_none());
+        assert!(!mgr.has_idle_container("test-func").await);
     }
 
     #[tokio::test]
-    async fn claim_idle_container_skips_wrong_function() {
+    async fn has_idle_container_returns_false_for_wrong_function() {
         let mgr = make_container_manager();
         mgr.insert_test_container("ctr-1".into(), "other-func".into(), ContainerState::Idle)
             .await;
 
-        assert!(mgr.claim_idle_container("test-func").await.is_none());
+        assert!(!mgr.has_idle_container("test-func").await);
     }
 
     #[tokio::test]
-    async fn claim_idle_container_fifo_selects_oldest() {
-        let mgr = make_container_manager();
-
-        // Insert two idle containers with different last_used times
-        {
-            let mut containers = mgr.containers.write().await;
-            containers.insert(
-                "ctr-old".to_string(),
-                ManagedContainer {
-                    container_id: "ctr-old".into(),
-                    function_name: "test-func".into(),
-                    state: ContainerState::Idle,
-                    image: "test:latest".into(),
-                    last_used: Instant::now() - Duration::from_secs(60),
-                    merged_layers_dir: None,
-                },
-            );
-            containers.insert(
-                "ctr-new".to_string(),
-                ManagedContainer {
-                    container_id: "ctr-new".into(),
-                    function_name: "test-func".into(),
-                    state: ContainerState::Idle,
-                    image: "test:latest".into(),
-                    last_used: Instant::now(),
-                    merged_layers_dir: None,
-                },
-            );
-        }
-
-        // FIFO should pick the oldest
-        let claimed = mgr.claim_idle_container("test-func").await;
-        assert_eq!(claimed, Some("ctr-old".to_string()));
-        assert_eq!(mgr.get_state("ctr-old").await, Some(ContainerState::Busy));
-        assert_eq!(mgr.get_state("ctr-new").await, Some(ContainerState::Idle));
-    }
-
-    #[tokio::test]
-    async fn claim_idle_container_second_claim_gets_next() {
+    async fn has_idle_container_returns_true_with_multiple_idle() {
         let mgr = make_container_manager();
         mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
             .await;
         mgr.insert_test_container("ctr-2".into(), "test-func".into(), ContainerState::Idle)
             .await;
 
-        let first = mgr.claim_idle_container("test-func").await;
-        assert!(first.is_some());
+        assert!(mgr.has_idle_container("test-func").await);
 
-        let second = mgr.claim_idle_container("test-func").await;
-        assert!(second.is_some());
-        assert_ne!(first, second);
+        // Neither container's state should change (read-only check)
+        assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Idle));
+        assert_eq!(mgr.get_state("ctr-2").await, Some(ContainerState::Idle));
+    }
 
-        // Third claim should fail — both are busy
-        assert!(mgr.claim_idle_container("test-func").await.is_none());
+    #[tokio::test]
+    async fn has_idle_container_mixed_states() {
+        let mgr = make_container_manager();
+        // One busy, one idle — should still return true
+        mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Busy)
+            .await;
+        mgr.insert_test_container("ctr-2".into(), "test-func".into(), ContainerState::Idle)
+            .await;
+
+        assert!(mgr.has_idle_container("test-func").await);
     }
 
     // -- count_active_by_function -------------------------------------------
@@ -2464,26 +2419,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_container_lifecycle_claim_release_reuse() {
+    async fn warm_container_lifecycle_set_busy_release_reuse() {
         let mgr = make_container_manager();
         mgr.insert_test_container("ctr-1".into(), "test-func".into(), ContainerState::Idle)
             .await;
 
-        // Claim
-        let claimed = mgr.claim_idle_container("test-func").await;
-        assert_eq!(claimed, Some("ctr-1".to_string()));
+        // Check idle and simulate /next handler setting Busy
+        assert!(mgr.has_idle_container("test-func").await);
+        mgr.set_state("ctr-1", ContainerState::Busy).await;
         assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Busy));
 
         // No more idle containers
-        assert!(mgr.claim_idle_container("test-func").await.is_none());
+        assert!(!mgr.has_idle_container("test-func").await);
 
         // Release
         mgr.release_container("ctr-1").await;
         assert_eq!(mgr.get_state("ctr-1").await, Some(ContainerState::Idle));
 
-        // Can claim again
-        let reclaimed = mgr.claim_idle_container("test-func").await;
-        assert_eq!(reclaimed, Some("ctr-1".to_string()));
+        // Can find idle again
+        assert!(mgr.has_idle_container("test-func").await);
     }
 
     // -- container_extra_hosts -----------------------------------------------
@@ -2536,8 +2490,8 @@ mod tests {
 
         mgr.mark_container_failed("ctr-1").await;
 
-        // Should not be claimable
-        assert!(mgr.claim_idle_container("test-func").await.is_none());
+        // Should not have any idle containers
+        assert!(!mgr.has_idle_container("test-func").await);
         assert_eq!(mgr.count().await, 0);
     }
 
@@ -2551,11 +2505,8 @@ mod tests {
 
         mgr.mark_container_failed("ctr-1").await;
 
-        // ctr-2 should still be claimable
-        assert_eq!(
-            mgr.claim_idle_container("test-func").await,
-            Some("ctr-2".to_string())
-        );
+        // ctr-2 should still be found as idle
+        assert!(mgr.has_idle_container("test-func").await);
     }
 
     // -- handle_container_event ------------------------------------------------

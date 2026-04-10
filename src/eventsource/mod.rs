@@ -96,69 +96,71 @@ pub async fn invoke_function_with_event(
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
-    // Acquire a container: try warm first, then cold-start.
-    let _container_id = match state
+    // Acquire a container: check for warm idle first, cold-start if needed.
+    // The actual Idle → Busy transition happens in the /next handler.
+    if !state
         .container_manager
-        .claim_idle_container(function_name)
+        .has_idle_container(function_name)
         .await
     {
-        Some(id) => id,
-        None => {
-            let acquire_timeout = std::time::Duration::from_secs(
-                state.config.container_acquire_timeout,
-            );
-            if !state
-                .container_manager
-                .acquire_container_slot(acquire_timeout)
-                .await
-            {
-                return Err("max concurrent containers reached".into());
+        let acquire_timeout = std::time::Duration::from_secs(
+            state.config.container_acquire_timeout,
+        );
+        if !state
+            .container_manager
+            .acquire_container_slot(acquire_timeout)
+            .await
+        {
+            return Err("max concurrent containers reached".into());
+        }
+
+        let cold_id = match state
+            .container_manager
+            .create_and_start(function_config)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                state.container_manager.release_container_slot();
+                return Err(format!("failed to start container: {}", e));
             }
+        };
 
-            let cold_id = match state
-                .container_manager
-                .create_and_start(function_config)
-                .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    state.container_manager.release_container_slot();
-                    return Err(format!("failed to start container: {}", e));
-                }
-            };
+        state
+            .container_manager
+            .set_state(
+                &cold_id,
+                crate::types::ContainerState::Busy,
+            )
+            .await;
 
-            state
-                .container_manager
-                .set_state(
-                    &cold_id,
-                    crate::types::ContainerState::Busy,
-                )
-                .await;
+        // Wait for bootstrap
+        let ready_signal = state
+            .runtime_bridge
+            .register_ready_signal(&cold_id, Some(function_name))
+            .await;
 
-            // Wait for bootstrap
-            let ready_signal = state
-                .runtime_bridge
-                .register_ready_signal(&cold_id, Some(function_name))
-                .await;
+        let init_timeout =
+            std::time::Duration::from_secs(state.config.init_timeout);
 
-            let init_timeout =
-                std::time::Duration::from_secs(state.config.init_timeout);
-
-            tokio::select! {
-                _ = ready_signal.notified() => cold_id,
-                _ = tokio::time::sleep(init_timeout) => {
-                    if state.runtime_bridge.is_ready(&cold_id).await {
-                        cold_id
-                    } else {
-                        return Err(format!(
-                            "container bootstrap timed out for '{}'",
-                            function_name
-                        ));
-                    }
+        tokio::select! {
+            _ = ready_signal.notified() => {}
+            _ = tokio::time::sleep(init_timeout) => {
+                if !state.runtime_bridge.is_ready(&cold_id).await {
+                    // Clean up the failed container and release the slot.
+                    let mgr = state.container_manager.clone();
+                    let cid = cold_id.clone();
+                    tokio::spawn(async move {
+                        let _ = mgr.stop_and_remove(&cid, std::time::Duration::from_secs(2)).await;
+                    });
+                    return Err(format!(
+                        "container bootstrap timed out for '{}'",
+                        function_name
+                    ));
                 }
             }
         }
-    };
+    }
 
     // Submit the invocation via RuntimeBridge
     let response_rx = state
@@ -176,7 +178,16 @@ pub async fn invoke_function_with_event(
     {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(_)) => Err("invocation response channel closed".into()),
-        Err(_) => Ok(InvocationResult::Timeout),
+        Err(_) => {
+            // Clean up the pending invocation and kill the container.
+            if let Some(cid) = state.runtime_bridge.timeout_invocation(request_id).await {
+                let mgr = state.container_manager.clone();
+                tokio::spawn(async move {
+                    let _ = mgr.stop_and_remove(&cid, std::time::Duration::from_secs(2)).await;
+                });
+            }
+            Ok(InvocationResult::Timeout)
+        }
     }
 }
 
