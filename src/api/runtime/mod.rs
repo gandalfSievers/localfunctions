@@ -65,10 +65,12 @@ async fn next_invocation(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Identify the function this container serves.
+    // Identify the function and (optionally) the specific container.
     // First try the explicit header, then fall back to extracting from the
-    // Host header (e.g. "python-hello.runtime.local:9601").
-    let function_name = match resolve_function_name(&headers) {
+    // Host header (e.g. "python-hello.cid-abc12345.runtime.local:9601").
+    let (resolved_function, resolved_runtime_id) = resolve_function_and_container(&headers);
+
+    let function_name = match resolved_function {
         Some(name) => name,
         None => {
             warn!("runtime /next called without function identification");
@@ -85,16 +87,24 @@ async fn next_invocation(
         return (err.status_code(), HeaderMap::new(), err.to_aws_response().to_json_bytes());
     }
 
+    // Resolve the Docker container ID from the runtime identifier embedded
+    // in the hostname, or fall back to the explicit header (used by tests).
+    let resolved_container_id = if let Some(ref rid) = resolved_runtime_id {
+        state.container_manager.find_by_runtime_id(rid).await
+    } else {
+        headers
+            .get(HEADER_CONTAINER_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+
     // Mark container as ready on first /next call (cold start complete).
-    let container_id = headers
-        .get(HEADER_CONTAINER_ID)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(&function_name);
-    state.runtime_bridge.mark_ready(container_id).await;
+    let container_id_for_ready = resolved_container_id.as_deref().unwrap_or(&function_name);
+    state.runtime_bridge.mark_ready(container_id_for_ready).await;
 
     debug!(
         function = %function_name,
-        container_id = %container_id,
+        container_id = %container_id_for_ready,
         "container long-polling for next invocation"
     );
 
@@ -114,10 +124,7 @@ async fn next_invocation(
             // invocation.  This is the single source of truth for the
             // Idle → Busy transition — the invoke path only checks
             // *whether* an idle container exists, it never mutates state.
-            let dispatched_container_id = headers
-                .get(HEADER_CONTAINER_ID)
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
+            let dispatched_container_id = resolved_container_id.clone();
 
             if let Some(ref cid) = dispatched_container_id {
                 debug!(container_id = %cid, "container picked up invocation, marking Busy");
@@ -239,29 +246,45 @@ struct RuntimeErrorRequest {
     stackTrace: Vec<String>,
 }
 
-/// Resolve the function name from request headers.
+/// Resolve the function name and optional runtime container identifier from
+/// request headers.
 ///
 /// Tries the explicit `Lambda-Runtime-Function-Name` header first, then falls
-/// back to extracting the function name from the HTTP `Host` header. When
-/// `AWS_LAMBDA_RUNTIME_API` is set to `{function}.runtime.local:{port}`, the
-/// standard Lambda RIC sends this as the Host header automatically.
-fn resolve_function_name(headers: &HeaderMap) -> Option<String> {
+/// back to extracting from the HTTP `Host` header.
+///
+/// Host header formats:
+/// - `{function}.cid-{runtime_id}.runtime.local:{port}` — identifies both
+///   function and specific container (used by real containers).
+/// - `{function}.runtime.local:{port}` — identifies only the function
+///   (legacy / backward compat).
+///
+/// Returns `(function_name, runtime_id)` where `runtime_id` is `Some` when
+/// the container can be identified from the hostname.
+fn resolve_function_and_container(headers: &HeaderMap) -> (Option<String>, Option<String>) {
     // Explicit header (used by simulated runtimes and custom clients).
     if let Some(name) = headers.get(HEADER_FUNCTION_NAME).and_then(|v| v.to_str().ok()) {
-        return Some(name.to_string());
+        return (Some(name.to_string()), None);
     }
 
-    // Fall back to Host header: "{function}.runtime.local:{port}"
+    // Fall back to Host header.
     if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
         let host_no_port = host.split(':').next().unwrap_or(host);
-        if let Some(function_name) = host_no_port.strip_suffix(RUNTIME_HOST_SUFFIX) {
-            if !function_name.is_empty() {
-                return Some(function_name.to_string());
+        if let Some(remainder) = host_no_port.strip_suffix(RUNTIME_HOST_SUFFIX) {
+            if !remainder.is_empty() {
+                // Try to parse container-specific hostname:
+                // "{function}.cid-{runtime_id}" → split on ".cid-"
+                if let Some((function_name, runtime_id)) = remainder.split_once(".cid-") {
+                    if !function_name.is_empty() && !runtime_id.is_empty() {
+                        return (Some(function_name.to_string()), Some(runtime_id.to_string()));
+                    }
+                }
+                // Legacy format: just the function name
+                return (Some(remainder.to_string()), None);
             }
         }
     }
 
-    None
+    (None, None)
 }
 
 /// Parse a runtime error from the request body and optional header.
@@ -506,7 +529,8 @@ async fn init_error(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let function_name = match resolve_function_name(&headers) {
+    let (resolved_function, _) = resolve_function_and_container(&headers);
+    let function_name = match resolved_function {
         Some(name) => name,
         None => {
             warn!("runtime /init/error called without function identification");

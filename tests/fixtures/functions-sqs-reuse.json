@@ -1,0 +1,30 @@
+{
+  "functions": {
+    "python-sqs-consumer": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./python-sqs-consumer",
+      "timeout": 30,
+      "memory_size": 128
+    },
+    "python-hello": {
+      "runtime": "python3.12",
+      "handler": "main.handler",
+      "code_path": "./python-hello",
+      "timeout": 30,
+      "memory_size": 128
+    }
+  },
+  "runtime_images": {
+    "python3.12": "public.ecr.aws/lambda/python:3.12"
+  },
+  "event_source_mappings": [
+    {
+      "queue_url": "http://sqs:9324/000000000000/reuse-test-queue",
+      "function_name": "python-sqs-consumer",
+      "batch_size": 1,
+      "endpoint_url": "http://sqs:9324",
+      "region": "us-east-1"
+    }
+  ]
+}

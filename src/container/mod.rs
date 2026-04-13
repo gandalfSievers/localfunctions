@@ -467,6 +467,9 @@ pub struct ManagedContainer {
     /// Temporary directory created for merged multi-layer mounts.
     /// Cleaned up when the container is stopped and removed.
     pub merged_layers_dir: Option<PathBuf>,
+    /// Short unique identifier embedded in the `AWS_LAMBDA_RUNTIME_API`
+    /// hostname so the Runtime API can identify which container is calling.
+    pub runtime_id: Option<String>,
 }
 
 /// Creates and manages Docker containers for Lambda function execution.
@@ -673,12 +676,18 @@ impl ContainerManager {
         // Lazy pull (with platform for multi-arch manifests)
         self.ensure_image(&image, Some(platform)).await?;
 
+        // Generate a unique runtime identifier for this container. This is
+        // embedded in the AWS_LAMBDA_RUNTIME_API hostname so the Runtime API
+        // can identify which specific container is making requests.
+        let runtime_id = uuid_short();
+
         // Build environment variables (with optional host credential forwarding)
         let env = lambda_env_vars(
             function,
             self.runtime_port,
             &self.region,
             &self.credential_config,
+            Some(&runtime_id),
         );
 
         // Code path mount: read-only at /var/task (skipped for image_uri functions
@@ -761,7 +770,7 @@ impl ContainerManager {
             cpu_quota: Some(cpu_quota),
             cpu_shares: Some(cpu_shares),
             network_mode: Some(self.network_name.clone()),
-            extra_hosts: Some(container_extra_hosts(&function.name, &self.runtime_host)),
+            extra_hosts: Some(container_extra_hosts(&function.name, &self.runtime_host, Some(&runtime_id))),
             tmpfs: Some(tmpfs),
             // Explicitly no privileged mode, no port bindings
             privileged: Some(false),
@@ -828,6 +837,7 @@ impl ContainerManager {
                     image: image.clone(),
                     last_used: Instant::now(),
                     merged_layers_dir,
+                    runtime_id: Some(runtime_id),
                 },
             );
         }
@@ -998,6 +1008,19 @@ impl ContainerManager {
         containers
             .values()
             .any(|c| c.function_name == function_name && c.state == ContainerState::Idle)
+    }
+
+    /// Look up a container's Docker ID by its runtime identifier.
+    ///
+    /// The runtime identifier is embedded in the `AWS_LAMBDA_RUNTIME_API`
+    /// hostname (e.g. `func.cid_abc12345.runtime.local`) so the Runtime API
+    /// can map incoming requests back to the specific container.
+    pub async fn find_by_runtime_id(&self, runtime_id: &str) -> Option<String> {
+        let containers = self.containers.read().await;
+        containers
+            .values()
+            .find(|c| c.runtime_id.as_deref() == Some(runtime_id))
+            .map(|c| c.container_id.clone())
     }
 
     /// Release a container back to the idle pool after an invocation completes.
@@ -1273,6 +1296,7 @@ impl ContainerManager {
                 image: "test:latest".into(),
                 last_used: Instant::now(),
                 merged_layers_dir: None,
+                runtime_id: None,
             },
         );
     }
@@ -1516,8 +1540,9 @@ pub fn lambda_env_vars(
     runtime_port: u16,
     region: &str,
     credential_config: &CredentialForwardingConfig,
+    runtime_id: Option<&str>,
 ) -> Vec<String> {
-    let runtime_api = runtime_api_endpoint(runtime_port, &function.name);
+    let runtime_api = runtime_api_endpoint(runtime_port, &function.name, runtime_id);
 
     // System variables required by the AWS Lambda execution environment
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -1617,22 +1642,32 @@ fn host_aws_config_dir() -> Option<String> {
 /// `host.docker.internal:<port>`.  When other services run as Docker
 /// containers on the same user-defined bridge network, Docker's embedded DNS
 /// resolves their container names automatically — no extra config needed.
-pub fn container_extra_hosts(function_name: &str, runtime_host: &str) -> Vec<String> {
-    vec![
+pub fn container_extra_hosts(function_name: &str, runtime_host: &str, runtime_id: Option<&str>) -> Vec<String> {
+    let mut hosts = vec![
         format!("host.docker.internal:{}", runtime_host),
         format!("{}.runtime.local:{}", function_name, runtime_host),
-    ]
+    ];
+    if let Some(rid) = runtime_id {
+        hosts.push(format!("{}.cid-{}.runtime.local:{}", function_name, rid, runtime_host));
+    }
+    hosts
 }
 
 /// Build the `AWS_LAMBDA_RUNTIME_API` endpoint value that containers should
 /// use to reach the Runtime API.
 ///
-/// Uses a per-function hostname (`{function}.runtime.local`) so the Lambda
-/// RIC's HTTP `Host` header identifies the function. The runtime API
-/// middleware extracts the function name from this header, removing the need
-/// for the custom `Lambda-Runtime-Function-Name` header.
-pub fn runtime_api_endpoint(runtime_port: u16, function_name: &str) -> String {
-    format!("{}.runtime.local:{}", function_name, runtime_port)
+/// Uses a per-container hostname (`{function}.cid-{runtime_id}.runtime.local`)
+/// so the Lambda RIC's HTTP `Host` header identifies both the function and the
+/// specific container. The runtime API extracts the function name and container
+/// identity from this header.
+///
+/// When `runtime_id` is `None`, falls back to the function-only hostname
+/// (`{function}.runtime.local`) for backward compatibility.
+pub fn runtime_api_endpoint(runtime_port: u16, function_name: &str, runtime_id: Option<&str>) -> String {
+    match runtime_id {
+        Some(rid) => format!("{}.cid-{}.runtime.local:{}", function_name, rid, runtime_port),
+        None => format!("{}.runtime.local:{}", function_name, runtime_port),
+    }
 }
 
 /// Compute Docker CPU constraints proportional to the function's memory size.
@@ -1668,14 +1703,20 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn runtime_api_endpoint_contains_function_and_port() {
-        let endpoint = runtime_api_endpoint(9601, "my-func");
+    fn runtime_api_endpoint_without_runtime_id() {
+        let endpoint = runtime_api_endpoint(9601, "my-func", None);
         assert_eq!(endpoint, "my-func.runtime.local:9601");
     }
 
     #[test]
+    fn runtime_api_endpoint_with_runtime_id() {
+        let endpoint = runtime_api_endpoint(9601, "my-func", Some("abc12345"));
+        assert_eq!(endpoint, "my-func.cid-abc12345.runtime.local:9601");
+    }
+
+    #[test]
     fn runtime_api_endpoint_custom_port() {
-        let endpoint = runtime_api_endpoint(3000, "hello");
+        let endpoint = runtime_api_endpoint(3000, "hello", None);
         assert_eq!(endpoint, "hello.runtime.local:3000");
     }
 
@@ -1707,35 +1748,42 @@ mod tests {
     #[test]
     fn lambda_env_vars_contains_function_name() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_NAME=my-func".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_handler() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"_HANDLER=main.handler".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_memory_size() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=256".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_runtime_api() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=my-func.runtime.local:9601".to_string()));
+    }
+
+    #[test]
+    fn lambda_env_vars_runtime_api_with_container_id() {
+        let func = make_test_function();
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), Some("abc12345"));
+        assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=my-func.cid-abc12345.runtime.local:9601".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_region() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "eu-west-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "eu-west-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_REGION=eu-west-1".to_string()));
         assert!(vars.contains(&"AWS_DEFAULT_REGION=eu-west-1".to_string()));
     }
@@ -1743,21 +1791,21 @@ mod tests {
     #[test]
     fn lambda_env_vars_contains_version() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_VERSION=$LATEST".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_log_group() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_LOG_GROUP_NAME=/aws/lambda/my-func".to_string()));
     }
 
     #[test]
     fn lambda_env_vars_contains_log_stream() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_LOG_STREAM_NAME=localfunctions/latest".to_string()));
     }
 
@@ -1765,7 +1813,7 @@ mod tests {
     fn lambda_env_vars_includes_user_vars() {
         let mut func = make_test_function();
         func.environment.insert("TABLE_NAME".into(), "my-table".into());
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"TABLE_NAME=my-table".to_string()));
     }
 
@@ -1774,7 +1822,7 @@ mod tests {
         let mut func = make_test_function();
         func.environment.insert("AWS_LAMBDA_FUNCTION_NAME".into(), "hacked".into());
         func.environment.insert("_HANDLER".into(), "evil.handler".into());
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         // System values must win
         assert!(vars.contains(&"AWS_LAMBDA_FUNCTION_NAME=my-func".to_string()));
         assert!(vars.contains(&"_HANDLER=main.handler".to_string()));
@@ -1784,7 +1832,7 @@ mod tests {
     #[test]
     fn lambda_env_vars_custom_port() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 3000, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 3000, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"AWS_LAMBDA_RUNTIME_API=my-func.runtime.local:3000".to_string()));
     }
 
@@ -1801,14 +1849,14 @@ mod tests {
             forward_env: false,
             mount_aws_dir: false,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &no_creds);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &no_creds, None);
         assert_eq!(vars.len(), 10);
     }
 
     #[test]
     fn lambda_env_vars_contains_trace_id_placeholder() {
         let func = make_test_function();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         let trace_var = vars.iter().find(|v| v.starts_with("_X_AMZN_TRACE_ID="));
         assert!(trace_var.is_some(), "expected _X_AMZN_TRACE_ID env var");
         let value = trace_var.unwrap().strip_prefix("_X_AMZN_TRACE_ID=").unwrap();
@@ -1822,7 +1870,7 @@ mod tests {
         let mut func = make_test_function();
         func.image_uri = Some("my-lambda:latest".into());
         func.handler = String::new();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(!vars.iter().any(|v| v.starts_with("_HANDLER=")));
     }
 
@@ -1831,7 +1879,7 @@ mod tests {
         let mut func = make_test_function();
         func.image_uri = Some("my-lambda:latest".into());
         func.handler = "app.handler".into();
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(&"_HANDLER=app.handler".to_string()));
     }
 
@@ -2086,6 +2134,7 @@ mod tests {
                     image: "test:latest".to_string(),
                     last_used: Instant::now(),
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
         }
@@ -2137,6 +2186,7 @@ mod tests {
                     image: "img-a:latest".to_string(),
                     last_used: Instant::now(),
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
             containers.insert(
@@ -2148,6 +2198,7 @@ mod tests {
                     image: "img-b:latest".to_string(),
                     last_used: Instant::now(),
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
         }
@@ -2171,6 +2222,7 @@ mod tests {
             image: "img:latest".into(),
             last_used: Instant::now(),
             merged_layers_dir: None,
+            runtime_id: None,
         };
         let mc2 = mc.clone();
         assert_eq!(mc2.container_id, "abc");
@@ -2302,6 +2354,7 @@ mod tests {
                     image: "test:latest".into(),
                     last_used: old_time,
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
         }
@@ -2335,6 +2388,7 @@ mod tests {
                     image: "test:latest".into(),
                     last_used: expired_time,
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
             containers.insert(
@@ -2346,6 +2400,7 @@ mod tests {
                     image: "test:latest".into(),
                     last_used: Instant::now(),
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
         }
@@ -2376,6 +2431,7 @@ mod tests {
                     image: "test:latest".into(),
                     last_used: expired_time,
                     merged_layers_dir: None,
+                    runtime_id: None,
                 },
             );
         }
@@ -2440,14 +2496,51 @@ mod tests {
         assert!(mgr.has_idle_container("test-func").await);
     }
 
+    // -- find_by_runtime_id ---------------------------------------------------
+
+    #[tokio::test]
+    async fn find_by_runtime_id_returns_docker_id() {
+        let mgr = make_container_manager();
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                "docker-abc123".to_string(),
+                ManagedContainer {
+                    container_id: "docker-abc123".into(),
+                    function_name: "test-func".into(),
+                    state: ContainerState::Idle,
+                    image: "test:latest".into(),
+                    last_used: Instant::now(),
+                    merged_layers_dir: None,
+                    runtime_id: Some("rid-001".into()),
+                },
+            );
+        }
+
+        assert_eq!(
+            mgr.find_by_runtime_id("rid-001").await,
+            Some("docker-abc123".to_string())
+        );
+        assert_eq!(mgr.find_by_runtime_id("nonexistent").await, None);
+    }
+
     // -- container_extra_hosts -----------------------------------------------
 
     #[test]
-    fn container_extra_hosts_contains_host_gateway_and_runtime_local() {
-        let hosts = container_extra_hosts("my-func", "host-gateway");
+    fn container_extra_hosts_without_runtime_id() {
+        let hosts = container_extra_hosts("my-func", "host-gateway", None);
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0], "host.docker.internal:host-gateway");
         assert_eq!(hosts[1], "my-func.runtime.local:host-gateway");
+    }
+
+    #[test]
+    fn container_extra_hosts_with_runtime_id() {
+        let hosts = container_extra_hosts("my-func", "host-gateway", Some("abc12345"));
+        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts[0], "host.docker.internal:host-gateway");
+        assert_eq!(hosts[1], "my-func.runtime.local:host-gateway");
+        assert_eq!(hosts[2], "my-func.cid-abc12345.runtime.local:host-gateway");
     }
 
     // -- mark_container_failed -------------------------------------------------
@@ -2618,7 +2711,7 @@ mod tests {
             "AWS_ENDPOINT_URL_SECRETS_MANAGER".into(),
             "http://host.docker.internal:9091".into(),
         );
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default());
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &CredentialForwardingConfig::default(), None);
         assert!(vars.contains(
             &"AWS_ENDPOINT_URL_S3=http://host.docker.internal:9090".to_string()
         ));
@@ -2641,7 +2734,7 @@ mod tests {
             forward_env: true,
             mount_aws_dir: false,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config, None);
 
         assert!(vars.contains(&"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE".to_string()));
         assert!(vars.contains(&"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()));
@@ -2663,7 +2756,7 @@ mod tests {
             forward_env: false,
             mount_aws_dir: false,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config, None);
 
         assert!(!vars.iter().any(|v| v.starts_with("AWS_ACCESS_KEY_ID=")));
         assert!(!vars.iter().any(|v| v.starts_with("AWS_SECRET_ACCESS_KEY=")));
@@ -2684,7 +2777,7 @@ mod tests {
             forward_env: true,
             mount_aws_dir: false,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config, None);
 
         assert!(vars.contains(&"AWS_ACCESS_KEY_ID=AKIATEST".to_string()));
         assert!(vars.contains(&"AWS_SECRET_ACCESS_KEY=secret".to_string()));
@@ -2708,7 +2801,7 @@ mod tests {
             forward_env: true,
             mount_aws_dir: false,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config, None);
 
         // Per-function values must win over host credentials
         assert!(vars.contains(&"AWS_ACCESS_KEY_ID=FUNC_KEY".to_string()));
@@ -2730,7 +2823,7 @@ mod tests {
             forward_env: false,
             mount_aws_dir: true,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config, None);
 
         assert!(vars.contains(&"AWS_PROFILE=my-dev-profile".to_string()));
 
@@ -2747,7 +2840,7 @@ mod tests {
             forward_env: true,
             mount_aws_dir: false,
         };
-        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config);
+        let vars = lambda_env_vars(&func, 9601, "us-east-1", &config, None);
 
         assert!(!vars.iter().any(|v| v.starts_with("AWS_PROFILE=")));
 

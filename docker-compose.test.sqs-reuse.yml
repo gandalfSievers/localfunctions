@@ -1,0 +1,67 @@
+# SQS container reuse integration test overlay.
+#
+# Tests that a single Lambda container can process multiple SQS messages
+# sequentially via warm reuse, without spawning new containers for each
+# message. Uses max_containers=5 and sends 10 messages.
+#
+# Run via: make test-integration-sqs-reuse
+
+services:
+  localfunctions:
+    image: localfunctions:debian
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.debian
+    container_name: localfunctions-sqs-reuse
+    ports:
+      - "9600:9600"
+      - "9601:9601"
+    networks:
+      sqs-reuse-testnet:
+        ipv4_address: 172.31.1.10
+    working_dir: ${PWD}/tests/fixtures
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}/tests/fixtures:${PWD}/tests/fixtures:ro
+    group_add:
+      - "${DOCKER_GID:-0}"
+    environment:
+      - LOCAL_LAMBDA_HOST=0.0.0.0
+      - LOCAL_LAMBDA_PORT=9600
+      - LOCAL_LAMBDA_RUNTIME_PORT=9601
+      - LOCAL_LAMBDA_FUNCTIONS_FILE=${PWD}/tests/fixtures/functions-sqs-reuse.json
+      - LOCAL_LAMBDA_DOCKER_NETWORK=localfunctions-sqs-reuse-test
+      - LOCAL_LAMBDA_MAX_CONTAINERS=5
+      - LOCAL_LAMBDA_PULL_IMAGES=false
+      - LOCAL_LAMBDA_HOT_RELOAD=false
+      - LOCAL_LAMBDA_INIT_TIMEOUT=60
+      - LOCAL_LAMBDA_FORWARD_AWS_CREDENTIALS=false
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - RUST_LOG=localfunctions=debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9600/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      - sqs
+
+  sqs:
+    image: softwaremill/elasticmq-native
+    container_name: localfunctions-sqs-reuse-elasticmq
+    networks:
+      sqs-reuse-testnet:
+    ports:
+      - "9324:9324"
+    volumes:
+      - ./docker/elasticmq-reuse.conf:/opt/elasticmq.conf
+
+networks:
+  sqs-reuse-testnet:
+    name: localfunctions-sqs-reuse-test
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.1.0/24

@@ -647,3 +647,49 @@ async fn runtime_init_error_fails_pending_invocations() {
         }
     );
 }
+
+// -- resolve_function_and_container tests -----------------------------------
+
+#[test]
+fn resolve_from_explicit_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(HEADER_FUNCTION_NAME, "my-func".parse().unwrap());
+    let (func, rid) = resolve_function_and_container(&headers);
+    assert_eq!(func.as_deref(), Some("my-func"));
+    assert_eq!(rid, None);
+}
+
+#[test]
+fn resolve_from_host_legacy_format() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", "my-func.runtime.local:9601".parse().unwrap());
+    let (func, rid) = resolve_function_and_container(&headers);
+    assert_eq!(func.as_deref(), Some("my-func"));
+    assert_eq!(rid, None);
+}
+
+#[test]
+fn resolve_from_host_with_container_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", "my-func.cid-abc12345.runtime.local:9601".parse().unwrap());
+    let (func, rid) = resolve_function_and_container(&headers);
+    assert_eq!(func.as_deref(), Some("my-func"));
+    assert_eq!(rid.as_deref(), Some("abc12345"));
+}
+
+#[test]
+fn resolve_from_host_with_hyphenated_function_name() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", "my-cool-func.cid-xyz99999.runtime.local:9601".parse().unwrap());
+    let (func, rid) = resolve_function_and_container(&headers);
+    assert_eq!(func.as_deref(), Some("my-cool-func"));
+    assert_eq!(rid.as_deref(), Some("xyz99999"));
+}
+
+#[test]
+fn resolve_returns_none_without_headers() {
+    let headers = HeaderMap::new();
+    let (func, rid) = resolve_function_and_container(&headers);
+    assert_eq!(func, None);
+    assert_eq!(rid, None);
+}

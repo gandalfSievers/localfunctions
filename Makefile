@@ -1,10 +1,11 @@
-.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-integration-eventsource _test-integration-eventsource test-integration-traefik _test-integration-traefik test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
+.PHONY: help build build-debug test test-unit test-integration _test-integration test-integration-pathstyle _test-integration-pathstyle test-integration-awsstyle _test-integration-awsstyle test-integration-eventsource _test-integration-eventsource test-integration-sqs-reuse _test-integration-sqs-reuse test-integration-traefik _test-integration-traefik test-all fmt clippy lint clean run run-release audit all docker-build-debian docker-push-debian docker-build-alpine docker-push-alpine docker-build docker-build-multi docker-push docker-clean docker-buildx-setup docker-up docker-down docker-restart docker-logs docker-test wait-ready
 
 .DEFAULT_GOAL := help
 
 # Compose file variables
 COMPOSE_TEST := docker compose -f docker-compose.test.yml
 COMPOSE_AWSSTYLE := $(COMPOSE_TEST) -f docker-compose.test.awsstyle.yml
+COMPOSE_SQS_REUSE := docker compose -f docker-compose.test.sqs-reuse.yml
 COMPOSE_TRAEFIK := docker compose -f docker-compose.test.traefik.yml
 
 help: ## Show this help message
@@ -16,6 +17,7 @@ help: ## Show this help message
 	@echo "    make test-integration-pathstyle    - Run path-style tests (real Lambda containers)"
 	@echo "    make test-integration-awsstyle     - Run AWS-style vhost tests (in Docker with dnsmasq)"
 	@echo "    make test-integration-eventsource  - Run SQS/SNS event source tests (local-sns + ElasticMQ)"
+	@echo "    make test-integration-sqs-reuse    - Run SQS container reuse tests (real containers + ElasticMQ)"
 	@echo "    make test-integration-traefik      - Run Traefik TLS proxy tests (Lambda+SQS+SNS via HTTPS)"
 	@echo "    make test-all                      - Run all tests"
 	@echo ""
@@ -41,6 +43,7 @@ test-all: docker-build-debian ## Run all tests
 	$(MAKE) test-unit || exit_code=$$?; \
 	$(MAKE) _test-integration || exit_code=$$?; \
 	$(MAKE) _test-integration-eventsource || exit_code=$$?; \
+	$(MAKE) _test-integration-sqs-reuse || exit_code=$$?; \
 	$(MAKE) _test-integration-pathstyle || exit_code=$$?; \
 	$(MAKE) _test-integration-awsstyle || exit_code=$$?; \
 	exit $$exit_code
@@ -148,6 +151,37 @@ _test-integration-eventsource:
 		cargo test --test sqs_integration --test sns_integration -- --ignored --nocapture --test-threads=1 || exit_code=$$?; \
 	$(COMPOSE_TEST) stop sns sqs; \
 	$(COMPOSE_TEST) rm -f sns sqs; \
+	exit $$exit_code
+
+# SQS container reuse integration tests (real Lambda containers + ElasticMQ)
+# Validates that containers transition Busy → Idle and are reused for
+# subsequent SQS messages, rather than spawning new containers each time.
+test-integration-sqs-reuse: docker-build-debian _test-integration-sqs-reuse ## Run SQS container reuse tests (real Lambda + ElasticMQ)
+
+_test-integration-sqs-reuse:
+	@echo "=========================================="
+	@echo "  SQS CONTAINER REUSE integration tests"
+	@echo "=========================================="
+	$(COMPOSE_SQS_REUSE) up -d
+	@echo "Waiting for localfunctions and SQS (ElasticMQ) to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
+		if nc -z localhost 9600 2>/dev/null && nc -z localhost 9324 2>/dev/null; then \
+			echo "localfunctions and SQS are ready!"; \
+			break; \
+		fi; \
+		echo "Waiting... ($$i/30)"; \
+		sleep 1; \
+	done
+	@if ! nc -z localhost 9600 2>/dev/null || ! nc -z localhost 9324 2>/dev/null; then \
+		echo "Error: Services did not become ready within 30 seconds"; \
+		$(COMPOSE_SQS_REUSE) logs; \
+		$(COMPOSE_SQS_REUSE) down --remove-orphans; \
+		exit 1; \
+	fi
+	@exit_code=0; \
+	SQS_ENDPOINT=http://localhost:9324 \
+		cargo test --test docker_sqs_reuse_integration -- --ignored --nocapture --test-threads=1 || exit_code=$$?; \
+	$(COMPOSE_SQS_REUSE) down --remove-orphans; \
 	exit $$exit_code
 
 # Traefik TLS integration tests (Traefik reverse proxy with mkcert certs, test-runner in Docker)
@@ -269,6 +303,7 @@ docker-up: ## Start container via docker compose (detached, with build)
 
 docker-down: ## Stop and remove all test containers
 	-$(COMPOSE_TRAEFIK) down --remove-orphans 2>/dev/null
+	-$(COMPOSE_SQS_REUSE) down --remove-orphans 2>/dev/null
 	-$(COMPOSE_AWSSTYLE) down --remove-orphans 2>/dev/null
 	-$(COMPOSE_TEST) down --remove-orphans 2>/dev/null
 	-docker compose down --remove-orphans 2>/dev/null
